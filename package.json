@@ -1,0 +1,55 @@
+{
+  "name": "xingqiyi-laundry-photo",
+  "productName": "星期衣精致洗衣衣物照片系统",
+  "version": "0.1.2",
+  "description": "洗衣店衣物拍照存档系统：客户端拍照/查询 + 管理端用户权限/日志/数据管理",
+  "main": "main/main.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/XQY-OWNER/xingqiyi-laundry-photo.git"
+  },
+  "scripts": {
+    "start": "electron .",
+    "postinstall": "node scripts/copy-vue.js",
+    "build": "electron-builder --win",
+    "verify": "node scripts/verify-store.js && node scripts/verify-server.js && node scripts/verify-templates.js"
+  },
+  "author": "星期衣精致洗衣",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^26.15.3",
+    "vue": "^3.4.38"
+  },
+  "build": {
+    "appId": "com.xingqiyi.laundryphoto",
+    "productName": "星期衣精致洗衣衣物照片系统",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main/**/*",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "星期衣衣物照片系统",
+      "artifactName": "星期衣精致洗衣衣物照片系统-安装包-${version}.exe"
+    },
+    "publish": null
+  }
+}
