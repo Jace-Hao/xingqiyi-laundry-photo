@@ -28,8 +28,8 @@ const APP_VERSION = require('../package.json').version;
 const UPDATE_DIR = path.join(app.getPath('userData'), 'updates');
 
 // 更新分发：通过 GitHub Releases 发布安装包，应用从这里检查最新版本。
-// 请把仓库地址改成实际的 GitHub 仓库（与 package.json 的 repository 保持一致）。
-const GITHUB_REPO = 'XQY-OWNER/xingqiyi-laundry-photo';
+// 仓库地址须与 package.json 的 repository 保持一致。
+const GITHUB_REPO = 'Jace-Hao/xingqiyi-laundry-photo';
 const GITHUB_RELEASES_PAGE = 'https://github.com/' + GITHUB_REPO + '/releases/latest';
 
 const store = createStore({

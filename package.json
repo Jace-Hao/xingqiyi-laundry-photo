@@ -6,7 +6,7 @@
   "main": "main/main.js",
   "repository": {
     "type": "git",
-    "url": "https://github.com/XQY-OWNER/xingqiyi-laundry-photo.git"
+    "url": "https://github.com/Jace-Hao/xingqiyi-laundry-photo.git"
   },
   "scripts": {
     "start": "electron .",
