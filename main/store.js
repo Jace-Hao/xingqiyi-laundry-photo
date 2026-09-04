@@ -456,6 +456,74 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     return { deleted, skipped };
   }
 
+  // ---------- 照片批量导出（按条码/订单号分文件夹保存） ----------
+  const fmtPhotoTime = (iso) => {
+    const d = new Date(iso || '');
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}`;
+  };
+
+  // 把存档照片复制到用户选择的目录，按条码（订单号）建立子文件夹。
+  // barcodes 为空数组时表示导出当前账号可见的全部记录。
+  function exportPhotos(token, p = {}) {
+    const me = requireSessionPermission(token, 'query');
+    const targetDir = path.resolve(String((p && p.targetDir) || '').trim());
+    if (!targetDir) throw new Error('请先选择保存目录');
+    fs.mkdirSync(targetDir, { recursive: true });
+
+    let barcodes = Array.isArray(p.barcodes)
+      ? [...new Set(p.barcodes.map((x) => String(x || '').trim()).filter(Boolean))]
+      : [];
+    let records = loadRecords();
+    const isAdmin = me.role === 'admin';
+    // 客户端账号只能导出自己的存档
+    if (!isAdmin) records = records.filter((r) => r.userId === me.id);
+    if (barcodes.length) {
+      const set = new Set(barcodes.map((b) => b.toLowerCase()));
+      records = records.filter((r) => set.has(String(r.barcode || '').toLowerCase()));
+    } else {
+      barcodes = [...new Set(records.map((r) => String(r.barcode || '')))];
+    }
+    if (!records.length) throw new Error('没有符合条件的存档记录，无法导出');
+
+    const photoDir = getPhotoDir();
+    let exported = 0;
+    let skipped = 0;
+    let failed = 0;
+    let folderCount = 0;
+    for (const code of barcodes) {
+      const group = records.filter((r) => String(r.barcode || '') === code);
+      if (!group.length) continue;
+      const safeCode = code.replace(/[\\/:*?"<>|]/g, '_').slice(0, 64) || '未命名';
+      const dir = path.join(targetDir, safeCode);
+      fs.mkdirSync(dir, { recursive: true });
+      folderCount++;
+      group.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+      for (const r of group) {
+        const src = path.join(photoDir, r.photoFile);
+        const ext = path.extname(r.photoFile) || '.jpg';
+        const name = `${fmtPhotoTime(r.createdAt)}_第${r.seq}张${ext}`;
+        try {
+          fs.copyFileSync(src, path.join(dir, name));
+          exported++;
+        } catch (e) {
+          if (fs.existsSync(src)) failed++;
+          else skipped++;
+        }
+      }
+    }
+    appendLog({
+      ...logBase(me),
+      module: me.role === 'admin' ? '数据管理' : '记录查询',
+      action: '批量导出照片',
+      detail:
+        `按条码文件夹批量导出衣物照片：${folderCount} 个文件夹、${exported} 张` +
+        `${skipped ? `，照片文件缺失跳过 ${skipped} 张` : ''}${failed ? `，导出失败 ${failed} 张` : ''} → ${targetDir}`,
+      result: '成功'
+    });
+    return { exported, skipped, failed, folders: folderCount, targetDir };
+  }
+
   // ---------- 用户管理（管理端） ----------
   function listUsers(token) {
     requireSessionAdmin(token);
@@ -802,6 +870,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     getRecord,
     deleteRecord,
     deleteRecords,
+    exportPhotos,
     listUsers,
     createUser,
     updateUser,

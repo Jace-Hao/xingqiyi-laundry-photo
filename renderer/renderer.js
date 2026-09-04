@@ -93,7 +93,7 @@ const SetupPage = {
   template: `
     <div class="setup-wrap">
       <div class="setup-card">
-        <div class="login-logo">👕</div>
+        <img class="logo-login" src="./assets/logo.png" alt="星期衣" />
         <h1>星期衣精致洗衣 · 衣物照片系统</h1>
         <div class="login-sub">首次使用，请选择本机的运行模式</div>
 
@@ -223,7 +223,7 @@ const LoginPage = {
   template: `
     <div class="login-wrap">
       <div class="login-card">
-        <div class="login-logo">👕</div>
+        <img class="logo-login" src="./assets/logo.png" alt="星期衣" />
         <h1>星期衣精致洗衣</h1>
         <div class="login-sub">衣物照片系统</div>
         <form @submit.prevent="submit">
@@ -684,6 +684,48 @@ const QueryPage = {
     const detail = Vue.ref(null);
     const selected = Vue.ref([]); // 已勾选的记录 id
     const batchDeleting = Vue.ref(false);
+    const exporting = Vue.ref(false);
+
+    // 按条码（订单号）批量下载照片：勾选了则导出勾选记录涉及的条码，未勾选则导出当前列表全部条码
+    async function exportByBarcode() {
+      if (exporting.value) return;
+      const source = selected.value.length
+        ? items.value.filter((r) => selected.value.includes(r.id))
+        : items.value.slice();
+      const barcodes = [...new Set(source.map((r) => r.barcode).filter(Boolean))];
+      if (!barcodes.length) {
+        toast('没有可导出的记录', 'error');
+        return;
+      }
+      const scope = selected.value.length
+        ? '已勾选记录涉及的 ' + barcodes.length + ' 个条码'
+        : '当前列表中的全部 ' + barcodes.length + ' 个条码';
+      if (!window.confirm('将按条码（订单号）分文件夹导出照片到本地目录。\n导出范围：' + scope + '。\n下一步请选择保存目录。')) return;
+      const d = await window.api.chooseExportDir();
+      if (!d.ok) {
+        if (d.message && d.message !== '已取消') toast(d.message, 'error');
+        return;
+      }
+      exporting.value = true;
+      toast('正在导出照片，数量较多时请稍候…', 'success');
+      try {
+        const res = await window.api.exportPhotos(props.token, { targetDir: d.data, barcodes });
+        if (res.ok) {
+          toast(
+            '导出完成：' + res.data.folders + ' 个文件夹、' + res.data.exported + ' 张照片' +
+            (res.data.skipped ? '，缺失跳过 ' + res.data.skipped + ' 张' : '') +
+            (res.data.failed ? '，失败 ' + res.data.failed + ' 张' : ''),
+            'success'
+          );
+        } else {
+          toast(res.message || '导出失败', 'error');
+        }
+      } catch (e) {
+        toast('导出失败：' + (e.message || e), 'error');
+      } finally {
+        exporting.value = false;
+      }
+    }
 
     function toggleSelect(r) {
       const i = selected.value.indexOf(r.id);
@@ -807,6 +849,7 @@ const QueryPage = {
       keyword, barcodeFilter, dateFrom, dateTo, userIdFilter, users, items, total,
       page, pageSize, totalPages, loading, detail,
       selected, batchDeleting, toggleSelect, selectAll, batchDelete,
+      exporting, exportByBarcode,
       search, reset, openDetail, remove, prev, next, fmt,
       adminMode: props.adminMode
     };
@@ -850,6 +893,9 @@ const QueryPage = {
         <div class="batch-bar" v-if="items.length">
           <label class="batch-check"><input type="checkbox" :checked="selected.length === items.length && items.length > 0" @change="selectAll" />全选本页</label>
           <span class="pager-info">已选 {{ selected.length }} 条</span>
+          <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="exportByBarcode">
+            {{ exporting ? '导出中…' : '⬇ 按订单号批量下载' }}
+          </button>
           <button class="btn btn-danger btn-sm" :disabled="!selected.length || batchDeleting" @click="batchDelete">
             {{ batchDeleting ? '删除中…' : '批量删除' }}
           </button>
@@ -1679,7 +1725,7 @@ const Shell = {
     <div class="shell">
       <aside class="sidebar">
         <div class="brand">
-          <div class="brand-logo">👕</div>
+          <img class="logo-brand" src="./assets/logo.png" alt="星期衣" />
           <div>
             <div class="brand-name">星期衣精致洗衣</div>
             <div class="brand-sub">衣物照片系统 · {{ isAdmin ? '管理端' : '客户端' }}</div>

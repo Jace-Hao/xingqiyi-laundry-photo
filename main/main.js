@@ -108,6 +108,7 @@ function localCall(route, body, token) {
     'records/get': () => store.getRecord(token, b.id),
     'records/delete': () => store.deleteRecord(token, b.id),
     'records/deleteBatch': () => store.deleteRecords(token, b.ids),
+    'records/exportPhotos': () => store.exportPhotos(token, b),
     'users/list': () => store.listUsers(token),
     'users/create': () => store.createUser(token, b),
     'users/update': () => store.updateUser(token, b),
@@ -158,6 +159,96 @@ handle('records:list', (p, token) => dispatch('records/list', p, token));
 handle('records:get', (p, token) => dispatch('records/get', p, token));
 handle('records:delete', (p, token) => dispatch('records/delete', p, token));
 handle('records:deleteBatch', (p, token) => dispatch('records/deleteBatch', p, token));
+
+// 客户端模式：照片在服务端电脑，主进程逐张从服务器拉取后按条码文件夹保存到本机目录
+async function clientExportPhotos(p, sessionToken) {
+  const fs = require('fs');
+  const targetDir = String((p && p.targetDir) || '').trim();
+  if (!targetDir) return { ok: false, message: '请先选择保存目录' };
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  const barcodes = Array.isArray(p.barcodes)
+    ? [...new Set(p.barcodes.map((x) => String(x || '').trim()).filter(Boolean))]
+    : [];
+
+  // 分页拉取全部符合条件的记录（silent 避免产生大量查询日志）
+  const base = { silent: true, pageSize: 100 };
+  const all = [];
+  async function pullPage(extra, page) {
+    return dispatch('records/list', { ...base, ...extra, page }, sessionToken);
+  }
+  if (barcodes.length) {
+    for (const code of barcodes) {
+      let page = 1;
+      for (;;) {
+        const r = await pullPage({ barcode: code }, page);
+        if (!r.ok) return r;
+        all.push(...r.data.items);
+        if (r.data.items.length < base.pageSize) break;
+        page++;
+      }
+    }
+  } else {
+    let page = 1;
+    for (;;) {
+      const r = await pullPage({}, page);
+      if (!r.ok) return r;
+      all.push(...r.data.items);
+      if (r.data.items.length < base.pageSize || page > 500) break;
+      page++;
+    }
+  }
+  if (!all.length) return { ok: false, message: '没有符合条件的存档记录，无法导出' };
+
+  const cfg = store.loadConfig();
+  const photoUrl = (file) =>
+    cfg.serverUrl + '/photo?f=' + encodeURIComponent(file) + '&token=' + encodeURIComponent(cfg.serverToken);
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmtTime = (iso) => {
+    const d = new Date(iso || '');
+    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}`;
+  };
+
+  const groups = new Map();
+  for (const r of all) {
+    const code = String(r.barcode || '');
+    if (!groups.has(code)) groups.set(code, []);
+    groups.get(code).push(r);
+  }
+
+  let exported = 0;
+  let skipped = 0;
+  let failed = 0;
+  for (const [code, list] of groups) {
+    const safeCode = code.replace(/[\\/:*?"<>|]/g, '_').slice(0, 64) || '未命名';
+    const dir = path.join(targetDir, safeCode);
+    fs.mkdirSync(dir, { recursive: true });
+    list.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+    for (const r of list) {
+      const ext = path.extname(r.photoFile) || '.jpg';
+      const name = `${fmtTime(r.createdAt)}_第${r.seq}张${ext}`;
+      try {
+        const resp = await net.fetch(photoUrl(r.photoFile));
+        if (!resp.ok) {
+          skipped++;
+          continue;
+        }
+        const buf = Buffer.from(await resp.arrayBuffer());
+        fs.writeFileSync(path.join(dir, name), buf);
+        exported++;
+      } catch (e) {
+        failed++;
+      }
+    }
+  }
+  return { ok: true, data: { exported, skipped, failed, folders: groups.size, targetDir } };
+}
+
+handle('records:exportPhotos', async (p, token) => {
+  const cfg = store.loadConfig();
+  if (cfg.mode === 'client') return clientExportPhotos(p, token);
+  return dispatch('records/exportPhotos', p, token);
+});
 
 handle('users:list', (_p, token) => dispatch('users/list', undefined, token));
 handle('users:create', (p, token) => dispatch('users/create', p, token));
@@ -267,6 +358,16 @@ handle('system:photoPath', (p, token) => {
   } catch (e) {
     return { ok: false, message: e.message || String(e) };
   }
+});
+
+handle('system:chooseExportDir', () => {
+  const { dialog } = require('electron');
+  return dialog
+    .showOpenDialog(mainWindow, {
+      title: '选择照片导出保存目录',
+      properties: ['openDirectory', 'createDirectory']
+    })
+    .then((r) => (r.canceled || !r.filePaths.length ? { ok: false, message: '已取消' } : { ok: true, data: r.filePaths[0] }));
 });
 
 handle('system:choosePhotoDir', () => {
@@ -416,6 +517,7 @@ function createWindow() {
     minWidth: 1024,
     minHeight: 680,
     title: '星期衣精致洗衣衣物照片系统',
+    icon: path.join(RENDERER_DIR, 'assets', 'logo.png'),
     backgroundColor: '#f2f6fc',
     autoHideMenuBar: true,
     webPreferences: {

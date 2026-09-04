@@ -31,6 +31,7 @@ contextBridge.exposeInMainWorld('api', {
   getRecord: (token, id) => call('records:get', { id }, token),
   deleteRecord: (token, id) => call('records:delete', { id }, token),
   deleteRecords: (token, ids) => call('records:deleteBatch', { ids }, token),
+  exportPhotos: (token, payload) => call('records:exportPhotos', payload, token),
 
   // 用户管理（只传原始类型参数，对象在桥接层内组装）
   listUsers: (token) => call('users:list', undefined, token),
@@ -64,6 +65,7 @@ contextBridge.exposeInMainWorld('api', {
   resetApiToken: (token) => ipcRenderer.invoke('system:resetToken', undefined, token),
   setPhotoPath: (token, pathValue) => ipcRenderer.invoke('system:photoPath', { path: pathValue }, token),
   choosePhotoDir: () => ipcRenderer.invoke('system:choosePhotoDir'),
+  chooseExportDir: () => ipcRenderer.invoke('system:chooseExportDir'),
   localIp: () => ipcRenderer.invoke('system:localIp'),
   version: () => ipcRenderer.invoke('system:version'),
   checkUpdate: () => ipcRenderer.invoke('system:checkUpdate'),

@@ -75,6 +75,7 @@ function startServer(store, opts = {}) {
       'records/get': () => store.getRecord(sessionToken, body.id),
       'records/delete': () => store.deleteRecord(sessionToken, body.id),
       'records/deleteBatch': () => store.deleteRecords(sessionToken, body.ids),
+      'records/exportPhotos': () => store.exportPhotos(sessionToken, body),
       // 用户管理
       'users/list': () => store.listUsers(sessionToken),
       'users/create': () => store.createUser(sessionToken, body),
