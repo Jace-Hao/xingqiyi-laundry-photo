@@ -12,3 +12,6 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Office 临时锁文件（~$ 开头的由 Office 打开文档时生成）
+~$*
