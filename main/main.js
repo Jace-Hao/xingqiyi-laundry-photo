@@ -284,51 +284,43 @@ handle('system:version', () => {
 });
 
 // ---------- GitHub Releases 更新检查 ----------
+// 使用 Electron 的 net 模块（走 Windows 系统证书库），
+// 在代理/企业证书环境下也能正常访问，避免 Node 内置模块的证书验证失败。
 function checkGitHubRelease() {
-  return new Promise((resolve) => {
-    const req = https.request(
-      {
-        method: 'GET',
-        hostname: 'api.github.com',
-        path: '/repos/' + GITHUB_REPO + '/releases/latest',
-        headers: {
-          'User-Agent': 'xingqiyi-laundry-photo',
-          Accept: 'application/vnd.github+json'
-        },
-        timeout: 10000
-      },
-      (res) => {
-        let data = '';
-        res.on('data', (c) => (data += c));
-        res.on('end', () => {
-          try {
-            if (res.statusCode !== 200) {
-              return resolve({ ok: false, message: 'GitHub 返回状态 ' + res.statusCode });
-            }
-            const rel = JSON.parse(data);
-            const tag = String(rel.tag_name || '').replace(/^v/i, '');
-            if (!tag) return resolve({ ok: false, message: 'GitHub 发布未标注版本号' });
-            const assets = Array.isArray(rel.assets) ? rel.assets : [];
-            // 优先匹配 .exe 安装包，其次取任意第一个附件
-            const asset = assets.find((a) => /\.exe$/i.test(a.name || '')) || assets[0];
-            resolve({
-              ok: true,
-              latestVersion: tag,
-              downloadUrl: (asset && asset.browser_download_url) || rel.html_url || GITHUB_RELEASES_PAGE
-            });
-          } catch (e) {
-            resolve({ ok: false, message: 'GitHub 返回数据异常' });
-          }
-        });
+  const fetchAll = async () => {
+    const resp = await net.fetch('https://api.github.com/repos/' + GITHUB_REPO + '/releases?per_page=20', {
+      headers: {
+        'User-Agent': 'xingqiyi-laundry-photo',
+        Accept: 'application/vnd.github+json'
       }
-    );
-    req.on('timeout', () => {
-      req.destroy();
-      resolve({ ok: false, message: '连接 GitHub 超时' });
     });
-    req.on('error', (e) => resolve({ ok: false, message: '无法连接 GitHub：' + (e.message || e.code) }));
-    req.end();
-  });
+    if (!resp.ok) return { ok: false, message: 'GitHub 返回状态 ' + resp.status };
+    const list = await resp.json();
+    if (!Array.isArray(list)) return { ok: false, message: 'GitHub 返回数据异常' };
+    // 遍历全部正式发布，按版本号取最高者，
+    // 不依赖 GitHub「latest」的排序（其按发布时间排序，标签格式或发布顺序异常时会取错）
+    let best = null;
+    for (const rel of list) {
+      if (rel.draft || rel.prerelease) continue;
+      const tag = String(rel.tag_name || '').replace(/^v/i, '');
+      if (!tag) continue;
+      if (!best || store.compareVersions(tag, best.latestVersion) > 0) best = { latestVersion: tag, rel };
+    }
+    if (!best) return { ok: false, message: '仓库暂无正式发布' };
+    const assets = Array.isArray(best.rel.assets) ? best.rel.assets : [];
+    // 优先匹配 .exe 安装包，其次取任意第一个附件
+    const asset = assets.find((a) => /\.exe$/i.test(a.name || '')) || assets[0];
+    return {
+      ok: true,
+      latestVersion: best.latestVersion,
+      downloadUrl: (asset && asset.browser_download_url) || best.rel.html_url || GITHUB_RELEASES_PAGE
+    };
+  };
+  // 超时兜底：避免网络异常时界面长时间卡在「检查中」
+  return Promise.race([
+    fetchAll().catch((e) => ({ ok: false, message: '无法连接 GitHub：' + (e.message || e.code) })),
+    new Promise((resolve) => setTimeout(() => resolve({ ok: false, message: '连接 GitHub 超时' }), 15000))
+  ]);
 }
 
 handle('system:checkUpdate', async () => {

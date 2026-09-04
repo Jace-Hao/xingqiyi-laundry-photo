@@ -1,7 +1,7 @@
 {
   "name": "xingqiyi-laundry-photo",
   "productName": "星期衣精致洗衣衣物照片系统",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "洗衣店衣物拍照存档系统：客户端拍照/查询 + 管理端用户权限/日志/数据管理",
   "main": "main/main.js",
   "repository": {
@@ -48,7 +48,7 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "星期衣衣物照片系统",
-      "artifactName": "星期衣精致洗衣衣物照片系统-安装包-${version}.exe"
+      "artifactName": "xingqiyi-laundry-photo-setup-${version}.exe"
     },
     "publish": null
   }

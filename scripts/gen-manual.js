@@ -193,7 +193,7 @@ children.push(bullet('操作系统：Windows 10 / 11（64 位）'));
 children.push(bullet('无需安装任何其他软件：运行环境已内置在安装包中'));
 children.push(bullet('硬件：摄像头（拍照用）、扫码枪（可选，即插即用）'));
 children.push(h2('2.2 一键安装（三步完成）'));
-children.push(steps('steps-install', '把安装包「星期衣精致洗衣衣物照片系统-安装包-0.1.0.exe」复制到目标电脑。'));
+children.push(steps('steps-install', '把安装包「xingqiyi-laundry-photo-setup-版本号.exe」复制到目标电脑。'));
 children.push(steps('steps-install', '双击安装包。如出现「已保护你的电脑」提示（因软件未做数字签名），点「更多信息」再点「仍要运行」，之后自动完成安装，全程无需任何选择。'));
 children.push(steps('steps-install', '安装完成后自动启动程序，桌面与开始菜单会出现「星期衣衣物照片系统」快捷方式。'));
 children.push(h2('2.3 日常启动'));
