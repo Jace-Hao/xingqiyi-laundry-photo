@@ -414,7 +414,11 @@ function checkGitHubRelease() {
     return {
       ok: true,
       latestVersion: best.latestVersion,
-      downloadUrl: (asset && asset.browser_download_url) || best.rel.html_url || GITHUB_RELEASES_PAGE
+      downloadUrl: (asset && asset.browser_download_url) || best.rel.html_url || GITHUB_RELEASES_PAGE,
+      // 资产名与发布说明：用于弹窗展示更新内容与「自动下载」保存文件名
+      assetName: (asset && asset.name) || '',
+      releaseNotes: String(best.rel.body || '').trim(),
+      releasePage: best.rel.html_url || GITHUB_RELEASES_PAGE
     };
   };
   // 超时兜底：避免网络异常时界面长时间卡在「检查中」
@@ -434,6 +438,9 @@ handle('system:checkUpdate', async () => {
         currentVersion: APP_VERSION,
         latestVersion: gh.latestVersion,
         downloadUrl: gh.downloadUrl,
+        assetName: gh.assetName || '',
+        releaseNotes: gh.releaseNotes || '',
+        releasePage: gh.releasePage || GITHUB_RELEASES_PAGE,
         hasUpdate: store.compareVersions(gh.latestVersion, APP_VERSION) > 0,
         source: 'github'
       }
@@ -461,6 +468,90 @@ handle('system:openUpdatePage', () => {
   const { shell } = require('electron');
   shell.openExternal(GITHUB_RELEASES_PAGE);
   return { ok: true, data: GITHUB_RELEASES_PAGE };
+});
+
+// ---------- 自动下载更新安装包 ----------
+// 从 GitHub Releases 下载安装包到「下载」目录下的专属文件夹，边下边报进度，完成后自动打开文件夹定位文件。
+let activeDownload = null;
+
+handle('system:downloadUpdate', async ({ url, name } = {}) => {
+  const fs = require('fs');
+  if (activeDownload) return { ok: false, message: '正在下载中，请稍候…' };
+  if (!url || !/^https?:\/\//i.test(String(url))) return { ok: false, message: '下载地址无效' };
+  if (!mainWindow) return { ok: false, message: '窗口未就绪' };
+
+  const dir = path.join(app.getPath('downloads'), 'xingqiyi-laundry-photo');
+  fs.mkdirSync(dir, { recursive: true });
+  let fileName = String(name || '').replace(/[\\/:*?"<>|]/g, '_').slice(0, 120);
+  if (!fileName) fileName = 'xingqiyi-laundry-photo-setup-' + Date.now() + '.exe';
+  const target = path.join(dir, fileName);
+  const tmp = target + '.part';
+
+  const win = mainWindow;
+  const send = (channel, payload) => {
+    try {
+      if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
+    } catch (e) {
+      /* 窗口销毁时忽略 */
+    }
+  };
+
+  const controller = new AbortController();
+  activeDownload = { url: String(url), cancel: () => controller.abort() };
+  try {
+    const resp = await net.fetch(String(url), {
+      signal: controller.signal,
+      headers: { 'User-Agent': 'xingqiyi-laundry-photo' }
+    });
+    if (!resp.ok || !resp.body) throw new Error('服务器返回状态 ' + resp.status);
+    const total = Number(resp.headers.get('content-length')) || 0;
+    let received = 0;
+    let lastSent = 0;
+    const out = fs.createWriteStream(tmp);
+    for await (const chunk of resp.body) {
+      out.write(chunk);
+      received += chunk.length;
+      const t = Date.now();
+      if (t - lastSent >= 400) {
+        lastSent = t;
+        send('update:download-progress', { received, total });
+      }
+    }
+    await new Promise((resolve, reject) => out.end((e) => (e ? reject(e) : resolve())));
+
+    // 已存在同名安装包时先移除；移除失败则换带时间戳的文件名落位
+    let finalTarget = target;
+    try {
+      fs.unlinkSync(target);
+    } catch (e) {
+      /* 可能不存在 */
+    }
+    try {
+      fs.renameSync(tmp, target);
+    } catch (e) {
+      finalTarget = path.join(dir, fileName.replace(/(\.exe)?$/i, '-' + Date.now() + '$1'));
+      fs.renameSync(tmp, finalTarget);
+    }
+    const { shell } = require('electron');
+    shell.showItemInFolder(finalTarget);
+    return { ok: true, data: { file: finalTarget, size: received } };
+  } catch (e) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch (_) {
+      /* 忽略 */
+    }
+    if (controller.signal.aborted) return { ok: false, canceled: true, message: '已取消下载' };
+    return { ok: false, message: '下载失败：' + (e.message || String(e)) };
+  } finally {
+    activeDownload = null;
+  }
+});
+
+handle('system:cancelDownload', () => {
+  if (!activeDownload) return { ok: false, message: '当前没有正在进行的下载' };
+  activeDownload.cancel();
+  return { ok: true };
 });
 
 handle('system:copyText', (text) => {

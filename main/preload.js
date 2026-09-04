@@ -69,6 +69,13 @@ contextBridge.exposeInMainWorld('api', {
   localIp: () => ipcRenderer.invoke('system:localIp'),
   version: () => ipcRenderer.invoke('system:version'),
   checkUpdate: () => ipcRenderer.invoke('system:checkUpdate'),
+  downloadUpdate: (url, name) => ipcRenderer.invoke('system:downloadUpdate', { url, name }),
+  cancelDownload: () => ipcRenderer.invoke('system:cancelDownload'),
+  onDownloadProgress: (cb) => {
+    const fn = (_e, p) => cb(p);
+    ipcRenderer.on('update:download-progress', fn);
+    return () => ipcRenderer.removeListener('update:download-progress', fn);
+  },
   openUpdateDir: () => ipcRenderer.invoke('system:openUpdateDir'),
   openUpdatePage: () => ipcRenderer.invoke('system:openUpdatePage'),
   copyText: (text) => ipcRenderer.invoke('system:copyText', text)

@@ -33,6 +33,11 @@ function fmt(iso) {
   );
 }
 
+function fmtSize(n) {
+  if (!n || n <= 0) return '';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
 /* ---------- 启动设置页（首次使用 / 切换运行模式） ---------- */
 const SetupPage = {
   emits: ['done'],
@@ -1470,6 +1475,9 @@ const AdminSystemPage = {
     const version = Vue.ref('');
     const updateInfo = Vue.ref(null);
     const checking = Vue.ref(false);
+    const downloading = Vue.ref(false);
+    const dlProgress = Vue.ref({ received: 0, total: 0 });
+    let removeProgress = null;
 
     async function loadVersion() {
       const r = await window.api.version();
@@ -1508,6 +1516,52 @@ const AdminSystemPage = {
     async function openUpdatePage() {
       const r = await window.api.openUpdatePage();
       if (!r.ok) toast(r.message || '打开失败', 'error');
+    }
+
+    const canAutoDownload = Vue.computed(
+      () => !!(updateInfo.value && updateInfo.value.source === 'github' && updateInfo.value.downloadUrl)
+    );
+    const progressPercent = Vue.computed(() => {
+      const { received, total } = dlProgress.value || {};
+      if (!total || total <= 0) return 0;
+      return Math.min(100, Math.round((received / total) * 100));
+    });
+    const progressText = Vue.computed(() => {
+      const { received, total } = dlProgress.value || {};
+      if (total > 0) return fmtSize(received) + ' / ' + fmtSize(total) + '（' + progressPercent.value + '%）';
+      return fmtSize(received);
+    });
+
+    async function downloadUpdateNow() {
+      const info = updateInfo.value;
+      if (!info || !info.downloadUrl || downloading.value) return;
+      downloading.value = true;
+      dlProgress.value = { received: 0, total: 0 };
+      removeProgress = window.api.onDownloadProgress((p) => {
+        dlProgress.value = p;
+      });
+      try {
+        const r = await window.api.downloadUpdate(info.downloadUrl, info.assetName);
+        if (r.ok) {
+          toast('安装包下载完成，已打开文件夹，双击安装即可覆盖升级', 'success');
+        } else if (!r.canceled) {
+          toast(r.message || '下载失败', 'error');
+        } else {
+          toast('已取消下载', 'success');
+        }
+      } catch (e) {
+        toast('下载失败：' + (e.message || e), 'error');
+      } finally {
+        downloading.value = false;
+        if (removeProgress) {
+          removeProgress();
+          removeProgress = null;
+        }
+      }
+    }
+
+    function cancelUpdateDownload() {
+      window.api.cancelDownload();
     }
 
     // 防火墙排查助手：复制放行命令，管理员在「管理员终端」中粘贴执行即可放行端口
@@ -1593,7 +1647,8 @@ const AdminSystemPage = {
       info, localIp, portInput, savingPort, savePort,
       resettingToken, resetToken,
       photoPathInput, savingPath, chooseDir, savePath,
-      version, updateInfo, checking, checkUpdate, openUpdateFolder, openUpdatePage, copyFirewallCmd
+      version, updateInfo, checking, checkUpdate, openUpdateFolder, openUpdatePage, copyFirewallCmd,
+      downloading, downloadUpdateNow, cancelUpdateDownload, canAutoDownload, progressPercent, progressText, fmtSize
     };
   },
   template: `
@@ -1666,11 +1721,23 @@ const AdminSystemPage = {
         </div>
         <div class="info-row">
           <span>更新方式</span>
-          <b>新版本通过 GitHub Releases 发布：启动或点击「检查更新」自动检测；发现新版本后点「前往下载」获取最新安装包，双击安装即可覆盖升级</b>
+          <b>新版本通过 GitHub Releases 发布：启动或点击「检查更新」自动检测，发现新版本后点「一键下载更新」自动下载安装包到本机，双击安装即可覆盖升级</b>
+        </div>
+        <div v-if="downloading" style="margin-top:12px">
+          <div class="update-progress">
+            <div class="update-progress-bar" :style="{ width: progressPercent + '%' }"></div>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
+            <span class="setup-desc">正在下载安装包… {{ progressText }}</span>
+            <button class="btn btn-ghost btn-sm" @click="cancelUpdateDownload">取消</button>
+          </div>
         </div>
         <div style="display:flex;gap:10px;margin-top:16px">
           <button class="btn btn-primary" :disabled="checking" @click="checkUpdate(true)">
             {{ checking ? '检查中…' : '检查更新' }}
+          </button>
+          <button class="btn btn-primary" :disabled="downloading || !canAutoDownload" @click="downloadUpdateNow">
+            {{ downloading ? '下载中…' : '一键下载更新' }}
           </button>
           <button class="btn btn-ghost" @click="openUpdatePage">前往下载页</button>
           <button v-if="info.mode === 'server'" class="btn btn-ghost" @click="openUpdateFolder">打开备用更新文件夹</button>
@@ -1776,6 +1843,10 @@ const app = createApp({
     const ready = Vue.ref(false);
     const needRestart = Vue.ref(false);
     const updateNotice = Vue.ref(null);
+    const updateModal = Vue.ref(null); // 更新提示弹窗
+    const downloading = Vue.ref(false);
+    const dlProgress = Vue.ref({ received: 0, total: 0 });
+    let removeProgress = null;
 
     window.api.systemInfo().then((r) => {
       if (r.ok) sysInfo.value = r.data;
@@ -1786,15 +1857,70 @@ const app = createApp({
     window.api.checkUpdate().then((r) => {
       if (r.ok && r.data && r.data.hasUpdate) {
         updateNotice.value = r.data;
+        // 检测到新版本：自动弹出更新提示，展示当前版本更新内容
+        updateModal.value = r.data;
       }
     });
+
+    const canAutoDownload = Vue.computed(
+      () => !!(updateModal.value && updateModal.value.source === 'github' && updateModal.value.downloadUrl)
+    );
+    const progressPercent = Vue.computed(() => {
+      const { received, total } = dlProgress.value || {};
+      if (!total || total <= 0) return 0;
+      return Math.min(100, Math.round((received / total) * 100));
+    });
+    const progressText = Vue.computed(() => {
+      const { received, total } = dlProgress.value || {};
+      if (total > 0) return fmtSize(received) + ' / ' + fmtSize(total) + '（' + progressPercent.value + '%）';
+      return fmtSize(received);
+    });
+
+    function openUpdateModal() {
+      if (updateNotice.value) updateModal.value = updateNotice.value;
+    }
 
     function closeUpdateNotice() {
       updateNotice.value = null;
     }
 
-    function gotoDownload() {
+    function openReleasePage() {
       window.api.openUpdatePage();
+    }
+
+    // 一键自动下载更新安装包：下载完成后自动打开文件夹定位文件，双击安装即可覆盖升级
+    async function downloadNow() {
+      const info = updateModal.value || updateNotice.value;
+      if (!info || !info.downloadUrl || downloading.value) return;
+      downloading.value = true;
+      dlProgress.value = { received: 0, total: 0 };
+      removeProgress = window.api.onDownloadProgress((p) => {
+        dlProgress.value = p;
+      });
+      try {
+        const r = await window.api.downloadUpdate(info.downloadUrl, info.assetName);
+        if (r.ok) {
+          toast('安装包下载完成，已打开文件夹，双击安装即可覆盖升级', 'success');
+          updateModal.value = null;
+          updateNotice.value = null;
+        } else if (!r.canceled) {
+          toast(r.message || '下载失败', 'error');
+        } else {
+          toast('已取消下载', 'success');
+        }
+      } catch (e) {
+        toast('下载失败：' + (e.message || e), 'error');
+      } finally {
+        downloading.value = false;
+        if (removeProgress) {
+          removeProgress();
+          removeProgress = null;
+        }
+      }
+    }
+
+    function cancelDownload() {
+      window.api.cancelDownload();
     }
 
     function onSetupDone() {
@@ -1820,21 +1946,60 @@ const app = createApp({
 
     return {
       sysInfo, user, token, ready, needRestart, updateNotice,
-      onSetupDone, onServerSaved, onLogin, onLogout, closeUpdateNotice, gotoDownload
+      updateModal, downloading, progressPercent, progressText, canAutoDownload,
+      onSetupDone, onServerSaved, onLogin, onLogout,
+      openUpdateModal, closeUpdateNotice, openReleasePage, downloadNow, cancelDownload
     };
   },
   template: `
     <div style="height:100%;display:flex;flex-direction:column">
       <div v-if="updateNotice" class="update-banner">
         <span>
-          🔔 发现新版本 <b>v{{ updateNotice.latestVersion }}</b>（当前 v{{ updateNotice.currentVersion }}）
-          <template v-if="updateNotice.source === 'github'">，已发布到 GitHub Releases。</template>
-          <template v-else-if="updateNotice.latestFile">，安装包：{{ updateNotice.latestFile }}，请联系管理员获取。</template>
-          <template v-else>，请联系管理员获取更新。</template>
+          🔔 发现新版本 <b>v{{ updateNotice.latestVersion }}</b>（当前 v{{ updateNotice.currentVersion }}），点击查看更新内容与一键下载。
         </span>
         <div style="display:flex;align-items:center;gap:8px">
-          <button class="update-banner-close" style="color:#9a3412;font-weight:600" @click="gotoDownload">前往下载</button>
+          <button class="update-banner-close" style="color:#9a3412;font-weight:600" @click="openUpdateModal">查看并下载</button>
           <button class="update-banner-close" @click="closeUpdateNotice">✕</button>
+        </div>
+      </div>
+
+      <div v-if="updateModal" class="modal-mask">
+        <div class="modal" style="max-width:560px">
+          <div class="modal-head">
+            <h3>发现新版本 v{{ updateModal.latestVersion }}</h3>
+            <button class="modal-close" :disabled="downloading" @click="updateModal = null">✕</button>
+          </div>
+          <div class="modal-body">
+            <div class="info-row"><span>当前版本</span><b class="code">v{{ updateModal.currentVersion }}</b></div>
+            <div class="info-row"><span>最新版本</span><b class="code">v{{ updateModal.latestVersion }}</b></div>
+
+            <div class="card-title" style="margin-top:16px">本版本更新内容</div>
+            <pre v-if="updateModal.releaseNotes" class="release-notes">{{ updateModal.releaseNotes }}</pre>
+            <div v-else class="setup-desc">
+              本次更新内容暂未提供，可打开下载页查看完整发布说明。
+            </div>
+
+            <div v-if="updateModal.source !== 'github'" class="setup-desc" style="margin-top:12px">
+              当前运行环境无法连接 GitHub，无法使用自动下载。请联系管理员从服务端更新文件夹获取安装包。
+            </div>
+
+            <div v-if="downloading" style="margin-top:14px">
+              <div class="update-progress">
+                <div class="update-progress-bar" :style="{ width: progressPercent + '%' }"></div>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
+                <span class="setup-desc">正在下载安装包… {{ progressText }}</span>
+                <button class="btn btn-ghost btn-sm" @click="cancelDownload">取消</button>
+              </div>
+            </div>
+          </div>
+          <div class="modal-foot">
+            <button class="btn btn-ghost" :disabled="downloading" @click="updateModal = null">稍后再说</button>
+            <button v-if="canAutoDownload" class="btn btn-primary" :disabled="downloading" @click="downloadNow">
+              {{ downloading ? '下载中…' : '一键下载更新' }}
+            </button>
+            <button v-else class="btn btn-primary" :disabled="downloading" @click="openReleasePage">打开下载页</button>
+          </div>
         </div>
       </div>
       <div style="flex:1;min-height:0">
