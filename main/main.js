@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, session, Menu, protocol, net } = require('electron');
+const { app, BrowserWindow, ipcMain, session, Menu, protocol, net, Tray, nativeImage, powerSaveBlocker } = require('electron');
 const path = require('path');
 const http = require('http');
 const https = require('https');
@@ -41,6 +41,11 @@ const store = createStore({
 });
 
 let httpServer = null;
+
+// 服务端后台常驻（需求13）：托盘图标、真正退出标志、防休眠句柄
+let tray = null;
+let isQuitting = false;
+let powerSaveId = null;
 
 // ---------- 远程调用（客户端模式把 IPC 转发到服务端节点） ----------
 function remoteCall(route, body, sessionToken) {
@@ -109,6 +114,7 @@ function localCall(route, body, token) {
     'records/delete': () => store.deleteRecord(token, b.id),
     'records/deleteBatch': () => store.deleteRecords(token, b.ids),
     'records/exportPhotos': () => store.exportPhotos(token, b),
+    'records/exportPhotosByDate': () => store.exportPhotosByDate(token, b),
     'users/list': () => store.listUsers(token),
     'users/create': () => store.createUser(token, b),
     'users/update': () => store.updateUser(token, b),
@@ -125,17 +131,114 @@ function localCall(route, body, token) {
   }
 }
 
+// ---------- 离线降级判定与离线会话 ----------
+// 客户端模式下服务器失联（网络层错误）时，允许用本机镜像继续工作。
+// 注意：业务层错误（如密码错误、无权限）不属于失联，不得降级，避免绕过服务端校验。
+function isConnFailure(r) {
+  if (!r || r.ok) return false;
+  const m = String(r.message || '');
+  return /无法连接|连接超时|尚未配置|返回数据异常|ETIMEDOUT|ECONNREFUSED|ECONNRESET|EAI_AGAIN|ENOTFOUND|socket hang up/i.test(m);
+}
+
+// 离线会话：本机镜像登录产生的令牌，仅在服务器失联期间有效
+const offlineSessions = new Map(); // localToken -> { username, offlineSince }
+let syncTimer = null;
+
 // ---------- 统一分发：按运行模式决定本地执行或远程转发 ----------
 async function dispatch(route, body, sessionToken) {
   try {
     const cfg = store.loadConfig();
     if (cfg.mode === 'client') {
-      return await remoteCall(route, body, sessionToken);
+      // 离线会话令牌：直接走本机镜像（服务器恢复后需重新登录建立在线会话）
+      const off = offlineSessions.get(sessionToken);
+      if (off && off.offlineSince) {
+        const lr = await localCall(route, body, off.localToken);
+        if (lr.ok) lr.offline = true;
+        return lr;
+      }
+      const r = await remoteCall(route, body, sessionToken);
+      if (!isConnFailure(r)) {
+        // 服务器可达：顺带触发待同步存档补传
+        if (r.ok && store.pendingSyncCount() > 0) scheduleSync();
+        return r;
+      }
+      // 服务器失联：降级到本机镜像，保证门店不停工
+      const sess = offlineSessions.get(sessionToken);
+      const localToken = sess ? sess.localToken : sessionToken;
+      if (route === 'records/add') {
+        try {
+          const data = store.addRecordOffline(localToken, body || {});
+          return { ok: true, data, offline: true };
+        } catch (e) {
+          return { ok: false, message: e.message || String(e) };
+        }
+      }
+      const lr = await localCall(route, body, localToken);
+      if (lr.ok) lr.offline = true;
+      return lr;
     }
     return await localCall(route, body, sessionToken);
   } catch (e) {
     return { ok: false, message: e.message || String(e) };
   }
+}
+
+// ---------- 离线存档同步：服务器恢复后把待同步记录补传到服务端 ----------
+async function syncOfflineRecords() {
+  const cfg = store.loadConfig();
+  if (cfg.mode !== 'client' || !cfg.serverUrl) return { synced: 0, failed: 0 };
+  const fs = require('fs');
+  const queue = store.offlineQueueTake(50);
+  if (!queue.length) return { synced: 0, failed: 0 };
+
+  // 用当前离线会话在服务端的令牌补传；无有效令牌时跳过本轮
+  let remoteToken = '';
+  for (const s of offlineSessions.values()) {
+    if (s.serverToken) {
+      remoteToken = s.serverToken;
+      break;
+    }
+  }
+  if (!remoteToken) return { synced: 0, failed: 0, reason: '缺少可用的登录会话，暂不同步' };
+
+  let synced = 0;
+  let failed = 0;
+  for (const item of queue) {
+    try {
+      if (!fs.existsSync(item.photoAbsPath)) {
+        // 照片已丢失，无法补传，丢弃该项避免永久卡住队列
+        store.offlineQueueRemove([item.id]);
+        failed++;
+        continue;
+      }
+      const imageData = 'data:image/jpeg;base64,' + fs.readFileSync(item.photoAbsPath).toString('base64');
+      const r = await remoteCall(
+        'records/add',
+        { imageData, barcode: item.barcode, note: item.note, syncFromOffline: true },
+        remoteToken
+      );
+      if (!r.ok) {
+        failed++;
+        break; // 多为连接或权限问题，停止本轮同步，下次再试
+      }
+      store.replaceOfflineRecord(item.id, r.data);
+      store.offlineQueueRemove([item.id]);
+      synced++;
+    } catch (e) {
+      failed++;
+      break;
+    }
+  }
+  return { synced, failed, remaining: store.pendingSyncCount() };
+}
+
+function scheduleSync() {
+  if (syncTimer) clearTimeout(syncTimer);
+  // 服务器恢复后延迟触发，避免与界面操作争抢
+  syncTimer = setTimeout(() => {
+    syncTimer = null;
+    syncOfflineRecords().catch(() => {});
+  }, 1500);
 }
 
 // ---------- IPC 注册 ----------
@@ -149,8 +252,67 @@ function handle(channel, fn) {
   });
 }
 
-handle('auth:login', (p) => dispatch('auth/login', p));
-handle('auth:logout', (_p, token) => dispatch('auth/logout', undefined, token));
+// 客户端登录：远程成功后镜像账号与存档到本机；服务器失联时用镜像离线登录
+async function clientLogin(p) {
+  const cfg = store.loadConfig();
+  const r = await remoteCall('auth/login', p, '');
+  if (!isConnFailure(r)) {
+    if (r.ok) {
+      // 镜像账号（本机重新生成校验子）与该账号的近期存档，供离线使用；
+      // 并用同一令牌在本机建立会话，服务器失联时该令牌可直接降级使用
+      try {
+        store.mirrorUser(r.data.user, p.password);
+        store.mirrorLogin(r.data.user, r.data.sessionToken);
+        const list = await remoteCall('records/list', { silent: true, pageSize: 100 }, r.data.sessionToken);
+        if (list.ok && list.data) store.mirrorRecords(list.data.items);
+      } catch (e) {
+        /* 镜像失败不影响正常登录 */
+      }
+      offlineSessions.set(r.data.sessionToken, {
+        username: r.data.user.username,
+        localToken: r.data.sessionToken,
+        serverToken: r.data.sessionToken,
+        offlineSince: null
+      });
+      if (store.pendingSyncCount() > 0) scheduleSync();
+      // 登录成功后异步检查服务端强制推送的安装包，不阻塞登录返回；
+      // 需要更新时后台静默下载，完成后由 update:force 事件通知界面弹窗提示安装
+      checkForceUpdateForClient().catch(() => {});
+    }
+    return r;
+  }
+  // 服务器失联：用本机镜像离线登录（本机无缓存时提示）
+  try {
+    const local = store.login(p);
+    offlineSessions.set(local.sessionToken, {
+      username: local.user.username,
+      localToken: local.sessionToken,
+      serverToken: '',
+      offlineSince: Date.now()
+    });
+    return { ok: true, data: { user: local.user, sessionToken: local.sessionToken }, offline: true };
+  } catch (e) {
+    return {
+      ok: false,
+      message: '无法连接服务器，且本机没有该账号的离线缓存：' + (e.message || String(e))
+    };
+  }
+}
+
+handle('auth:login', async (p) => {
+  // 激活拦截：试用到期后必须输入激活码才能继续使用
+  const lic = store.licenseStatus();
+  if (lic.state === 'expired') {
+    return { ok: false, expired: true, message: '试用期已结束，请在本机输入激活码后继续使用（机器码：' + lic.machineCode + '）', license: lic };
+  }
+  const cfg = store.loadConfig();
+  if (cfg.mode === 'client') return clientLogin(p);
+  return dispatch('auth/login', p);
+});
+handle('auth:logout', (_p, token) => {
+  offlineSessions.delete(token);
+  return dispatch('auth/logout', undefined, token);
+});
 handle('auth:current', (_p, token) => dispatch('auth/current', undefined, token));
 handle('auth:changePassword', (p, token) => dispatch('auth/changePassword', p, token));
 
@@ -250,6 +412,87 @@ handle('records:exportPhotos', async (p, token) => {
   return dispatch('records/exportPhotos', p, token);
 });
 
+// 客户端模式：按日期范围拉取记录与照片，按条码文件夹保存并生成归档表格
+async function clientExportPhotosByDate(p, sessionToken) {
+  const fs = require('fs');
+  const targetDir = String((p && p.targetDir) || '').trim();
+  if (!targetDir) return { ok: false, message: '请先选择保存目录' };
+  const dateFrom = String(p.dateFrom || '').trim();
+  const dateTo = String(p.dateTo || '').trim();
+  if (!dateFrom || !dateTo) return { ok: false, message: '请选择开始与结束日期' };
+  if (dateFrom > dateTo) return { ok: false, message: '开始日期不能晚于结束日期' };
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  const base = { silent: true, pageSize: 100, dateFrom, dateTo };
+  const all = [];
+  let page = 1;
+  for (;;) {
+    const r = await dispatch('records/list', { ...base, page }, sessionToken);
+    if (!r.ok) return r;
+    all.push(...r.data.items);
+    if (r.data.items.length < base.pageSize || page > 500) break;
+    page++;
+  }
+  if (!all.length) return { ok: false, message: '该日期范围内没有存档记录，无法导出' };
+
+  const cfg = store.loadConfig();
+  const photoUrl = (file) =>
+    cfg.serverUrl + '/photo?f=' + encodeURIComponent(file) + '&token=' + encodeURIComponent(cfg.serverToken);
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmtTime = (iso) => {
+    const d = new Date(iso || '');
+    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}`;
+  };
+
+  const groups = new Map();
+  for (const r of all) {
+    const code = String(r.barcode || '');
+    if (!groups.has(code)) groups.set(code, []);
+    groups.get(code).push(r);
+  }
+
+  const rows = [['条码', '文件位置']];
+  let exported = 0;
+  let skipped = 0;
+  let failed = 0;
+  for (const [code, list] of groups) {
+    const safeCode = code.replace(/[\\/:*?"<>|]/g, '_').slice(0, 64) || '未命名';
+    const dir = path.join(targetDir, safeCode);
+    fs.mkdirSync(dir, { recursive: true });
+    list.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+    for (const r of list) {
+      const ext = path.extname(r.photoFile) || '.jpg';
+      const name = `${fmtTime(r.createdAt)}_第${r.seq}张${ext}`;
+      const dst = path.join(dir, name);
+      try {
+        const resp = await net.fetch(photoUrl(r.photoFile));
+        if (!resp.ok) {
+          skipped++;
+          continue;
+        }
+        const buf = Buffer.from(await resp.arrayBuffer());
+        fs.writeFileSync(dst, buf);
+        exported++;
+        rows.push([code, dst]);
+      } catch (e) {
+        failed++;
+      }
+    }
+  }
+
+  const csv = rows.map((row) => row.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
+  const csvPath = path.join(targetDir, `导出清单_${dateFrom}_${dateTo}.csv`);
+  fs.writeFileSync(csvPath, '\ufeff' + csv, 'utf8');
+
+  return { ok: true, data: { exported, skipped, failed, folders: groups.size, targetDir, csvPath } };
+}
+
+handle('records:exportPhotosByDate', async (p, token) => {
+  const cfg = store.loadConfig();
+  if (cfg.mode === 'client') return clientExportPhotosByDate(p, token);
+  return dispatch('records/exportPhotosByDate', p, token);
+});
+
 handle('users:list', (_p, token) => dispatch('users/list', undefined, token));
 handle('users:create', (p, token) => dispatch('users/create', p, token));
 handle('users:update', (p, token) => dispatch('users/update', p, token));
@@ -264,6 +507,75 @@ handle('system:info', () => {
   return { ok: true, data: info };
 });
 
+// ---------- 激活与试用 ----------
+handle('license:status', () => {
+  return { ok: true, data: store.licenseStatus() };
+});
+
+handle('license:activate', (code) => {
+  try {
+    const data = store.activate(code);
+    return { ok: true, data };
+  } catch (e) {
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
+// ---------- 离线状态与手动同步 ----------
+handle('offline:status', async () => {
+  const cfg = store.loadConfig();
+  let online = true;
+  if (cfg.mode === 'client' && cfg.serverUrl) {
+    // 用 /ping 轻量探测服务器是否可达（3 秒超时）
+    online = await new Promise((resolve) => {
+      let url;
+      try {
+        url = new URL(cfg.serverUrl.replace(/\/+$/, '') + '/ping');
+      } catch (e) {
+        return resolve(false);
+      }
+      const lib = url.protocol === 'https:' ? https : http;
+      const req = lib.request(
+        {
+          method: 'GET',
+          hostname: url.hostname,
+          port: url.port || (url.protocol === 'https:' ? 443 : 80),
+          path: url.pathname,
+          timeout: 3000
+        },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode === 200);
+        }
+      );
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(false);
+      });
+      req.on('error', () => resolve(false));
+      req.end();
+    });
+  }
+  return {
+    ok: true,
+    data: {
+      online,
+      mode: cfg.mode,
+      pending: store.pendingSyncCount(),
+      queue: store.offlineQueueList()
+    }
+  };
+});
+
+handle('offline:sync', async () => {
+  try {
+    const data = await syncOfflineRecords();
+    return { ok: true, data };
+  } catch (e) {
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
 handle('system:setMode', async (mode) => {
   const data = store.setMode(mode);
   if (data.mode === 'server') {
@@ -271,6 +583,7 @@ handle('system:setMode', async (mode) => {
   } else if (httpServer) {
     await httpServer.close();
     httpServer = null;
+    destroyTray();
   }
   return { ok: true, data };
 });
@@ -281,6 +594,7 @@ handle('system:setClientConfig', async ({ serverUrl, serverToken } = {}) => {
     if (httpServer) {
       await httpServer.close();
       httpServer = null;
+      destroyTray();
     }
     return { ok: true, data };
   } catch (e) {
@@ -360,25 +674,44 @@ handle('system:photoPath', (p, token) => {
   }
 });
 
-handle('system:chooseExportDir', () => {
-  const { dialog } = require('electron');
-  return dialog
-    .showOpenDialog(mainWindow, {
-      title: '选择照片导出保存目录',
-      properties: ['openDirectory', 'createDirectory']
-    })
-    .then((r) => (r.canceled || !r.filePaths.length ? { ok: false, message: '已取消' } : { ok: true, data: r.filePaths[0] }));
-});
+// ---------- 窗口焦点保护 ----------
+// Windows 下调用原生对话框会抢走前台焦点；若此时主窗口处于最小化或失焦状态，
+// 对话框关闭后主窗口可能再也收不到鼠标输入，表现为「所有输入框点不动，必须重启软件」。
+// 因此弹出原生对话框前先把窗口恢复到前台，关闭后再夺回焦点。
+function ensureWindowFocus() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    if (!mainWindow.isVisible()) mainWindow.show();
+    mainWindow.focus();
+    mainWindow.webContents.focus();
+  } catch (e) {
+    /* 忽略 */
+  }
+}
 
-handle('system:choosePhotoDir', () => {
+// 统一的目录选择：调用前后各恢复一次焦点，任何结果（含取消、异常）都不留下失焦窗口
+function chooseDirectory(title) {
   const { dialog } = require('electron');
+  ensureWindowFocus();
   return dialog
     .showOpenDialog(mainWindow, {
-      title: '选择照片保存目录',
+      title,
       properties: ['openDirectory', 'createDirectory']
     })
-    .then((r) => (r.canceled || !r.filePaths.length ? { ok: false, message: '已取消' } : { ok: true, data: r.filePaths[0] }));
-});
+    .then((r) => {
+      ensureWindowFocus();
+      return r.canceled || !r.filePaths.length ? { ok: false, message: '已取消' } : { ok: true, data: r.filePaths[0] };
+    })
+    .catch((e) => {
+      ensureWindowFocus();
+      return { ok: false, message: e.message || String(e) };
+    });
+}
+
+handle('system:chooseExportDir', () => chooseDirectory('选择照片导出保存目录'));
+
+handle('system:choosePhotoDir', () => chooseDirectory('选择照片保存目录'));
 
 handle('system:version', () => {
   return { ok: true, data: { version: APP_VERSION } };
@@ -471,11 +804,13 @@ handle('system:openUpdatePage', () => {
 });
 
 // ---------- 自动下载更新安装包 ----------
-// 从 GitHub Releases 下载安装包到「下载」目录下的专属文件夹，边下边报进度，完成后自动打开文件夹定位文件。
+// 从 GitHub Releases 或服务端强制推送地址下载安装包到「下载」目录下的专属文件夹，
+// 边下边报进度，完成后自动打开文件夹定位文件。手动下载与强制推送自动下载共用此实现。
 let activeDownload = null;
 
-handle('system:downloadUpdate', async ({ url, name } = {}) => {
+async function downloadInstaller(url, name, opts = {}) {
   const fs = require('fs');
+  const openFolder = opts.openFolder !== false;
   if (activeDownload) return { ok: false, message: '正在下载中，请稍候…' };
   if (!url || !/^https?:\/\//i.test(String(url))) return { ok: false, message: '下载地址无效' };
   if (!mainWindow) return { ok: false, message: '窗口未就绪' };
@@ -497,6 +832,19 @@ handle('system:downloadUpdate', async ({ url, name } = {}) => {
   };
 
   const controller = new AbortController();
+  // 无响应看门狗：连续 30 秒收不到任何数据即中止下载，
+  // 避免网络请求永久挂起导致下载状态无法解除、界面被全屏弹窗锁死
+  const IDLE_TIMEOUT_MS = 30000;
+  let timedOut = false;
+  let idleTimer = null;
+  const resetIdleTimer = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, IDLE_TIMEOUT_MS);
+  };
+  resetIdleTimer();
   activeDownload = { url: String(url), cancel: () => controller.abort() };
   try {
     const resp = await net.fetch(String(url), {
@@ -509,6 +857,7 @@ handle('system:downloadUpdate', async ({ url, name } = {}) => {
     let lastSent = 0;
     const out = fs.createWriteStream(tmp);
     for await (const chunk of resp.body) {
+      resetIdleTimer();
       out.write(chunk);
       received += chunk.length;
       const t = Date.now();
@@ -532,8 +881,12 @@ handle('system:downloadUpdate', async ({ url, name } = {}) => {
       finalTarget = path.join(dir, fileName.replace(/(\.exe)?$/i, '-' + Date.now() + '$1'));
       fs.renameSync(tmp, finalTarget);
     }
-    const { shell } = require('electron');
-    shell.showItemInFolder(finalTarget);
+    if (openFolder) {
+      const { shell } = require('electron');
+      shell.showItemInFolder(finalTarget);
+      // 资源管理器窗口会抢走前台焦点，稍后夺回，避免返回软件后输入框点不动
+      setTimeout(() => ensureWindowFocus(), 600);
+    }
     return { ok: true, data: { file: finalTarget, size: received } };
   } catch (e) {
     try {
@@ -541,17 +894,146 @@ handle('system:downloadUpdate', async ({ url, name } = {}) => {
     } catch (_) {
       /* 忽略 */
     }
+    if (timedOut) return { ok: false, message: '下载超时：网络连接不稳定，请稍后重试' };
     if (controller.signal.aborted) return { ok: false, canceled: true, message: '已取消下载' };
     return { ok: false, message: '下载失败：' + (e.message || String(e)) };
   } finally {
+    if (idleTimer) clearTimeout(idleTimer);
     activeDownload = null;
   }
-});
+}
+
+handle('system:downloadUpdate', ({ url, name } = {}) => downloadInstaller(url, name));
 
 handle('system:cancelDownload', () => {
   if (!activeDownload) return { ok: false, message: '当前没有正在进行的下载' };
   activeDownload.cancel();
   return { ok: true };
+});
+
+// ---------- 服务端强制推送安装包 ----------
+// 服务端管理员在「系统设置」中选择更新文件夹里的安装包并开启强制推送；
+// 客户端下次登录时自动查询，发现推送版本高于本机版本即静默下载并弹窗提示安装。
+handle('system:forceUpdate', async () => {
+  try {
+    const cfg = store.loadConfig();
+    if (cfg.mode === 'client' && cfg.serverUrl) {
+      const r = await remoteCall('system/forceUpdate', {});
+      if (!r.ok) return { ok: false, message: r.message || '获取服务端推送设置失败' };
+      return { ok: true, data: { ...r.data, fromServer: true } };
+    }
+    return { ok: true, data: store.getForceUpdate() };
+  } catch (e) {
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
+handle('system:setForceUpdate', (p, token) => {
+  try {
+    const data = store.setForceUpdate(token, p || {});
+    return { ok: true, data };
+  } catch (e) {
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
+// 拼装服务端安装包下载地址（连接码放查询参数，下载走 net.fetch 无法附加自定义请求头）
+function buildServerUpdateUrl(cfg, fileName) {
+  return (
+    cfg.serverUrl.replace(/\/+$/, '') +
+    '/update-file?f=' +
+    encodeURIComponent(fileName) +
+    '&token=' +
+    encodeURIComponent(cfg.serverToken || '')
+  );
+}
+
+// 客户端登录成功后调用：检查服务端强制推送，需要时静默下载安装包并通知界面弹窗
+async function checkForceUpdateForClient() {
+  const cfg = store.loadConfig();
+  if (cfg.mode !== 'client' || !cfg.serverUrl) {
+    return { ok: true, data: { needUpdate: false, reason: 'not-client' } };
+  }
+  const r = await remoteCall('system/forceUpdate', {});
+  if (!r.ok || !r.data) return { ok: true, data: { needUpdate: false, reason: 'query-failed' } };
+  const f = r.data;
+  if (!f.enabled || !f.version) return { ok: true, data: { needUpdate: false, reason: 'not-pushed' } };
+  if (store.compareVersions(f.version, APP_VERSION) <= 0) {
+    return { ok: true, data: { needUpdate: false, reason: 'already-new', version: f.version } };
+  }
+  if (!f.fileExists || !f.fileName) {
+    return { ok: true, data: { needUpdate: false, reason: 'file-missing', version: f.version } };
+  }
+
+  // 本机已下载过同一安装包（同名且大小一致）时不重复下载，直接提示安装
+  const fs = require('fs');
+  const dir = path.join(app.getPath('downloads'), 'xingqiyi-laundry-photo');
+  const cached = path.join(dir, f.fileName);
+  let payload = {
+    needUpdate: true,
+    version: f.version,
+    fileName: f.fileName,
+    file: cached,
+    size: 0,
+    downloaded: false
+  };
+  try {
+    if (fs.existsSync(cached)) {
+      payload.size = fs.statSync(cached).size;
+      payload.downloaded = true;
+    }
+  } catch (e) {
+    /* 缓存检查失败则走下载 */
+  }
+
+  if (!payload.downloaded) {
+    if (activeDownload) return { ok: true, data: { ...payload, reason: 'busy' } };
+    const dl = await downloadInstaller(buildServerUpdateUrl(cfg, f.fileName), f.fileName, { openFolder: false });
+    if (!dl.ok) {
+      return { ok: true, data: { needUpdate: false, reason: 'download-failed', message: dl.message, version: f.version } };
+    }
+    payload = { ...payload, file: dl.data.file, size: dl.data.size, downloaded: true };
+  }
+
+  // 通知界面弹出强制更新提示（登录页与主框架都在监听）
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('update:force', payload);
+  } catch (e) {
+    /* 窗口未就绪时忽略，界面仍可通过 checkForceUpdate 主动查询 */
+  }
+  return { ok: true, data: payload };
+}
+
+handle('system:checkForceUpdate', () => checkForceUpdateForClient());
+
+// 打开已下载的安装包所在文件夹并定位文件（强制推送下载完成后由弹窗按钮触发）
+handle('system:openInstaller', (p) => {
+  const fs = require('fs');
+  const { shell } = require('electron');
+  const file = String((p && p.file) || '');
+  if (!file || !fs.existsSync(file)) return { ok: false, message: '安装包文件不存在，可能已被移动或删除' };
+  shell.showItemInFolder(file);
+  // 资源管理器窗口会抢走前台焦点，稍后夺回，避免返回软件后输入框点不动
+  setTimeout(() => ensureWindowFocus(), 600);
+  return { ok: true, data: file };
+});
+
+// 直接启动安装程序（用户点击「立即安装」时使用）
+handle('system:runInstaller', (p) => {
+  const fs = require('fs');
+  const { shell } = require('electron');
+  const file = String((p && p.file) || '');
+  if (!file || !fs.existsSync(file)) return { ok: false, message: '安装包文件不存在，可能已被移动或删除' };
+  if (!/\.exe$/i.test(file)) {
+    // 非可执行安装包（如 zip）只做定位，由用户自行解压安装
+    shell.showItemInFolder(file);
+    return { ok: true, data: { opened: false, file } };
+  }
+  return shell.openPath(file).then((err) => {
+    if (err) return { ok: false, message: '启动安装程序失败：' + err };
+    setTimeout(() => ensureWindowFocus(), 600);
+    return { ok: true, data: { opened: true, file } };
+  });
 });
 
 handle('system:copyText', (text) => {
@@ -565,6 +1047,8 @@ handle('system:openUpdateDir', () => {
   const dir = store.getUpdateDir();
   require('fs').mkdirSync(dir, { recursive: true });
   shell.openPath(dir);
+  // 资源管理器窗口会抢走前台焦点，稍后夺回，避免返回软件后输入框点不动
+  setTimeout(() => ensureWindowFocus(), 600);
   return { ok: true, data: dir };
 });
 
@@ -593,6 +1077,15 @@ async function restartServerIfNeeded() {
       httpServer = null;
     }
     httpServer = await startServer(store, { port: cfg.port });
+    // 服务端后台常驻（需求13）：运行时切换到服务端也创建托盘并防休眠
+    createTray();
+    if (powerSaveId === null) {
+      try {
+        powerSaveId = powerSaveBlocker.start('prevent-app-suspension');
+      } catch (e) {
+        /* 忽略 */
+      }
+    }
   } catch (e) {
     console.error('[server] 启动失败：' + (e.message || e));
   }
@@ -626,12 +1119,108 @@ function createWindow() {
   });
   mainWindow.webContents.on('render-process-gone', (_e, details) => {
     console.error('[main] 渲染进程异常退出: ' + details.reason);
+    // 渲染进程崩溃后界面会整体失去响应（含输入框），自动重载恢复，避免用户只能手动重启软件
+    if (details.reason !== 'clean-exit' && mainWindow && !mainWindow.isDestroyed()) {
+      try {
+        mainWindow.loadURL(APP_SCHEME + '://renderer/index.html');
+      } catch (e) {
+        /* 忽略 */
+      }
+    }
+  });
+
+  // 窗口重新获得焦点时把焦点交回页面内容：
+  // 原生对话框、资源管理器窗口关闭后，Windows 可能只把焦点给到窗口边框而不给页面，
+  // 此时所有输入框都点不动，这里主动补一次 webContents.focus() 作为兜底。
+  mainWindow.on('focus', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      try {
+        mainWindow.webContents.focus();
+      } catch (e) {
+        /* 忽略 */
+      }
+    }
   });
 
   mainWindow.loadURL(APP_SCHEME + '://renderer/index.html');
+
+  // 服务端后台常驻（需求13）：服务端模式下点关闭按钮只把窗口隐藏到托盘，
+  // HTTP 服务继续运行，避免店员客户端断连；只有托盘「退出程序」或系统退出才真正关闭。
+  mainWindow.on('close', (e) => {
+    if (isQuitting) return;
+    if (isServerRunning()) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
+}
+
+// 服务端是否正在后台提供 HTTP 服务（用于决定是否常驻托盘）
+function isServerRunning() {
+  const cfg = store.loadConfig();
+  return cfg.mode === 'server' && !!httpServer;
+}
+
+// 显示并聚焦主窗口（托盘菜单 / 双击托盘图标 / 窗口已销毁时重建）
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+// 创建系统托盘图标（服务端模式），提供「显示主窗口」与「退出程序」入口
+function createTray() {
+  if (tray) return;
+  try {
+    const iconPath = path.join(RENDERER_DIR, 'assets', 'logo.png');
+    const image = nativeImage.createFromPath(iconPath);
+    const trayImage = image.isEmpty() ? nativeImage.createEmpty() : image.resize({ width: 16, height: 16 });
+    tray = new Tray(trayImage);
+    tray.setToolTip('星期衣精致洗衣衣物照片系统（服务运行中）');
+    const menu = Menu.buildFromTemplate([
+      { label: '显示主窗口', click: () => showMainWindow() },
+      { type: 'separator' },
+      {
+        label: '退出程序',
+        click: () => {
+          isQuitting = true;
+          app.quit();
+        }
+      }
+    ]);
+    tray.setContextMenu(menu);
+    tray.on('double-click', () => showMainWindow());
+  } catch (e) {
+    console.error('[tray] 创建托盘失败：' + (e.message || e));
+    tray = null;
+  }
+}
+
+// 销毁托盘图标并释放防休眠句柄
+function destroyTray() {
+  if (tray) {
+    try {
+      tray.destroy();
+    } catch (e) {
+      /* 忽略 */
+    }
+    tray = null;
+  }
+  if (powerSaveId !== null) {
+    try {
+      powerSaveBlocker.stop(powerSaveId);
+    } catch (e) {
+      /* 忽略 */
+    }
+    powerSaveId = null;
+  }
 }
 
 app.whenReady().then(async () => {
@@ -682,6 +1271,15 @@ app.whenReady().then(async () => {
   if (cfg.mode === 'server') {
     try {
       httpServer = await startServer(store, { port: cfg.port });
+      // 服务端后台常驻（需求13）：创建托盘图标，并阻止系统休眠导致服务中断
+      createTray();
+      if (powerSaveId === null) {
+        try {
+          powerSaveId = powerSaveBlocker.start('prevent-app-suspension');
+        } catch (e) {
+          /* 忽略 */
+        }
+      }
     } catch (e) {
       console.error('[server] 启动失败：' + (e.message || e));
     }
@@ -695,15 +1293,21 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
+  // 服务端后台常驻（需求13）：服务仍在运行时不退出，保持托盘常驻，
+  // 避免店员客户端因服务端进程退出而连接失效；客户端模式维持原有「关窗即退出」。
+  if (isServerRunning()) return;
   app.quit();
 });
 
 app.on('before-quit', () => {
+  isQuitting = true;
+  destroyTray();
   if (httpServer) {
     try {
       httpServer.close();
     } catch (e) {
       /* 忽略 */
     }
+    httpServer = null;
   }
 });

@@ -257,6 +257,15 @@ check('迁移后新照片写入新路径', () => {
   const r = store.addRecord(adminToken, { imageData: tinyJpeg, barcode: 'NEWPATH01' });
   if (!fs.existsSync(path.join(store.getPhotoDir(), r.photoFile))) throw new Error('新照片未写入新路径');
 });
+check('远程客户端状态下禁止修改照片路径', () => {
+  store.setClientConfig('192.168.1.10:17521', 'abc123');
+  if (store.systemInfo().remoteClient !== true) throw new Error('systemInfo 未标记 remoteClient');
+  const blocked = path.join(tmpDir, 'remote-block');
+  expectThrow(() => store.setPhotoPath(adminToken, blocked), '远程连接服务器');
+  if (fs.existsSync(blocked)) throw new Error('被拒绝时不应创建目标目录');
+  store.setMode('server'); // 恢复
+  if (store.systemInfo().remoteClient !== false) throw new Error('恢复服务端后仍标记为远程');
+});
 
 console.log('== 批量删除 ==');
 check('批量删除空列表被拒绝', () => {
