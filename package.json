@@ -16,7 +16,6 @@
   },
   "author": "星期衣精致洗衣",
   "license": "MIT",
-  "dependencies": {},
   "devDependencies": {
     "electron": "^33.0.0",
     "electron-builder": "^26.15.3",
@@ -38,7 +37,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ]
     },
