@@ -38,6 +38,96 @@ function fmtSize(n) {
   return (n / 1048576).toFixed(1) + ' MB';
 }
 
+/**
+ * 共用的「版本与安装包下载」逻辑。
+ * 登录页、客户端设置页、管理端系统设置页都要展示当前版本并支持一键下载安装包，
+ * 统一在此实现，避免多份拷贝出现行为不一致。
+ *
+ * 说明：checkUpdate 即使没有新版本也会返回下载地址，因此始终可以下载最新安装包。
+ */
+function useUpdater() {
+  const version = Vue.ref('');
+  const updateInfo = Vue.ref(null);
+  const downloading = Vue.ref(false);
+  const dlProgress = Vue.ref({ received: 0, total: 0 });
+  let removeProgress = null;
+
+  const canAutoDownload = Vue.computed(
+    () => !!(updateInfo.value && updateInfo.value.source === 'github' && updateInfo.value.downloadUrl)
+  );
+  const progressPercent = Vue.computed(() => {
+    const { received, total } = dlProgress.value || {};
+    if (!total || total <= 0) return 0;
+    return Math.min(100, Math.round((received / total) * 100));
+  });
+  const progressText = Vue.computed(() => {
+    const { received, total } = dlProgress.value || {};
+    if (total > 0) return fmtSize(received) + ' / ' + fmtSize(total) + '（' + progressPercent.value + '%）';
+    return fmtSize(received);
+  });
+
+  // 组件销毁时必须注销进度监听，否则反复进出页面会累积回调
+  function dispose() {
+    if (removeProgress) {
+      removeProgress();
+      removeProgress = null;
+    }
+  }
+
+  async function loadVersion() {
+    const r = await window.api.version();
+    if (r.ok && r.data) version.value = r.data.version;
+  }
+
+  async function refreshUpdateInfo() {
+    const u = await window.api.checkUpdate();
+    if (u.ok && u.data) updateInfo.value = u.data;
+    return updateInfo.value;
+  }
+
+  async function downloadPackage() {
+    const info = updateInfo.value;
+    if (!info || !info.downloadUrl || downloading.value) return;
+    if (!canAutoDownload.value) {
+      // 无法访问 GitHub 时回退为打开下载页
+      window.api.openUpdatePage();
+      return;
+    }
+    downloading.value = true;
+    dlProgress.value = { received: 0, total: 0 };
+    removeProgress = window.api.onDownloadProgress((p) => {
+      dlProgress.value = p;
+    });
+    try {
+      const r = await window.api.downloadUpdate(info.downloadUrl, info.assetName);
+      if (r.ok) {
+        toast('安装包下载完成，已打开文件夹，双击安装即可覆盖升级', 'success');
+      } else if (!r.canceled) {
+        toast(r.message || '下载失败', 'error');
+      } else {
+        toast('已取消下载', 'success');
+      }
+    } catch (e) {
+      toast('下载失败：' + (e.message || e), 'error');
+    } finally {
+      downloading.value = false;
+      dispose();
+    }
+  }
+
+  function cancelDownload() {
+    window.api.cancelDownload();
+  }
+
+  Vue.onUnmounted(dispose);
+
+  return {
+    version, updateInfo, downloading, dlProgress,
+    canAutoDownload, progressPercent, progressText,
+    loadVersion, refreshUpdateInfo, downloadPackage, cancelDownload
+  };
+}
+
 /* ---------- 启动设置页（首次使用 / 切换运行模式） ---------- */
 const SetupPage = {
   emits: ['done'],
@@ -161,6 +251,64 @@ const LoginPage = {
     const testMsg = Vue.ref('');
     const savingServer = Vue.ref(false);
 
+    // 激活与试用状态
+    const license = Vue.ref(null);
+    const showActivate = Vue.ref(false);
+    const activateCode = Vue.ref('');
+    const activateMsg = Vue.ref('');
+    const activating = Vue.ref(false);
+
+    // 版本与安装包下载：登录页即可下载最新版安装包，店员未登录时也能升级
+    const {
+      version, updateInfo, downloading, canAutoDownload, progressPercent, progressText,
+      loadVersion, refreshUpdateInfo, downloadPackage, cancelDownload
+    } = useUpdater();
+
+    async function loadAll() {
+      loadLicense();
+      await loadVersion();
+      refreshUpdateInfo();
+    }
+
+    async function loadLicense() {
+      const r = await window.api.licenseStatus();
+      if (r.ok) {
+        license.value = r.data;
+        // 试用到期时强制显示激活弹窗
+        if (r.data.state === 'expired') showActivate.value = true;
+      }
+    }
+
+    async function doActivate() {
+      if (activating.value) return;
+      activateMsg.value = '';
+      if (!activateCode.value.trim()) {
+        activateMsg.value = '请输入激活码';
+        return;
+      }
+      activating.value = true;
+      const r = await window.api.activate(activateCode.value.trim());
+      activating.value = false;
+      if (r.ok) {
+        toast('激活成功，感谢使用', 'success');
+        license.value = r.data;
+        showActivate.value = false;
+        activateCode.value = '';
+      } else {
+        activateMsg.value = r.message || '激活失败';
+      }
+    }
+
+    function copyMachineCode() {
+      if (license.value && license.value.machineCode) {
+        window.api.copyText(license.value.machineCode);
+        toast('机器码已复制，请发送给管理员获取激活码', 'success');
+      }
+    }
+
+    // 挂载时加载激活状态、当前版本与更新信息（loadAll 内部已串联这三步）
+    Vue.onMounted(loadAll);
+
     function openServer() {
       showServer.value = !showServer.value;
       if (showServer.value && props.sysInfo) {
@@ -209,6 +357,11 @@ const LoginPage = {
         if (r.ok) {
           toast('登录成功，欢迎 ' + (r.data.user.name || r.data.user.username), 'success');
           emit('login', r.data);
+        } else if (r.expired) {
+          // 试用到期：提示并弹出激活框
+          error.value = r.message || '试用期已结束，请输入激活码';
+          if (r.license) license.value = r.license;
+          showActivate.value = true;
         } else {
           error.value = r.message || '登录失败';
         }
@@ -222,7 +375,11 @@ const LoginPage = {
     return {
       username, password, error, loading, submit,
       showServer, serverUrl, serverToken, testing, testMsg, savingServer,
-      openServer, testConn, saveServer, sysInfo: props.sysInfo
+      openServer, testConn, saveServer, sysInfo: props.sysInfo,
+      license, showActivate, activateCode, activateMsg, activating,
+      doActivate, copyMachineCode,
+      version, updateInfo, downloading, canAutoDownload, progressPercent, progressText,
+      downloadPackage, cancelDownload
     };
   },
   template: `
@@ -273,6 +430,70 @@ const LoginPage = {
         <div class="login-hint">
           首次使用默认管理员账号：admin / admin123<br />
           登录后请及时修改密码并创建店员账号
+        </div>
+
+        <div v-if="license" class="license-tip" :class="license.state">
+          <template v-if="license.state === 'activated'">
+            ✅ 已激活
+          </template>
+          <template v-else-if="license.state === 'trial'">
+            试用中，剩余 <b>{{ license.trialDaysLeft }}</b> 天（共 {{ license.trialDays }} 天）
+            <a href="#" @click.prevent="showActivate = true">输入激活码</a>
+          </template>
+          <template v-else>
+            ⚠️ 试用期已结束，请输入激活码后继续使用
+          </template>
+        </div>
+
+        <!-- 当前版本 + 一键下载安装包 -->
+        <div class="login-version">
+          <span class="login-version-text">当前版本 <b>v{{ version || '-' }}</b></span>
+          <template v-if="downloading">
+            <div class="login-dl-progress">
+              <div class="login-dl-bar"><i :style="{ width: progressPercent + '%' }"></i></div>
+              <span>{{ progressText }}</span>
+            </div>
+            <button class="btn btn-ghost btn-sm" @click="cancelDownload">取消下载</button>
+          </template>
+          <template v-else>
+            <button v-if="canAutoDownload" class="btn btn-ghost btn-sm" @click="downloadPackage">
+              ⬇️ 一键下载安装包
+            </button>
+            <button v-else-if="updateInfo" class="btn btn-ghost btn-sm" @click="downloadPackage">
+              ⬇️ 打开下载页
+            </button>
+          </template>
+        </div>
+      </div>
+
+      <div v-if="showActivate" class="modal-mask" @click.self="license && license.state === 'expired' ? null : (showActivate = false)">
+        <div class="modal modal-sm">
+          <div class="modal-head">
+            <h3>软件激活</h3>
+            <button class="modal-close" :disabled="license && license.state === 'expired'" @click="showActivate = false">✕</button>
+          </div>
+          <div class="modal-body">
+            <div v-if="license && license.copiedFromOtherMachine" class="form-error" style="margin:0 0 10px">
+              检测到本机曾使用其他电脑的激活码，激活码与机器码一一绑定，请为本机重新获取激活码。
+            </div>
+            <div class="info-row">
+              <span>本机机器码</span>
+              <b class="code">{{ license ? license.machineCode : '-' }}</b>
+            </div>
+            <p class="setup-desc" style="margin:10px 0 0">
+              把机器码发送给管理员，由管理员使用「激活码计算工具」生成对应的激活码。
+              激活码与本机绑定，更换电脑需重新获取。
+            </p>
+            <label>激活码</label>
+            <input v-model="activateCode" placeholder="例如 XQY-XXXX-XXXX-XXXX" @keyup.enter="doActivate" />
+            <div v-if="activateMsg" class="form-error">{{ activateMsg }}</div>
+          </div>
+          <div class="modal-foot">
+            <button class="btn btn-ghost" @click="copyMachineCode">复制机器码</button>
+            <button class="btn btn-primary" :disabled="activating" @click="doActivate">
+              {{ activating ? '激活中…' : '立即激活' }}
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -391,7 +612,11 @@ const CapturePage = {
       }
     }
 
-    // 应用连续自动对焦 + 近距对焦（拍衣物多为近景），不支持的设备静默忽略
+    // 应用连续自动对焦 + 近距对焦（拍衣物多为近景），不支持的设备静默忽略。
+    // 支持焦点坐标的设备额外把焦点锁定在画面中心，并周期性触发一次单点对焦，
+    // 防止摄像头对焦漂移或被意外切到手动模式导致偶发失焦。
+    let focusTimer = null;
+
     async function applyFocus(track) {
       if (!track || !track.getCapabilities || !track.applyConstraints) return;
       let cap = {};
@@ -403,12 +628,46 @@ const CapturePage = {
       const adv = {};
       if (cap.focusMode && cap.focusMode.includes('continuous')) adv.focusMode = 'continuous';
       if (cap.focusDistance) adv.focusDistance = cap.focusDistance.min || undefined;
+      if (cap.pointsOfInterest) {
+        adv.pointsOfInterest = [
+          {
+            x: Math.round((cap.pointsOfInterest.width || 1000) / 2),
+            y: Math.round((cap.pointsOfInterest.height || 1000) / 2)
+          }
+        ];
+      }
       if (Object.keys(adv).length) {
         try {
           await track.applyConstraints({ advanced: [adv] });
         } catch (e) {
           /* 部分设备不支持，保持默认对焦 */
         }
+      }
+    }
+
+    // 周期对焦脉冲：定时触发一次单点对焦后恢复连续对焦，
+    // 纠正部分摄像头长时间待机后出现的对焦漂移
+    function startFocusPulse(track) {
+      stopFocusPulse();
+      focusTimer = setInterval(async () => {
+        if (!track || track.readyState !== 'live') {
+          stopFocusPulse();
+          return;
+        }
+        try {
+          await track.applyConstraints({ advanced: [{ focusMode: 'single-shot' }] });
+          await new Promise((r) => setTimeout(r, 350));
+          await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+        } catch (e) {
+          /* 设备不支持时静默忽略 */
+        }
+      }, 20000);
+    }
+
+    function stopFocusPulse() {
+      if (focusTimer) {
+        clearInterval(focusTimer);
+        focusTimer = null;
       }
     }
 
@@ -440,8 +699,9 @@ const CapturePage = {
         if (videoEl.value) {
           videoEl.value.srcObject = s;
           await videoEl.value.play();
-          // 画面就绪后再次应用对焦，避免初始虚焦
+          // 画面就绪后再次应用对焦，避免初始虚焦；并开启周期对焦脉冲
           applyFocus(track);
+          startFocusPulse(track);
         }
       } catch (e) {
         cameraError.value = '无法打开摄像头：' + (e.message || e.name);
@@ -558,12 +818,24 @@ const CapturePage = {
       }
     }
 
+    // 组件是否仍在页面上：卸载后定时器不能再抢焦点
+    let captureAlive = true;
+
     function focusBarcode() {
       Vue.nextTick().then(() => {
-        if (barcodeEl.value) barcodeEl.value.focus();
-        // 个别环境下一次聚焦会被抢占，短延时再补一次
+        if (!captureAlive || !barcodeEl.value || !document.contains(barcodeEl.value)) return;
+        barcodeEl.value.focus();
+        // 个别环境下一次聚焦会被抢占，短延时再补一次。
+        // 只在「当前没有任何输入框获得焦点」时才补，
+        // 否则会把用户刚点开的备注框等焦点抢回条码框，表现为其他输入框点不动。
         setTimeout(() => {
-          if (barcodeEl.value && document.activeElement !== barcodeEl.value) barcodeEl.value.focus();
+          if (!captureAlive) return;
+          const el = barcodeEl.value;
+          if (!el || !document.contains(el)) return;
+          const active = document.activeElement;
+          const nothingFocused =
+            !active || active === document.body || active === document.documentElement || !document.contains(active);
+          if (nothingFocused) el.focus();
         }, 80);
       });
     }
@@ -576,6 +848,7 @@ const CapturePage = {
     });
 
     function stopCamera() {
+      stopFocusPulse();
       if (stream.value) {
         stream.value.getTracks().forEach((t) => t.stop());
         stream.value = null;
@@ -583,6 +856,7 @@ const CapturePage = {
     }
 
     Vue.onMounted(() => {
+      captureAlive = true;
       window.addEventListener('keydown', onKeydown);
       focusBarcode();
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
@@ -593,6 +867,7 @@ const CapturePage = {
     });
 
     Vue.onUnmounted(() => {
+      captureAlive = false;
       window.removeEventListener('keydown', onKeydown);
       stopCamera();
     });
@@ -732,6 +1007,48 @@ const QueryPage = {
       }
     }
 
+    // 按日期范围导出照片：按条码分文件夹归档，并生成「条码+文件位置」表格
+    async function exportByDate() {
+      if (exporting.value) return;
+      if (!dateFrom.value || !dateTo.value) {
+        toast('请先在上方选择开始日期与结束日期', 'error');
+        return;
+      }
+      if (dateFrom.value > dateTo.value) {
+        toast('开始日期不能晚于结束日期', 'error');
+        return;
+      }
+      if (!window.confirm('将导出 ' + dateFrom.value + ' 至 ' + dateTo.value + ' 期间的照片，按条码分文件夹归档，并生成归档表格。下一步请选择保存目录。')) return;
+      const d = await window.api.chooseExportDir();
+      if (!d.ok) {
+        if (d.message && d.message !== '已取消') toast(d.message, 'error');
+        return;
+      }
+      exporting.value = true;
+      toast('正在按日期导出照片，数量较多时请稍候…', 'success');
+      try {
+        const res = await window.api.exportPhotosByDate(props.token, {
+          targetDir: d.data,
+          dateFrom: dateFrom.value,
+          dateTo: dateTo.value
+        });
+        if (res.ok) {
+          toast(
+            '导出完成：' + res.data.folders + ' 个条码文件夹、' + res.data.exported + ' 张照片，表格已生成' +
+            (res.data.skipped ? '，缺失跳过 ' + res.data.skipped + ' 张' : '') +
+            (res.data.failed ? '，失败 ' + res.data.failed + ' 张' : ''),
+            'success'
+          );
+        } else {
+          toast(res.message || '导出失败', 'error');
+        }
+      } catch (e) {
+        toast('导出失败：' + (e.message || e), 'error');
+      } finally {
+        exporting.value = false;
+      }
+    }
+
     function toggleSelect(r) {
       const i = selected.value.indexOf(r.id);
       if (i === -1) selected.value.push(r.id);
@@ -854,7 +1171,7 @@ const QueryPage = {
       keyword, barcodeFilter, dateFrom, dateTo, userIdFilter, users, items, total,
       page, pageSize, totalPages, loading, detail,
       selected, batchDeleting, toggleSelect, selectAll, batchDelete,
-      exporting, exportByBarcode,
+      exporting, exportByBarcode, exportByDate,
       search, reset, openDetail, remove, prev, next, fmt,
       adminMode: props.adminMode
     };
@@ -900,6 +1217,9 @@ const QueryPage = {
           <span class="pager-info">已选 {{ selected.length }} 条</span>
           <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="exportByBarcode">
             {{ exporting ? '导出中…' : '⬇ 按订单号批量下载' }}
+          </button>
+          <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="exportByDate" title="按上方日期范围导出照片，并生成条码+文件位置表格">
+            ⬇ 按日期导出
           </button>
           <button class="btn btn-danger btn-sm" :disabled="!selected.length || batchDeleting" @click="batchDelete">
             {{ batchDeleting ? '删除中…' : '批量删除' }}
@@ -961,6 +1281,17 @@ const SettingsPage = {
     const confirmPassword = Vue.ref('');
     const saving = Vue.ref(false);
 
+    // 版本与安装包下载：登录后可在设置页一键下载最新版安装包（需求10）
+    const {
+      version, updateInfo, downloading, canAutoDownload, progressPercent, progressText,
+      loadVersion, refreshUpdateInfo, downloadPackage, cancelDownload
+    } = useUpdater();
+
+    Vue.onMounted(() => {
+      loadVersion();
+      refreshUpdateInfo();
+    });
+
     async function submit() {
       if (!oldPassword.value || !newPassword.value) {
         toast('请填写完整的密码信息', 'error');
@@ -988,7 +1319,11 @@ const SettingsPage = {
       }
     }
 
-    return { user: props.user, oldPassword, newPassword, confirmPassword, saving, submit, fmt };
+    return {
+      user: props.user, oldPassword, newPassword, confirmPassword, saving, submit, fmt,
+      version, updateInfo, downloading, canAutoDownload, progressPercent, progressText,
+      downloadPackage, cancelDownload
+    };
   },
   template: `
     <div>
@@ -1020,6 +1355,29 @@ const SettingsPage = {
           <button class="btn btn-primary" :disabled="saving" @click="submit">
             {{ saving ? '保存中…' : '保存修改' }}
           </button>
+        </div>
+
+        <div class="card">
+          <div class="card-title">⬇️ 版本与更新</div>
+          <div class="settings-version">
+            <span class="login-version-text">当前版本 <b>v{{ version || '-' }}</b></span>
+            <template v-if="downloading">
+              <div class="login-dl-progress">
+                <div class="login-dl-bar"><i :style="{ width: progressPercent + '%' }"></i></div>
+                <span>{{ progressText }}</span>
+              </div>
+              <button class="btn btn-ghost btn-sm" @click="cancelDownload">取消下载</button>
+            </template>
+            <template v-else>
+              <button v-if="canAutoDownload" class="btn btn-primary btn-sm" @click="downloadPackage">
+                ⬇️ 一键下载安装包
+              </button>
+              <button v-else-if="updateInfo" class="btn btn-ghost btn-sm" @click="downloadPackage">
+                ⬇️ 打开下载页
+              </button>
+              <p class="settings-version-tip">下载完成后会打开安装包所在文件夹，双击安装即可覆盖升级。</p>
+            </template>
+          </div>
         </div>
       </div>
     </div>
@@ -1077,12 +1435,13 @@ const AdminOverviewPage = {
       <div class="card table-wrap">
         <table v-if="o">
           <thead>
-            <tr><th>时间</th><th>账号</th><th>模块</th><th>操作</th><th class="wrap">详情</th></tr>
+            <tr><th>时间</th><th>账号</th><th>IP</th><th>模块</th><th>操作</th><th class="wrap">详情</th></tr>
           </thead>
           <tbody>
             <tr v-for="l in o.recentLogs" :key="l.id">
               <td>{{ fmt(l.time) }}</td>
               <td>{{ l.username }}</td>
+              <td class="ip-cell">{{ l.ip || '-' }}</td>
               <td>{{ l.module }}</td>
               <td><span class="tag" :class="l.result === '失败' ? 'tag-red' : 'tag-green'">{{ l.action }}</span></td>
               <td class="wrap">{{ l.detail }}</td>
@@ -1433,7 +1792,7 @@ const AdminLogsPage = {
           <table>
             <thead>
               <tr>
-                <th>时间</th><th>账号</th><th>角色</th><th>模块</th>
+                <th>时间</th><th>账号</th><th>IP</th><th>角色</th><th>模块</th>
                 <th>操作</th><th>结果</th><th class="wrap">详情</th>
               </tr>
             </thead>
@@ -1441,6 +1800,7 @@ const AdminLogsPage = {
               <tr v-for="l in items" :key="l.id">
                 <td>{{ fmt(l.time) }}</td>
                 <td><b>{{ l.username }}</b></td>
+                <td class="ip-cell">{{ l.ip || '-' }}</td>
                 <td>{{ l.role === 'admin' ? '管理员' : (l.role === 'client' ? '客户端' : l.role) }}</td>
                 <td>{{ l.module }}</td>
                 <td>{{ l.action }}</td>
@@ -1478,6 +1838,46 @@ const AdminSystemPage = {
     const downloading = Vue.ref(false);
     const dlProgress = Vue.ref({ received: 0, total: 0 });
     let removeProgress = null;
+
+    // ---------- 强制推送安装包（仅服务端可设置） ----------
+    const forceInfo = Vue.ref(null); // { enabled, version, fileName, fileExists, files:[{name,size,version}] }
+    const forceFile = Vue.ref(''); // 下拉选中的安装包文件名
+    const savingForce = Vue.ref(false);
+
+    async function loadForceUpdate() {
+      const r = await window.api.forceUpdate();
+      if (r.ok && r.data) {
+        forceInfo.value = r.data;
+        const files = r.data.files || [];
+        if (r.data.enabled && r.data.fileName) {
+          forceFile.value = r.data.fileName;
+        } else if (!forceFile.value) {
+          // 默认选中版本号最高的安装包，减少一次手动选择
+          forceFile.value = files.length ? files[0].name : '';
+        }
+      }
+    }
+
+    async function setForceUpdate(enabled) {
+      if (enabled && !forceFile.value) {
+        toast('请先选择要推送的安装包文件', 'error');
+        return;
+      }
+      savingForce.value = true;
+      try {
+        const r = await window.api.setForceUpdate(props.token, enabled, forceFile.value);
+        if (r.ok) {
+          forceInfo.value = r.data;
+          toast(enabled ? '已开启强制推送：客户端下次登录将自动下载并提示安装' : '已取消强制推送', 'success');
+        } else {
+          toast(r.message || '设置失败', 'error');
+        }
+      } catch (e) {
+        toast('设置失败：' + (e.message || e), 'error');
+      } finally {
+        savingForce.value = false;
+      }
+    }
 
     async function loadVersion() {
       const r = await window.api.version();
@@ -1521,6 +1921,8 @@ const AdminSystemPage = {
     const canAutoDownload = Vue.computed(
       () => !!(updateInfo.value && updateInfo.value.source === 'github' && updateInfo.value.downloadUrl)
     );
+    // 远程连接服务器时照片由服务端统一管理，本机不可修改保存路径
+    const remoteLocked = Vue.computed(() => !!(info.value && info.value.remoteClient));
     const progressPercent = Vue.computed(() => {
       const { received, total } = dlProgress.value || {};
       if (!total || total <= 0) return 0;
@@ -1585,6 +1987,7 @@ const AdminSystemPage = {
       if (ip.ok) localIp.value = ip.data;
       loadVersion();
       checkUpdate(false);
+      loadForceUpdate();
     }
 
     async function savePort() {
@@ -1621,11 +2024,19 @@ const AdminSystemPage = {
     }
 
     async function chooseDir() {
+      if (remoteLocked.value) {
+        toast('远程连接服务器状态下不可修改照片保存位置，请在服务端电脑上修改', 'error');
+        return;
+      }
       const r = await window.api.choosePhotoDir();
       if (r.ok) photoPathInput.value = r.data;
     }
 
     async function savePath() {
+      if (remoteLocked.value) {
+        toast('远程连接服务器状态下不可修改照片保存位置，请在服务端电脑上修改', 'error');
+        return;
+      }
       savingPath.value = true;
       try {
         const r = await window.api.setPhotoPath(props.token, photoPathInput.value);
@@ -1646,9 +2057,10 @@ const AdminSystemPage = {
     return {
       info, localIp, portInput, savingPort, savePort,
       resettingToken, resetToken,
-      photoPathInput, savingPath, chooseDir, savePath,
+      photoPathInput, savingPath, chooseDir, savePath, remoteLocked,
       version, updateInfo, checking, checkUpdate, openUpdateFolder, openUpdatePage, copyFirewallCmd,
-      downloading, downloadUpdateNow, cancelUpdateDownload, canAutoDownload, progressPercent, progressText, fmtSize
+      downloading, downloadUpdateNow, cancelUpdateDownload, canAutoDownload, progressPercent, progressText, fmtSize,
+      forceInfo, forceFile, savingForce, setForceUpdate, loadForceUpdate
     };
   },
   template: `
@@ -1693,14 +2105,18 @@ const AdminSystemPage = {
         <div class="card">
           <div class="card-title">🖼️ 照片保存路径</div>
           <label>保存目录（修改时自动迁移现有照片）</label>
-          <input v-model="photoPathInput" placeholder="选择或输入目录路径" />
+          <input v-model="photoPathInput" placeholder="选择或输入目录路径" :disabled="remoteLocked" />
           <div style="display:flex;gap:10px;margin-top:16px">
-            <button class="btn btn-ghost" @click="chooseDir">浏览…</button>
-            <button class="btn btn-primary" style="flex:1" :disabled="savingPath" @click="savePath">
+            <button class="btn btn-ghost" :disabled="remoteLocked" @click="chooseDir">浏览…</button>
+            <button class="btn btn-primary" style="flex:1" :disabled="savingPath || remoteLocked" @click="savePath">
               {{ savingPath ? '保存中…' : '保存路径' }}
             </button>
           </div>
-          <p class="setup-desc" style="margin-top:14px">
+          <p v-if="remoteLocked" class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#fef9ec;border:1px solid #f5e0b0;border-radius:8px">
+            🔒 当前为远程连接服务器状态（{{ info.serverUrl }}），照片由服务器统一保存管理，
+            本机不可修改照片保存位置。如需调整，请在服务端电脑的本页面上修改。
+          </p>
+          <p v-else class="setup-desc" style="margin-top:14px">
             照片按原始分辨率保存为 JPG 文件；修改路径前会先校验目标目录，避免覆盖同名文件。
           </p>
         </div>
@@ -1743,6 +2159,53 @@ const AdminSystemPage = {
           <button v-if="info.mode === 'server'" class="btn btn-ghost" @click="openUpdateFolder">打开备用更新文件夹</button>
         </div>
       </div>
+
+      <div v-if="info && info.mode === 'server'" class="card" style="margin-top:18px">
+        <div class="card-title">📣 强制推送安装包</div>
+        <div class="info-row">
+          <span>当前状态</span>
+          <b v-if="forceInfo && forceInfo.enabled" style="color:#d97706">
+            已推送 v{{ forceInfo.version }}（{{ forceInfo.fileName }}）
+          </b>
+          <b v-else-if="forceInfo">未推送</b>
+          <b v-else>-</b>
+        </div>
+        <div v-if="forceInfo && forceInfo.enabled && !forceInfo.fileExists" class="info-row">
+          <span>文件状态</span>
+          <b style="color:#dc2626">安装包已不在更新文件夹中，推送失效，请重新放入文件</b>
+        </div>
+
+        <label style="margin-top:14px">选择更新文件夹内的安装包</label>
+        <select v-model="forceFile" :disabled="savingForce">
+          <option v-if="!forceInfo || !forceInfo.files || !forceInfo.files.length" value="">
+            （更新文件夹内暂无安装包）
+          </option>
+          <option v-for="f in (forceInfo ? forceInfo.files : [])" :key="f.name" :value="f.name">
+            {{ f.name }}<template v-if="f.version">（v{{ f.version }}）</template> · {{ fmtSize(f.size) }}
+          </option>
+        </select>
+
+        <div style="display:flex;gap:10px;margin-top:16px">
+          <button class="btn btn-primary" :disabled="savingForce || !forceFile" @click="setForceUpdate(true)">
+            {{ savingForce ? '设置中…' : '开启强制推送' }}
+          </button>
+          <button
+            class="btn btn-ghost"
+            :disabled="savingForce || !forceInfo || !forceInfo.enabled"
+            @click="setForceUpdate(false)"
+          >
+            取消推送
+          </button>
+          <button class="btn btn-ghost" :disabled="savingForce" @click="loadForceUpdate">刷新列表</button>
+          <button class="btn btn-ghost" @click="openUpdateFolder">打开更新文件夹</button>
+        </div>
+
+        <p class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#f0f7ff;border:1px solid #cfe2f7;border-radius:8px">
+          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-0.1.7.exe）放入更新文件夹 →
+          在上方列表选中它 → 点「开启强制推送」。客户端下次登录时会自动从服务器下载该安装包，
+          下载完成后弹窗提示店员双击安装；版本号不高于客户端当前版本的不会触发。
+        </p>
+      </div>
     </div>
   `
 };
@@ -1757,6 +2220,49 @@ const Shell = {
 
     window.api.version().then((r) => {
       if (r.ok) version.value = r.data.version;
+    });
+
+    // 离线冗余：周期探测服务器连通性与待同步数量，仅客户端模式显示
+    const online = Vue.ref(true);
+    const pending = Vue.ref(0);
+    const syncing = Vue.ref(false);
+    let statusTimer = null;
+
+    async function refreshStatus() {
+      if (props.mode !== 'client') return;
+      const r = await window.api.offlineStatus();
+      if (r.ok) {
+        online.value = r.data.online;
+        pending.value = r.data.pending || 0;
+        // 服务器恢复且有待同步存档时自动触发同步
+        if (r.data.online && (r.data.pending || 0) > 0 && !syncing.value) doSync();
+      }
+    }
+
+    async function doSync() {
+      if (syncing.value) return;
+      syncing.value = true;
+      try {
+        const r = await window.api.syncOffline();
+        if (r.ok && r.data.synced > 0) {
+          toast('已同步 ' + r.data.synced + ' 条离线存档到服务器', 'success');
+        } else if (r.ok && (r.data.remaining || 0) > 0 && r.data.reason) {
+          toast('离线存档暂未同步：' + r.data.reason, 'error');
+        }
+      } catch (e) {
+        /* 静默失败，下次轮询重试 */
+      } finally {
+        syncing.value = false;
+        refreshStatus();
+      }
+    }
+
+    Vue.onMounted(() => {
+      refreshStatus();
+      statusTimer = setInterval(refreshStatus, 15000);
+    });
+    Vue.onUnmounted(() => {
+      if (statusTimer) clearInterval(statusTimer);
     });
 
     const pages = isAdmin
@@ -1786,7 +2292,10 @@ const Shell = {
       toast(r.ok ? '已退出登录' : r.message || '退出失败', r.ok ? 'success' : 'error');
     }
 
-    return { user: props.user, mode: props.mode, isAdmin, pages, comps, active, doLogout, version };
+    return {
+      user: props.user, mode: props.mode, isAdmin, pages, comps, active, doLogout, version,
+      online, pending, syncing, doSync
+    };
   },
   template: `
     <div class="shell">
@@ -1822,6 +2331,17 @@ const Shell = {
         </div>
       </aside>
       <main class="main">
+        <div v-if="mode === 'client' && (!online || pending > 0)" class="offline-banner" :class="{ off: !online }">
+          <span v-if="!online">
+            ⚠️ 服务器连接中断，已进入离线模式：拍照与查询仍可使用，存档将在服务器恢复后自动同步
+          </span>
+          <span v-else>
+            ⏳ 有 {{ pending }} 条离线存档待同步到服务器
+          </span>
+          <button class="btn btn-ghost btn-sm" :disabled="syncing" @click="doSync">
+            {{ syncing ? '同步中…' : '立即同步' }}
+          </button>
+        </div>
         <component
           :is="comps[active]"
           :user="user"
@@ -1944,11 +2464,61 @@ const app = createApp({
       token.value = '';
     }
 
+    // ---------- 服务端强制推送安装包 ----------
+    // 客户端登录后主进程会自动下载推送的安装包，完成后通过 update:force 事件通知这里弹窗
+    const forceModal = Vue.ref(null);
+    const installing = Vue.ref(false);
+    let removeForceListener = null;
+
+    if (window.api.onForceUpdate) {
+      removeForceListener = window.api.onForceUpdate((p) => {
+        if (p && p.needUpdate) forceModal.value = p;
+      });
+    }
+
+    // 兜底：界面自身就绪后主动查一次，避免事件在渲染进程挂载前就已发出而丢失
+    if (window.api.checkForceUpdate) {
+      window.api.checkForceUpdate().then((r) => {
+        if (r.ok && r.data && r.data.needUpdate && !forceModal.value) forceModal.value = r.data;
+      });
+    }
+
+    Vue.onUnmounted(() => {
+      if (removeForceListener) removeForceListener();
+    });
+
+    async function runInstaller() {
+      const f = forceModal.value;
+      if (!f || !f.file || installing.value) return;
+      installing.value = true;
+      try {
+        const r = await window.api.runInstaller(f.file);
+        if (r.ok) {
+          toast(r.data.opened ? '已启动安装程序，请按向导完成升级' : '已定位安装包，请双击安装', 'success');
+          forceModal.value = null;
+        } else {
+          toast(r.message || '启动安装程序失败', 'error');
+        }
+      } catch (e) {
+        toast('启动安装程序失败：' + (e.message || e), 'error');
+      } finally {
+        installing.value = false;
+      }
+    }
+
+    async function openInstallerFolder() {
+      const f = forceModal.value;
+      if (!f || !f.file) return;
+      const r = await window.api.openInstaller(f.file);
+      if (!r.ok) toast(r.message || '打开文件夹失败', 'error');
+    }
+
     return {
       sysInfo, user, token, ready, needRestart, updateNotice,
       updateModal, downloading, progressPercent, progressText, canAutoDownload,
       onSetupDone, onServerSaved, onLogin, onLogout,
-      openUpdateModal, closeUpdateNotice, openReleasePage, downloadNow, cancelDownload
+      openUpdateModal, closeUpdateNotice, openReleasePage, downloadNow, cancelDownload,
+      forceModal, installing, runInstaller, openInstallerFolder, fmtSize
     };
   },
   template: `
@@ -1963,7 +2533,7 @@ const app = createApp({
         </div>
       </div>
 
-      <div v-if="updateModal" class="modal-mask">
+      <div v-if="updateModal" class="modal-mask" @click.self="downloading ? null : (updateModal = null)">
         <div class="modal" style="max-width:560px">
           <div class="modal-head">
             <h3>发现新版本 v{{ updateModal.latestVersion }}</h3>
@@ -1999,6 +2569,37 @@ const app = createApp({
               {{ downloading ? '下载中…' : '一键下载更新' }}
             </button>
             <button v-else class="btn btn-primary" :disabled="downloading" @click="openReleasePage">打开下载页</button>
+          </div>
+        </div>
+      </div>
+      <div v-if="forceModal" class="modal-mask">
+        <div class="modal" style="max-width:520px">
+          <div class="modal-head">
+            <h3>📣 服务器推送了新版本 v{{ forceModal.version }}</h3>
+          </div>
+          <div class="modal-body">
+            <div class="setup-desc">
+              管理员已推送新版本安装包，并已自动下载到本机。请尽快完成升级，
+              以保证与服务器端功能一致。
+            </div>
+            <div class="info-row" style="margin-top:14px">
+              <span>推送版本</span><b class="code">v{{ forceModal.version }}</b>
+            </div>
+            <div class="info-row">
+              <span>安装包</span><b>{{ forceModal.fileName }}</b>
+            </div>
+            <div class="info-row">
+              <span>文件大小</span><b>{{ fmtSize(forceModal.size) }}</b>
+            </div>
+            <div class="info-row">
+              <span>保存位置</span><b style="word-break:break-all">{{ forceModal.file }}</b>
+            </div>
+          </div>
+          <div class="modal-foot">
+            <button class="btn btn-ghost" :disabled="installing" @click="openInstallerFolder">打开所在文件夹</button>
+            <button class="btn btn-primary" :disabled="installing" @click="runInstaller">
+              {{ installing ? '启动中…' : '立即安装' }}
+            </button>
           </div>
         </div>
       </div>

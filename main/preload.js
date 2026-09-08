@@ -32,6 +32,7 @@ contextBridge.exposeInMainWorld('api', {
   deleteRecord: (token, id) => call('records:delete', { id }, token),
   deleteRecords: (token, ids) => call('records:deleteBatch', { ids }, token),
   exportPhotos: (token, payload) => call('records:exportPhotos', payload, token),
+  exportPhotosByDate: (token, payload) => call('records:exportPhotosByDate', payload, token),
 
   // 用户管理（只传原始类型参数，对象在桥接层内组装）
   listUsers: (token) => call('users:list', undefined, token),
@@ -56,6 +57,10 @@ contextBridge.exposeInMainWorld('api', {
 
   // 系统配置（本地，不随客户端转发）
   systemInfo: () => ipcRenderer.invoke('system:info'),
+  licenseStatus: () => ipcRenderer.invoke('license:status'),
+  activate: (code) => ipcRenderer.invoke('license:activate', code),
+  offlineStatus: () => ipcRenderer.invoke('offline:status'),
+  syncOffline: () => ipcRenderer.invoke('offline:sync'),
   setMode: (mode) => ipcRenderer.invoke('system:setMode', mode),
   setClientConfig: (serverUrl, serverToken) =>
     ipcRenderer.invoke('system:setClientConfig', { serverUrl, serverToken }),
@@ -78,5 +83,17 @@ contextBridge.exposeInMainWorld('api', {
   },
   openUpdateDir: () => ipcRenderer.invoke('system:openUpdateDir'),
   openUpdatePage: () => ipcRenderer.invoke('system:openUpdatePage'),
-  copyText: (text) => ipcRenderer.invoke('system:copyText', text)
+  copyText: (text) => ipcRenderer.invoke('system:copyText', text),
+  // 强制推送安装包（服务端设置 / 客户端查询）
+  forceUpdate: () => ipcRenderer.invoke('system:forceUpdate'),
+  setForceUpdate: (token, enabled, fileName) =>
+    ipcRenderer.invoke('system:setForceUpdate', { enabled: !!enabled, fileName }, token),
+  checkForceUpdate: () => ipcRenderer.invoke('system:checkForceUpdate'),
+  openInstaller: (file) => ipcRenderer.invoke('system:openInstaller', { file }),
+  runInstaller: (file) => ipcRenderer.invoke('system:runInstaller', { file }),
+  onForceUpdate: (cb) => {
+    const fn = (_e, p) => cb(p);
+    ipcRenderer.on('update:force', fn);
+    return () => ipcRenderer.removeListener('update:force', fn);
+  }
 });

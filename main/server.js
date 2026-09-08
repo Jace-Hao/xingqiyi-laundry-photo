@@ -13,6 +13,7 @@
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
+const { withRequestIp } = require('./store');
 
 function startServer(store, opts = {}) {
   const port = opts.port || 17521;
@@ -89,7 +90,10 @@ function startServer(store, opts = {}) {
       'system/checkUpdate': () => store.checkUpdates(),
       'system/settings': () => store.updateSystemSettings(sessionToken, body),
       'system/resetToken': () => store.resetApiToken(sessionToken),
-      'system/photoPath': () => store.setPhotoPath(sessionToken, body.path)
+      'system/photoPath': () => store.setPhotoPath(sessionToken, body.path),
+      // 强制推送安装包：客户端登录后查询，服务端管理员设置
+      'system/forceUpdate': () => store.getForceUpdate(),
+      'system/setForceUpdate': () => store.setForceUpdate(sessionToken, body)
     };
 
     const fn = routes[route];
@@ -129,21 +133,71 @@ function startServer(store, opts = {}) {
     });
   }
 
-  const server = http.createServer(async (req, res) => {
-    try {
-      const url = new URL(req.url, 'http://localhost');
-      if (url.pathname.startsWith('/api/')) {
-        await handleApi(req, res, url.pathname.slice(5), url.searchParams);
-      } else if (url.pathname === '/photo') {
-        handlePhoto(req, res, url.searchParams);
-      } else if (url.pathname === '/ping') {
-        json(res, 200, { ok: true, data: { app: 'xingqiyi' } });
-      } else {
-        json(res, 404, { ok: false, message: 'Not Found' });
-      }
-    } catch (e) {
-      json(res, 500, { ok: false, message: e.message || String(e) });
+  // 强制推送的安装包分发：客户端下载安装包走 net.fetch，无法附加自定义请求头，
+  // 因此沿用 /photo 的方式通过查询参数传递连接码。文件名已在数据层做路径穿越防护。
+  function handleUpdateFile(req, res, query) {
+    const cfg = store.loadConfig();
+    const apiToken = req.headers['x-api-token'] || (query.get ? query.get('token') : '');
+    if (!apiToken || apiToken !== cfg.token) {
+      res.writeHead(401);
+      return res.end('Unauthorized');
     }
+    const fileName = decodeURIComponent((query.get && query.get('f')) || '');
+    const filePath = store.resolveUpdateFile(fileName);
+    if (!fileName || !filePath) {
+      res.writeHead(404);
+      return res.end('Not Found');
+    }
+    let size = 0;
+    try {
+      size = fs.statSync(filePath).size;
+    } catch (e) {
+      res.writeHead(404);
+      return res.end('Not Found');
+    }
+    // 文件名只取 ASCII 可见字符（安装包名固定为英文），并用 RFC 5987 的 filename* 兼容中文
+    const asciiName = fileName.replace(/[^\x20-\x7e]/g, '').replace(/["\\]/g, '_');
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': String(size),
+      'Content-Disposition': "attachment; filename=\"" + asciiName + "\"; filename*=UTF-8''" + encodeURIComponent(fileName),
+      'Cache-Control': 'no-store'
+    });
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', () => {
+      try {
+        res.destroy();
+      } catch (e) {
+        /* 已断开时忽略 */
+      }
+    });
+    // 客户端中途取消下载时停止读文件，避免无谓磁盘 IO
+    res.on('close', () => stream.destroy());
+    stream.pipe(res);
+  }
+
+  const server = http.createServer(async (req, res) => {
+    // 取客户端来源 IP（req.socket.remoteAddress），包裹整个请求处理过程，
+    // 期间数据层写入的每条操作日志都会自动带上该 IP。
+    const clientIp = (req.socket && req.socket.remoteAddress) || '';
+    return withRequestIp(clientIp, async () => {
+      try {
+        const url = new URL(req.url, 'http://localhost');
+        if (url.pathname.startsWith('/api/')) {
+          await handleApi(req, res, url.pathname.slice(5), url.searchParams);
+        } else if (url.pathname === '/photo') {
+          handlePhoto(req, res, url.searchParams);
+        } else if (url.pathname === '/update-file') {
+          handleUpdateFile(req, res, url.searchParams);
+        } else if (url.pathname === '/ping') {
+          json(res, 200, { ok: true, data: { app: 'xingqiyi' } });
+        } else {
+          json(res, 404, { ok: false, message: 'Not Found' });
+        }
+      } catch (e) {
+        json(res, 500, { ok: false, message: e.message || String(e) });
+      }
+    });
   });
 
   // 上传大照片时可能耗时较长

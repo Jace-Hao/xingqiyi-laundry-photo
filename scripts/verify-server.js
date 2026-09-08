@@ -152,6 +152,83 @@ const tinyJpeg =
   const ov = await call('stats/overview', undefined, session);
   check('远程数据总览', ov.body.ok === true && ov.body.data.userCount === 2);
 
+  // ---------- 强制推送安装包 ----------
+  function getFile(urlPath, headers) {
+    return new Promise((resolve, reject) => {
+      http.get({ hostname: '127.0.0.1', port: PORT, path: urlPath, headers: headers || {}, timeout: 10000 }, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () =>
+          resolve({
+            status: res.statusCode,
+            size: Buffer.concat(chunks).length,
+            type: res.headers['content-type'],
+            disposition: res.headers['content-disposition'] || '',
+            body: Buffer.concat(chunks).toString('utf8')
+          })
+        );
+      }).on('error', reject);
+    });
+  }
+
+  const updateDir = store.getUpdateDir();
+  const INSTALLER = 'xingqiyi-laundry-photo-setup-9.9.9.exe';
+  fs.mkdirSync(updateDir, { recursive: true });
+  const installerBody = 'FAKE-INSTALLER-' + 'x'.repeat(2048);
+  fs.writeFileSync(path.join(updateDir, INSTALLER), installerBody, 'utf8');
+  // 非安装包文件不应出现在可选列表中
+  fs.writeFileSync(path.join(updateDir, 'readme.txt'), 'ignore me', 'utf8');
+
+  const fuEmpty = await call('system/forceUpdate', {}, session);
+  check('查询强制推送设置', fuEmpty.body.ok === true && fuEmpty.body.data.enabled === false);
+  check('推送设置返回安装包列表且过滤非安装包', Array.isArray(fuEmpty.body.data.files) &&
+    fuEmpty.body.data.files.length === 1 && fuEmpty.body.data.files[0].name === INSTALLER,
+    JSON.stringify(fuEmpty.body.data.files));
+
+  const fuNoPerm = await call('system/setForceUpdate', { enabled: true, fileName: INSTALLER }, clerkSession);
+  check('客户端账号无权设置强制推送', fuNoPerm.body.ok === false && /仅管理员/.test(fuNoPerm.body.message || ''),
+    fuNoPerm.body.message);
+
+  const fuBadFile = await call('system/setForceUpdate', { enabled: true, fileName: 'not-exist-9.9.9.exe' }, session);
+  check('推送不存在的安装包被拒绝', fuBadFile.body.ok === false && /不存在/.test(fuBadFile.body.message || ''),
+    fuBadFile.body.message);
+
+  const fuTraversal = await call('system/setForceUpdate', { enabled: true, fileName: '../../../config.json' }, session);
+  check('推送含路径穿越的文件名被拒绝', fuTraversal.body.ok === false);
+
+  const fuSet = await call('system/setForceUpdate', { enabled: true, fileName: INSTALLER }, session);
+  check('开启强制推送', fuSet.body.ok === true && fuSet.body.data.enabled === true && fuSet.body.data.version === '9.9.9',
+    JSON.stringify(fuSet.body));
+  check('推送版本号从文件名解析且文件存在标记正确', fuSet.body.ok === true &&
+    fuSet.body.data.fileExists === true);
+
+  const fuQuery = await call('system/forceUpdate', {}, session);
+  check('客户端可查询到已推送版本', fuQuery.body.ok === true && fuQuery.body.data.enabled === true &&
+    fuQuery.body.data.version === '9.9.9');
+
+  const dl = await getFile('/update-file?f=' + encodeURIComponent(INSTALLER) + '&token=' + encodeURIComponent(apiToken));
+  check('安装包下载接口返回文件', dl.status === 200 && dl.size === Buffer.byteLength(installerBody) &&
+    dl.body === installerBody, 'status=' + dl.status + ' size=' + dl.size);
+  check('安装包下载带附件头与长度', dl.type === 'application/octet-stream' &&
+    /attachment/.test(dl.disposition));
+
+  const dlNoToken = await getFile('/update-file?f=' + encodeURIComponent(INSTALLER));
+  check('安装包下载无连接码被拒绝', dlNoToken.status === 401);
+
+  const dlTraversal = await getFile('/update-file?f=' + encodeURIComponent('../../../config.json') + '&token=' + encodeURIComponent(apiToken));
+  check('安装包下载路径穿越被拒绝', dlTraversal.status === 404);
+
+  const dlMissing = await getFile('/update-file?f=nope.exe&token=' + encodeURIComponent(apiToken));
+  check('下载不存在的安装包返回 404', dlMissing.status === 404);
+
+  const fuOff = await call('system/setForceUpdate', { enabled: false }, session);
+  check('取消强制推送', fuOff.body.ok === true && fuOff.body.data.enabled === false);
+
+  const pushLogs = await call('logs/list', { silent: true }, session);
+  check('强制推送与取消推送均记入操作日志', pushLogs.body.ok === true &&
+    /强制推送安装包/.test(JSON.stringify(pushLogs.body.data)) &&
+    /取消强制推送/.test(JSON.stringify(pushLogs.body.data)));
+
   await server.close();
   console.log('\n结果：' + passed + ' 通过，' + failed + ' 失败');
   fs.rmSync(tmpDir, { recursive: true, force: true });
