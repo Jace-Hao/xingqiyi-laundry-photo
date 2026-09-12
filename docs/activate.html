@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>星期衣精致洗衣 - 激活码生成工具</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      font-family: 'Microsoft YaHei', Arial, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 20px;
+    }
+    .container {
+      background: white;
+      border-radius: 16px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      max-width: 600px;
+      width: 100%;
+      padding: 40px;
+    }
+    h1 {
+      color: #333;
+      margin-bottom: 10px;
+      font-size: 28px;
+    }
+    .subtitle {
+      color: #666;
+      margin-bottom: 30px;
+      font-size: 14px;
+    }
+    .form-group {
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      margin-bottom: 8px;
+      color: #555;
+      font-weight: 600;
+      font-size: 14px;
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 12px 16px;
+      border: 2px solid #e0e0e0;
+      border-radius: 8px;
+      font-size: 16px;
+      transition: all 0.3s;
+      font-family: 'Consolas', 'Monaco', monospace;
+    }
+    input[type="text"]:focus {
+      outline: none;
+      border-color: #667eea;
+      box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+    input[type="text"]::placeholder {
+      color: #aaa;
+      font-family: 'Microsoft YaHei', Arial, sans-serif;
+    }
+    .btn {
+      width: 100%;
+      padding: 14px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s;
+      margin-top: 10px;
+    }
+    .btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 20px rgba(102, 126, 234, 0.4);
+    }
+    .btn:active {
+      transform: translateY(0);
+    }
+    .result {
+      margin-top: 30px;
+      padding: 20px;
+      background: #f8f9fa;
+      border-radius: 8px;
+      border-left: 4px solid #667eea;
+    }
+    .result-label {
+      font-size: 14px;
+      color: #666;
+      margin-bottom: 8px;
+    }
+    .result-value {
+      font-size: 20px;
+      font-weight: 700;
+      color: #333;
+      font-family: 'Consolas', 'Monaco', monospace;
+      word-break: break-all;
+      user-select: all;
+    }
+    .copy-btn {
+      margin-top: 10px;
+      padding: 8px 16px;
+      background: #667eea;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 0.3s;
+    }
+    .copy-btn:hover {
+      background: #5568d3;
+    }
+    .copy-btn.copied {
+      background: #28a745;
+    }
+    .info {
+      margin-top: 30px;
+      padding: 16px;
+      background: #fff3cd;
+      border-left: 4px solid #ffc107;
+      border-radius: 6px;
+      font-size: 13px;
+      color: #856404;
+      line-height: 1.6;
+    }
+    .info strong {
+      color: #664d03;
+    }
+    .error {
+      margin-top: 20px;
+      padding: 16px;
+      background: #f8d7da;
+      border-left: 4px solid #dc3545;
+      border-radius: 6px;
+      font-size: 14px;
+      color: #721c24;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🔐 激活码生成工具</h1>
+    <p class="subtitle">星期衣精致洗衣衣物照片系统 - 管理员专用</p>
+    
+    <form id="licenseForm">
+      <div class="form-group">
+        <label for="machineCode">客户机器码</label>
+        <input 
+          type="text" 
+          id="machineCode" 
+          placeholder="例如：FP97-YDRP-YZ2Q-GABW"
+          autocomplete="off"
+          required
+        >
+      </div>
+      <button type="submit" class="btn">生成激活码</button>
+    </form>
+
+    <div id="result" style="display: none;">
+      <div class="result">
+        <div class="result-label">生成的激活码：</div>
+        <div class="result-value" id="activationCode"></div>
+        <button class="copy-btn" id="copyBtn">复制激活码</button>
+      </div>
+    </div>
+
+    <div id="error" class="error" style="display: none;"></div>
+
+    <div class="info">
+      <strong>使用说明：</strong><br>
+      1. 让客户在软件登录页点击「软件激活」，复制机器码<br>
+      2. 将机器码粘贴到上方输入框<br>
+      3. 点击「生成激活码」按钮<br>
+      4. 将生成的激活码发给客户，客户在软件中输入即可激活<br>
+      <br>
+      <strong>注意：</strong>激活码与机器码一一对应，每台电脑需要单独生成。
+    </div>
+  </div>
+
+  <script>
+    // 激活码生成算法（与服务器端保持一致）
+    const SECRET = 'xingqiyi-laundry-photo-license-v1';
+    const CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+    function toCharset(hex, len) {
+      let out = '';
+      for (let i = 0; i < len; i++) {
+        const byte = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+        out += CHARSET[byte % CHARSET.length];
+      }
+      return out;
+    }
+
+    function group(s) {
+      return s.replace(/(.{4})(?=.)/g, '$1-');
+    }
+
+    async function genActivationCode(machineCode) {
+      const normalized = String(machineCode || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+      if (normalized.length !== 16) {
+        throw new Error('机器码格式不正确（应为 16 位字符）');
+      }
+
+      // 使用 Web Crypto API 生成 HMAC-SHA256
+      const encoder = new TextEncoder();
+      const keyData = encoder.encode(SECRET + ':activation');
+      const messageData = encoder.encode(normalized);
+
+      const key = await crypto.subtle.importKey(
+        'raw',
+        keyData,
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+      );
+
+      const signature = await crypto.subtle.sign('HMAC', key, messageData);
+      const hex = Array.from(new Uint8Array(signature))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+
+      return 'XQY-' + group(toCharset(hex, 12));
+    }
+
+    // 表单提交处理
+    document.getElementById('licenseForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      
+      const machineCode = document.getElementById('machineCode').value.trim();
+      const resultDiv = document.getElementById('result');
+      const errorDiv = document.getElementById('error');
+      const activationCodeSpan = document.getElementById('activationCode');
+
+      // 隐藏之前的结果和错误
+      resultDiv.style.display = 'none';
+      errorDiv.style.display = 'none';
+
+      try {
+        const activationCode = await genActivationCode(machineCode);
+        activationCodeSpan.textContent = activationCode;
+        resultDiv.style.display = 'block';
+      } catch (err) {
+        errorDiv.textContent = '错误：' + err.message;
+        errorDiv.style.display = 'block';
+      }
+    });
+
+    // 复制按钮
+    document.getElementById('copyBtn').addEventListener('click', () => {
+      const activationCode = document.getElementById('activationCode').textContent;
+      const copyBtn = document.getElementById('copyBtn');
+
+      navigator.clipboard.writeText(activationCode).then(() => {
+        copyBtn.textContent = '已复制！';
+        copyBtn.classList.add('copied');
+        setTimeout(() => {
+          copyBtn.textContent = '复制激活码';
+          copyBtn.classList.remove('copied');
+        }, 2000);
+      }).catch(err => {
+        alert('复制失败，请手动复制：' + activationCode);
+      });
+    });
+
+    // 自动聚焦输入框
+    document.getElementById('machineCode').focus();
+  </script>
+</body>
+</html>

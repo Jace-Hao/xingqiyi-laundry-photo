@@ -239,8 +239,27 @@ const LoginPage = {
   props: { sysInfo: { type: Object, default: null } },
   emits: ['login', 'server-saved'],
   setup(props, { emit }) {
-    const username = Vue.ref('');
+    // 记住最后登录账号：仅缓存用户名，密码不落盘，下次打开自动填充并聚焦密码框
+    const LAST_USER_KEY = 'xqy.lastUsername';
+    function readLastUsername() {
+      try {
+        return localStorage.getItem(LAST_USER_KEY) || '';
+      } catch (e) {
+        return '';
+      }
+    }
+    function writeLastUsername(name) {
+      try {
+        if (name) localStorage.setItem(LAST_USER_KEY, name);
+        else localStorage.removeItem(LAST_USER_KEY);
+      } catch (e) {
+        /* 忽略存储不可用时的异常 */
+      }
+    }
+
+    const username = Vue.ref(readLastUsername());
     const password = Vue.ref('');
+    const passwordInput = Vue.ref(null);
     const error = Vue.ref('');
     const loading = Vue.ref(false);
 
@@ -307,7 +326,15 @@ const LoginPage = {
     }
 
     // 挂载时加载激活状态、当前版本与更新信息（loadAll 内部已串联这三步）
-    Vue.onMounted(loadAll);
+    Vue.onMounted(() => {
+      loadAll();
+      // 账号已被记住时，自动聚焦密码框，省去再次点击账号框
+      if (username.value && passwordInput.value) {
+        Vue.nextTick(() => {
+          if (passwordInput.value && passwordInput.value.focus) passwordInput.value.focus();
+        });
+      }
+    });
 
     function openServer() {
       showServer.value = !showServer.value;
@@ -355,6 +382,7 @@ const LoginPage = {
       try {
         const r = await window.api.login(username.value.trim(), password.value);
         if (r.ok) {
+          writeLastUsername(username.value.trim());
           toast('登录成功，欢迎 ' + (r.data.user.name || r.data.user.username), 'success');
           emit('login', r.data);
         } else if (r.expired) {
@@ -373,7 +401,7 @@ const LoginPage = {
     }
 
     return {
-      username, password, error, loading, submit,
+      username, password, passwordInput, error, loading, submit,
       showServer, serverUrl, serverToken, testing, testMsg, savingServer,
       openServer, testConn, saveServer, sysInfo: props.sysInfo,
       license, showActivate, activateCode, activateMsg, activating,
@@ -392,7 +420,7 @@ const LoginPage = {
           <label>账号</label>
           <input v-model="username" placeholder="请输入账号" autocomplete="username" />
           <label>密码</label>
-          <input v-model="password" type="password" placeholder="请输入密码" autocomplete="current-password" />
+          <input ref="passwordInput" v-model="password" type="password" placeholder="请输入密码" autocomplete="current-password" />
           <div v-if="error" class="form-error">{{ error }}</div>
           <button class="btn btn-primary btn-block" type="submit" :disabled="loading">
             {{ loading ? '登录中…' : '登 录' }}
@@ -448,6 +476,10 @@ const LoginPage = {
         <!-- 当前版本 + 一键下载安装包 -->
         <div class="login-version">
           <span class="login-version-text">当前版本 <b>v{{ version || '-' }}</b></span>
+          <span v-if="updateInfo && updateInfo.latestVersion" class="login-version-latest">
+            最新版本 <b>v{{ updateInfo.latestVersion }}</b>
+            <span v-if="updateInfo.hasUpdate" class="tag tag-orange" style="margin-left:4px;vertical-align:middle">有更新</span>
+          </span>
           <template v-if="downloading">
             <div class="login-dl-progress">
               <div class="login-dl-bar"><i :style="{ width: progressPercent + '%' }"></i></div>
@@ -959,12 +991,181 @@ const QueryPage = {
     const items = Vue.ref([]);
     const total = Vue.ref(0);
     const page = Vue.ref(1);
-    const pageSize = 12;
+    // 每页显示数量随窗口可视区域自适应（需求：不再固定），下限/上限见 recalcPageSize
+    const pageSize = Vue.ref(12);
     const loading = Vue.ref(false);
     const detail = Vue.ref(null);
+    const detailIndex = Vue.ref(-1); // 当前预览照片在本页列表中的下标，用于左右切换
     const selected = Vue.ref([]); // 已勾选的记录 id
     const batchDeleting = Vue.ref(false);
     const exporting = Vue.ref(false);
+
+    // 照片网格容器引用，用于测量可用宽高以计算每页数量
+    const gridEl = Vue.ref(null);
+
+    // ---------- 图片灯箱：原尺寸预览 + 缩放平移 + 左右切换 ----------
+    const zoomScale = Vue.ref(1);
+    const panX = Vue.ref(0);
+    const panY = Vue.ref(0);
+    const imgLoaded = Vue.ref(false);
+    const imgNatural = Vue.ref({ w: 0, h: 0 });
+    let dragging = false;
+    let dragStart = { x: 0, y: 0, panX: 0, panY: 0 };
+
+    const ZOOM_MIN = 0.2;
+    const ZOOM_MAX = 8;
+
+    function resetZoom() {
+      zoomScale.value = 1;
+      panX.value = 0;
+      panY.value = 0;
+      imgLoaded.value = false;
+    }
+
+    // 以某点为中心缩放：保持鼠标位置对应的图像点不动
+    function applyZoom(nextScale, cx, cy) {
+      const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, nextScale));
+      if (clamped === zoomScale.value) return;
+      const ratio = clamped / zoomScale.value;
+      if (typeof cx === 'number' && typeof cy === 'number') {
+        panX.value = cx - (cx - panX.value) * ratio;
+        panY.value = cy - (cy - panY.value) * ratio;
+      }
+      zoomScale.value = clamped;
+    }
+
+    function zoomIn() {
+      applyZoom(zoomScale.value * 1.25);
+    }
+
+    function zoomOut() {
+      applyZoom(zoomScale.value / 1.25);
+    }
+
+    function zoomReset() {
+      zoomScale.value = 1;
+      panX.value = 0;
+      panY.value = 0;
+    }
+
+    // 滚轮缩放（以光标位置为锚点）
+    function onWheel(e) {
+      if (!detail.value) return;
+      e.preventDefault();
+      const rect = e.currentTarget.getBoundingClientRect();
+      const cx = e.clientX - rect.left - rect.width / 2;
+      const cy = e.clientY - rect.top - rect.height / 2;
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      applyZoom(zoomScale.value * factor, cx, cy);
+    }
+
+    function onImgMouseDown(e) {
+      if (e.button !== 0) return;
+      dragging = true;
+      dragStart = { x: e.clientX, y: e.clientY, panX: panX.value, panY: panY.value };
+      e.preventDefault();
+    }
+
+    function onDocMouseMove(e) {
+      if (!dragging) return;
+      panX.value = dragStart.panX + (e.clientX - dragStart.x);
+      panY.value = dragStart.panY + (e.clientY - dragStart.y);
+    }
+
+    function onDocMouseUp() {
+      dragging = false;
+    }
+
+    // 双击在 1x 与 2.5x 之间切换，便于快速看细节
+    function onImgDblClick(e) {
+      if (zoomScale.value > 1.01) {
+        zoomReset();
+      } else {
+        const rect = e.currentTarget.getBoundingClientRect();
+        applyZoom(2.5, e.clientX - rect.left - rect.width / 2, e.clientY - rect.top - rect.height / 2);
+      }
+    }
+
+    function onImgLoad(e) {
+      imgLoaded.value = true;
+      const el = e && e.target;
+      if (el) imgNatural.value = { w: el.naturalWidth || 0, h: el.naturalHeight || 0 };
+    }
+
+    // 关闭灯箱并清理键盘/鼠标监听
+    function closeDetail() {
+      detail.value = null;
+      detailIndex.value = -1;
+      resetZoom();
+    }
+
+    // 左右切换：本页内移动；到达边界时自动翻页并定位到首/尾张
+    async function stepPhoto(delta) {
+      if (!items.value.length) return;
+      const idx = detailIndex.value;
+      let nextIdx = idx + delta;
+
+      if (nextIdx < 0) {
+        if (page.value <= 1) return; // 已是全部记录的第一张
+        page.value--;
+        await search(false);
+        if (!items.value.length) return;
+        nextIdx = items.value.length - 1;
+      } else if (nextIdx >= items.value.length) {
+        if (page.value >= totalPages.value) return; // 已是最后一张
+        page.value++;
+        await search(false);
+        if (!items.value.length) return;
+        nextIdx = 0;
+      }
+
+      detailIndex.value = nextIdx;
+      detail.value = items.value[nextIdx];
+      resetZoom();
+    }
+
+    function prevPhoto() {
+      stepPhoto(-1);
+    }
+
+    function nextPhoto() {
+      stepPhoto(1);
+    }
+
+    // 灯箱打开期间监听键盘：←/→ 切换，+/- 缩放，0 复位，Esc 关闭
+    function onKeydown(e) {
+      if (!detail.value) return;
+      switch (e.key) {
+        case 'ArrowLeft':
+          e.preventDefault();
+          prevPhoto();
+          break;
+        case 'ArrowRight':
+          e.preventDefault();
+          nextPhoto();
+          break;
+        case 'Escape':
+          e.preventDefault();
+          closeDetail();
+          break;
+        case '+':
+        case '=':
+          e.preventDefault();
+          zoomIn();
+          break;
+        case '-':
+        case '_':
+          e.preventDefault();
+          zoomOut();
+          break;
+        case '0':
+          e.preventDefault();
+          zoomReset();
+          break;
+        default:
+          break;
+      }
+    }
 
     // 按条码（订单号）批量下载照片：勾选了则导出勾选记录涉及的条码，未勾选则导出当前列表全部条码
     async function exportByBarcode() {
@@ -1103,7 +1304,7 @@ const QueryPage = {
           dateTo: dateTo.value,
           userId: userIdFilter.value,
           page: page.value,
-          pageSize
+          pageSize: pageSize.value
         });
         if (r.ok) {
           items.value = r.data.items;
@@ -1129,9 +1330,11 @@ const QueryPage = {
     }
 
     async function openDetail(r) {
-      const res = await window.api.getRecord(props.token, r.id);
-      if (res.ok) detail.value = res.data;
-      else toast(res.message || '打开失败', 'error');
+      // 列表记录已含完整字段与原图 photoUrl，直接用于灯箱预览，切换时零延迟且不额外产生「查看记录」日志
+      const idx = items.value.findIndex((x) => x.id === r.id);
+      detailIndex.value = idx >= 0 ? idx : -1;
+      detail.value = r;
+      resetZoom();
     }
 
     async function remove(r) {
@@ -1139,14 +1342,48 @@ const QueryPage = {
       const res = await window.api.deleteRecord(props.token, r.id);
       if (res.ok) {
         toast('已删除', 'success');
-        if (detail.value && detail.value.id === r.id) detail.value = null;
+        if (detail.value && detail.value.id === r.id) closeDetail();
         search(false);
       } else {
         toast(res.message || '删除失败', 'error');
       }
     }
 
-    const totalPages = Vue.computed(() => Math.max(1, Math.ceil(total.value / pageSize)));
+    const totalPages = Vue.computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)));
+
+    // 根据网格容器可视宽高估算每页应显示的照片数量：
+    // 先按最小卡宽 180px + 间距 14px 算出每行列数，再按可用高度算出可容纳的行数。
+    function recalcPageSize() {
+      const el = gridEl.value;
+      if (!el) return;
+      const CARD_MIN_W = 180;
+      const GAP = 14;
+      const CARD_H = 232; // 卡片高度：4:3 图(≈135) + meta(≈80) + 边框间距
+      const width = el.clientWidth || el.offsetWidth || 0;
+      if (width <= 0) return;
+      const cols = Math.max(1, Math.floor((width + GAP) / (CARD_MIN_W + GAP)));
+      // 可用高度：视口高度减去顶栏/筛选栏/分页等固定占位（约 320px），至少 1 行
+      const mainEl = el.closest('.main');
+      const viewportH = mainEl ? mainEl.clientHeight : window.innerHeight;
+      const availH = Math.max(CARD_H, viewportH - 320);
+      const rows = Math.max(1, Math.floor((availH + GAP) / (CARD_H + GAP)));
+      const next = Math.min(100, Math.max(6, cols * rows));
+      if (next !== pageSize.value) {
+        pageSize.value = next;
+      }
+    }
+
+    // 尺寸变化时重新计算每页数量并回到第一页重查，避免半屏空白或溢出
+    let resizeRaf = null;
+    function onResize() {
+      if (resizeRaf) cancelAnimationFrame(resizeRaf);
+      resizeRaf = requestAnimationFrame(() => {
+        resizeRaf = null;
+        const before = pageSize.value;
+        recalcPageSize();
+        if (pageSize.value !== before) search(true);
+      });
+    }
 
     function prev() {
       if (page.value > 1) {
@@ -1164,15 +1401,33 @@ const QueryPage = {
 
     Vue.onMounted(() => {
       loadUsers();
+      // 首屏先按容器尺寸计算每页数量，再查询
+      Vue.nextTick(() => recalcPageSize());
       search(true);
+      window.addEventListener('resize', onResize);
+      window.addEventListener('keydown', onKeydown);
+      document.addEventListener('mousemove', onDocMouseMove);
+      document.addEventListener('mouseup', onDocMouseUp);
+    });
+
+    Vue.onBeforeUnmount(() => {
+      window.removeEventListener('resize', onResize);
+      window.removeEventListener('keydown', onKeydown);
+      document.removeEventListener('mousemove', onDocMouseMove);
+      document.removeEventListener('mouseup', onDocMouseUp);
+      if (resizeRaf) cancelAnimationFrame(resizeRaf);
     });
 
     return {
       keyword, barcodeFilter, dateFrom, dateTo, userIdFilter, users, items, total,
-      page, pageSize, totalPages, loading, detail,
+      page, pageSize, totalPages, loading, detail, detailIndex, gridEl,
       selected, batchDeleting, toggleSelect, selectAll, batchDelete,
       exporting, exportByBarcode, exportByDate,
       search, reset, openDetail, remove, prev, next, fmt,
+      // 灯箱预览：缩放、平移、切换
+      zoomScale, panX, panY, imgLoaded, imgNatural,
+      closeDetail, prevPhoto, nextPhoto, zoomIn, zoomOut, zoomReset,
+      onWheel, onImgMouseDown, onImgDblClick, onImgLoad,
       adminMode: props.adminMode
     };
   },
@@ -1226,22 +1481,24 @@ const QueryPage = {
           </button>
         </div>
 
-        <div v-if="loading" class="empty">加载中…</div>
-        <div v-else-if="!items.length" class="empty">暂无符合条件的存档记录</div>
-        <div v-else class="record-grid">
-          <div v-for="r in items" :key="r.id" class="record-card" @click="openDetail(r)">
-            <div class="record-photo"><img :src="r.photoUrl" /></div>
-            <div class="record-meta">
-              <div class="record-customer">{{ r.barcode }}</div>
-              <div class="record-tags">
-                <span class="tag tag-orange">第 {{ r.seq }} 张</span>
-                <span v-if="adminMode" class="tag tag-owner">{{ r.username }}</span>
+        <div ref="gridEl" class="query-results">
+          <div v-if="loading" class="empty">加载中…</div>
+          <div v-else-if="!items.length" class="empty">暂无符合条件的存档记录</div>
+          <div v-else class="record-grid">
+            <div v-for="r in items" :key="r.id" class="record-card" @click="openDetail(r)">
+              <div class="record-photo"><img :src="r.photoUrl" /></div>
+              <div class="record-meta">
+                <div class="record-customer">{{ r.barcode }}</div>
+                <div class="record-tags">
+                  <span class="tag tag-orange">第 {{ r.seq }} 张</span>
+                  <span v-if="adminMode" class="tag tag-owner">{{ r.username }}</span>
+                </div>
+                <div class="record-time">{{ fmt(r.createdAt) }}</div>
               </div>
-              <div class="record-time">{{ fmt(r.createdAt) }}</div>
+              <label class="card-check" :class="{ on: selected.includes(r.id) }" @click.stop>
+                <input type="checkbox" :checked="selected.includes(r.id)" @change="toggleSelect(r)" />
+              </label>
             </div>
-            <label class="card-check" :class="{ on: selected.includes(r.id) }" @click.stop>
-              <input type="checkbox" :checked="selected.includes(r.id)" @change="toggleSelect(r)" />
-            </label>
           </div>
         </div>
 
@@ -1252,20 +1509,60 @@ const QueryPage = {
         </div>
       </div>
 
-      <div v-if="detail" class="modal-mask" @click.self="detail = null">
-        <div class="modal">
-          <div class="modal-head"><h3>存档详情</h3><button class="modal-close" @click="detail = null">✕</button></div>
-          <div class="modal-body">
-            <img class="modal-photo" :src="detail.photoUrl" />
-            <div class="info-row"><span>条形码</span><b>{{ detail.barcode }}</b></div>
-            <div class="info-row"><span>照片编号</span><b>第 {{ detail.seq }} 张</b></div>
-            <div class="info-row"><span>备注</span><b>{{ detail.note || '无' }}</b></div>
-            <div v-if="adminMode" class="info-row"><span>所属账号</span><b>{{ detail.username }}</b></div>
+      <div v-if="detail" class="lightbox" @click.self="closeDetail" @wheel="onWheel">
+        <!-- 顶部信息条 -->
+        <div class="lightbox-top">
+          <div class="lightbox-info">
+            <span class="lightbox-barcode">{{ detail.barcode }}</span>
+            <span class="lightbox-seq">第 {{ detail.seq }} 张</span>
+            <span v-if="adminMode" class="lightbox-owner">{{ detail.username }}</span>
+            <span class="lightbox-time">{{ fmt(detail.createdAt) }}</span>
+            <span v-if="detail.note" class="lightbox-note" :title="detail.note">备注：{{ detail.note }}</span>
+            <span v-if="imgNatural.w" class="lightbox-dim">{{ imgNatural.w }}×{{ imgNatural.h }}</span>
+            <span class="lightbox-zoom">{{ Math.round(zoomScale * 100) }}%</span>
+            <span v-if="detailIndex >= 0" class="lightbox-pos">{{ detailIndex + 1 }} / {{ items.length }}</span>
           </div>
-          <div class="modal-foot">
-            <button class="btn btn-danger" @click="remove(detail)">删除记录</button>
-            <button class="btn btn-ghost" @click="detail = null">关闭</button>
-          </div>
+          <button class="lightbox-close" title="关闭（Esc）" @click="closeDetail">✕</button>
+        </div>
+
+        <!-- 左切换 -->
+        <button
+          class="lightbox-nav lightbox-prev"
+          title="上一张（←）"
+          :disabled="detailIndex <= 0 && page <= 1"
+          @click.stop="prevPhoto"
+        >‹</button>
+
+        <!-- 图片舞台 -->
+        <div class="lightbox-stage" @click.self="closeDetail">
+          <img
+            class="lightbox-img"
+            :class="{ loaded: imgLoaded, grab: zoomScale > 1.01 }"
+            :src="detail.photoUrl"
+            :style="{ transform: 'translate(' + panX + 'px,' + panY + 'px) scale(' + zoomScale + ')' }"
+            draggable="false"
+            @load="onImgLoad"
+            @mousedown="onImgMouseDown"
+            @dblclick="onImgDblClick"
+            alt="衣物照片"
+          />
+        </div>
+
+        <!-- 右切换 -->
+        <button
+          class="lightbox-nav lightbox-next"
+          title="下一张（→）"
+          :disabled="detailIndex >= items.length - 1 && page >= totalPages"
+          @click.stop="nextPhoto"
+        >›</button>
+
+        <!-- 底部工具条 -->
+        <div class="lightbox-bottom">
+          <button class="lightbox-btn" title="缩小（-）" @click="zoomOut">－</button>
+          <button class="lightbox-btn" title="实际大小（0）" @click="zoomReset">1:1</button>
+          <button class="lightbox-btn" title="放大（+）" @click="zoomIn">＋</button>
+          <span class="lightbox-hint">滚轮缩放 · 拖拽平移 · 双击放大 · ←/→ 切换 · Esc 关闭</span>
+          <button class="lightbox-btn lightbox-danger" @click="remove(detail)">删除记录</button>
         </div>
       </div>
     </div>
@@ -2217,9 +2514,18 @@ const Shell = {
   setup(props, { emit }) {
     const isAdmin = props.user.role === 'admin';
     const version = Vue.ref('');
+    const latestVersion = Vue.ref('');
+    const hasUpdate = Vue.ref(false);
 
     window.api.version().then((r) => {
       if (r.ok) version.value = r.data.version;
+    });
+    // 启动时自动从 GitHub 获取最新版本号
+    window.api.checkUpdate().then((r) => {
+      if (r.ok && r.data) {
+        latestVersion.value = r.data.latestVersion || '';
+        hasUpdate.value = !!r.data.hasUpdate;
+      }
     });
 
     // 离线冗余：周期探测服务器连通性与待同步数量，仅客户端模式显示
@@ -2294,6 +2600,7 @@ const Shell = {
 
     return {
       user: props.user, mode: props.mode, isAdmin, pages, comps, active, doLogout, version,
+      latestVersion, hasUpdate,
       online, pending, syncing, doSync
     };
   },
@@ -2327,7 +2634,7 @@ const Shell = {
             </div>
           </div>
           <button class="btn btn-ghost btn-block" @click="doLogout">退出登录</button>
-          <div class="sidebar-version">版本 v{{ version || '-' }}</div>
+          <div class="sidebar-version">版本 v{{ version || '-' }}<template v-if="latestVersion"> · 最新 v{{ latestVersion }}<span v-if="hasUpdate" class="tag tag-orange" style="margin-left:4px;font-size:10px">有更新</span></template></div>
         </div>
       </aside>
       <main class="main">

@@ -763,6 +763,211 @@ textarea {
   word-break: break-all;
 }
 
+/* ---------- 图片灯箱预览（原图缩放 + 左右切换） ---------- */
+.lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(6, 12, 26, 0.92);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  user-select: none;
+}
+
+.lightbox-top {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 18px;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.lightbox-info {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  color: #e6ecf5;
+  font-size: 13px;
+  min-width: 0;
+}
+
+.lightbox-barcode {
+  font-weight: 700;
+  font-size: 15px;
+  color: #fff;
+}
+
+.lightbox-seq {
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.22);
+  color: #fbbf24;
+}
+
+.lightbox-owner {
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(59, 130, 246, 0.22);
+  color: #93c5fd;
+}
+
+.lightbox-note {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #cbd5e1;
+}
+
+.lightbox-time,
+.lightbox-dim,
+.lightbox-zoom,
+.lightbox-pos {
+  color: #94a3b8;
+  font-variant-numeric: tabular-nums;
+}
+
+.lightbox-zoom {
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.lightbox-close {
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  font-size: 16px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.lightbox-close:hover {
+  background: rgba(255, 255, 255, 0.24);
+}
+
+/* 舞台：占据中间剩余空间，图片在其中居中并可缩放平移 */
+.lightbox-stage {
+  flex: 1;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.lightbox-img {
+  max-width: 92%;
+  max-height: 92%;
+  object-fit: contain;
+  cursor: grab;
+  opacity: 0;
+  transition: opacity 0.15s;
+  will-change: transform;
+}
+
+.lightbox-img.loaded {
+  opacity: 1;
+}
+
+.lightbox-img.grab {
+  cursor: move;
+}
+
+/* 左右切换按钮 */
+.lightbox-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 52px;
+  height: 88px;
+  border: none;
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  font-size: 40px;
+  line-height: 1;
+  cursor: pointer;
+  z-index: 2;
+  transition: background 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lightbox-nav:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.lightbox-nav:disabled {
+  opacity: 0.25;
+  cursor: not-allowed;
+}
+
+.lightbox-prev {
+  left: 0;
+  border-radius: 0 10px 10px 0;
+}
+
+.lightbox-next {
+  right: 0;
+  border-radius: 10px 0 0 10px;
+}
+
+/* 底部工具条 */
+.lightbox-bottom {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 18px;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.lightbox-btn {
+  min-width: 44px;
+  height: 34px;
+  padding: 0 12px;
+  border: none;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.lightbox-btn:hover {
+  background: rgba(255, 255, 255, 0.24);
+}
+
+.lightbox-danger {
+  margin-left: auto;
+  background: rgba(220, 38, 38, 0.75);
+}
+
+.lightbox-danger:hover {
+  background: rgba(220, 38, 38, 0.95);
+}
+
+.lightbox-hint {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+/* 结果区容器：为自适应分页提供测量基准 */
+.query-results {
+  min-height: 200px;
+}
+
 /* ---------- 表格 ---------- */
 .table-wrap {
   overflow-x: auto;

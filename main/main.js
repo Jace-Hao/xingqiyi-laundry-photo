@@ -1094,22 +1094,114 @@ async function restartServerIfNeeded() {
 // ---------- 窗口 ----------
 let mainWindow = null;
 
+// 窗口状态持久化：记住上次是否最大化及手动调整过的尺寸，下次启动沿用。
+// 首次运行（无状态文件）默认最大化，满足「打开软件即全屏显示」的要求。
+const WINDOW_STATE_FILE = path.join(app.getPath('userData'), 'window-state.json');
+const DEFAULT_WINDOW = { width: 1300, height: 860, isMaximized: true };
+
+function loadWindowState() {
+  try {
+    const fs = require('fs');
+    const state = JSON.parse(fs.readFileSync(WINDOW_STATE_FILE, 'utf8'));
+    // 尺寸需落在合理范围内，避免显示器变化后窗口过小或跑出屏幕
+    const width = Number(state.width) >= 800 ? Number(state.width) : DEFAULT_WINDOW.width;
+    const height = Number(state.height) >= 600 ? Number(state.height) : DEFAULT_WINDOW.height;
+    // 强制最大化：如果用户没有明确设置过窗口状态，或者窗口尺寸过小，都强制最大化
+    const isMaximized = state.isMaximized === undefined || state.isMaximized !== false || (width < 1200 || height < 700);
+    return {
+      width,
+      height,
+      x: Number.isFinite(state.x) ? state.x : undefined,
+      y: Number.isFinite(state.y) ? state.y : undefined,
+      isMaximized
+    };
+  } catch (e) {
+    // 首次运行或状态文件损坏，返回默认最大化状态
+    return Object.assign({}, DEFAULT_WINDOW);
+  }
+}
+
+// 保存窗口状态；最大化时用还原态尺寸记录，避免退出后下次打开变成小窗
+function saveWindowState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    const fs = require('fs');
+    const isMaximized = mainWindow.isMaximized();
+    let bounds;
+    try {
+      bounds = isMaximized ? mainWindow.getNormalBounds() : mainWindow.getBounds();
+    } catch (e) {
+      bounds = mainWindow.getBounds();
+    }
+    if (!bounds || !(bounds.width > 0)) return;
+    fs.mkdirSync(path.dirname(WINDOW_STATE_FILE), { recursive: true });
+    fs.writeFileSync(
+      WINDOW_STATE_FILE,
+      JSON.stringify({
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+        isMaximized
+      }),
+      'utf8'
+    );
+  } catch (e) {
+    /* 状态保存失败不影响主流程 */
+  }
+}
+
+// 拖动/缩放窗口会高频触发事件，延迟合并写入，避免反复读写磁盘
+let saveWindowStateTimer = null;
+function scheduleSaveWindowState() {
+  if (saveWindowStateTimer) clearTimeout(saveWindowStateTimer);
+  saveWindowStateTimer = setTimeout(() => {
+    saveWindowStateTimer = null;
+    saveWindowState();
+  }, 400);
+}
+
 function createWindow() {
+  const winState = loadWindowState();
+
   mainWindow = new BrowserWindow({
-    width: 1300,
-    height: 860,
+    width: winState.width,
+    height: winState.height,
+    x: winState.x,
+    y: winState.y,
     minWidth: 1024,
     minHeight: 680,
     title: '星期衣精致洗衣衣物照片系统',
     icon: path.join(RENDERER_DIR, 'assets', 'logo.png'),
     backgroundColor: '#f2f6fc',
     autoHideMenuBar: true,
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false
     }
   });
+
+  mainWindow.once('ready-to-show', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.show();
+      // 在窗口显示后再最大化，确保生效
+      if (winState.isMaximized) {
+        setTimeout(() => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.maximize();
+          }
+        }, 50);
+      }
+    }
+  });
+
+  // 记录用户手动调整的窗口状态；最大化/还原状态变化即时落盘
+  mainWindow.on('resize', scheduleSaveWindowState);
+  mainWindow.on('move', scheduleSaveWindowState);
+  mainWindow.on('maximize', saveWindowState);
+  mainWindow.on('unmaximize', saveWindowState);
 
   mainWindow.webContents.on('console-message', (_e, _level, message) => {
     console.log('[renderer] ' + message);
@@ -1147,6 +1239,12 @@ function createWindow() {
   // 服务端后台常驻（需求13）：服务端模式下点关闭按钮只把窗口隐藏到托盘，
   // HTTP 服务继续运行，避免店员客户端断连；只有托盘「退出程序」或系统退出才真正关闭。
   mainWindow.on('close', (e) => {
+    // 关闭/隐藏前先落盘窗口状态（closed 事件时窗口已不可读，只能在这里保存）
+    if (saveWindowStateTimer) {
+      clearTimeout(saveWindowStateTimer);
+      saveWindowStateTimer = null;
+    }
+    saveWindowState();
     if (isQuitting) return;
     if (isServerRunning()) {
       e.preventDefault();

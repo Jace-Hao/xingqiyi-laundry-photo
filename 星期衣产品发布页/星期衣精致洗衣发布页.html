@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>星期衣精致洗衣衣物照片系统 · V0.1.6 正式发布</title>
+<title>星期衣精致洗衣衣物照片系统 · 正式版发布</title>
 <style>
 /* SECTION: tokens */
 :root{
@@ -33,6 +33,7 @@ section{padding:88px 0}
 header{position:fixed;inset:0 0 auto 0;z-index:50;backdrop-filter:blur(14px);background:#0a130bd9;border-bottom:1px solid var(--line)}
 .nav{display:flex;align-items:center;gap:28px;height:64px}
 .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:16px}
+.brand .brand-logo{width:34px;height:34px;border-radius:9px;flex:none;object-fit:contain;background:#fff;padding:2px}
 .brand .mark{width:34px;height:34px;border-radius:9px;background:#2f8f00;display:flex;align-items:center;justify-content:center;color:var(--gold);font-size:17px;flex:none}
 .nav-links{display:flex;gap:22px;margin-left:auto;font-size:14px;color:var(--ink2)}
 .nav-links a{padding:6px 2px;border-bottom:2px solid transparent;transition:color .15s,border-color .15s}
@@ -165,7 +166,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 <!-- SECTION: nav -->
 <header>
   <div class="wrap nav">
-    <div class="brand"><span class="mark">衣</span>星期衣 · 精致洗衣</div>
+    <div class="brand"><img class="brand-logo" src="assets/logo.png" alt="星期衣 logo" onerror="this.outerHTML='<span class=&quot;mark&quot;>衣</span>'">星期衣 · 精致洗衣</div>
     <nav class="nav-links" id="navLinks">
       <a href="#product">产品</a>
       <a href="#features">核心能力</a>
@@ -173,7 +174,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
       <a href="#network">联网与安全</a>
       <a href="#start">开始使用</a>
     </nav>
-    <a class="btn btn-gold" href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/releases" target="_blank" rel="noopener" data-primary-action>下载 V0.1.6</a>
+    <a class="btn btn-gold" href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/releases/latest" target="_blank" rel="noopener" data-primary-action data-download>下载 <span data-ver>V0.1.8</span></a>
   </div>
 </header>
 
@@ -181,11 +182,11 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 <section class="hero" id="top">
   <div class="wrap hero-grid">
     <div>
-      <div class="eyebrow">多店联网存档 · 正式版 V0.1.6</div>
+      <div class="eyebrow">多店联网存档 · 正式版 <span data-ver>V0.1.8</span></div>
       <h1>不只拍下衣物。<br><em>留住每一次交接。</em></h1>
       <p class="sub">扫码即拍、最大分辨率留档、按条码自动编号归档；多台电脑联网共用一套数据，权限与操作全程可审计，把洗衣店的每一件衣物都管得明明白白。</p>
       <div class="hero-cta">
-        <a class="btn btn-gold" href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/releases" target="_blank" rel="noopener">下载安装包 V0.1.6 →</a>
+        <a class="btn btn-gold" href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/releases/latest" target="_blank" rel="noopener" data-download>下载安装包 <span data-ver>V0.1.8</span> →</a>
         <a class="btn btn-ghost" href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/blob/main/CHANGELOG.md" target="_blank" rel="noopener">查看更新日志 ↗</a>
       </div>
       <div class="stats">
@@ -228,7 +229,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
       <div><div class="no">01</div><h3>下载与安装</h3><p>一键安装包，终端电脑无需任何依赖</p></div><span class="arr">↗</span>
     </a>
     <a href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/blob/main/CHANGELOG.md" target="_blank" rel="noopener">
-      <div><div class="no">02</div><h3>更新日志</h3><p>V0.1.6 更新弹窗与一键下载更新</p></div><span class="arr">↗</span>
+      <div><div class="no">02</div><h3>更新日志</h3><p>V0.1.8 更新弹窗与一键下载更新</p></div><span class="arr">↗</span>
     </a>
     <a href="#network">
       <div><div class="no">03</div><h3>多店联网指南</h3><p>局域网连接与异地组网排查步骤</p></div><span class="arr">→</span>
@@ -245,7 +246,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
         <h2>星期衣精致洗衣衣物照片系统</h2>
         <p class="lead">一套面向洗衣门店的衣物拍照存档方案。扫码建档、高清留影、按条码归档，客户端与管理端分离，覆盖单店多机与多店异地场景。</p>
       </div>
-      <div class="ver-pill">最新版本<b>V0.1.6</b></div>
+      <div class="ver-pill">最新版本<b>V0.1.8</b></div>
     </div>
     <div class="p-stats">
       <div><b>2</b><span>种运行模式：服务端 / 客户端</span></div>
@@ -345,7 +346,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
     <div class="start-grid">
       <a href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/releases" target="_blank" rel="noopener">
         <div class="tag">DOWNLOAD</div><h3>下载安装包</h3>
-        <p>获取 V0.1.6 安装包，向导式安装可自选目录，内置全部运行环境，终端电脑零依赖。</p>
+        <p>获取 V0.1.8 安装包，向导式安装可自选目录，内置全部运行环境，终端电脑零依赖。</p>
         <span class="go">前往 Releases ↗</span>
       </a>
       <a href="https://github.com/Jace-Hao/xingqiyi-laundry-photo" target="_blank" rel="noopener">
@@ -355,7 +356,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
       </a>
       <a href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/blob/main/CHANGELOG.md" target="_blank" rel="noopener">
         <div class="tag">CHANGELOG</div><h3>更新日志</h3>
-        <p>从 V0.1.0 首版到 V0.1.6 更新弹窗与一键下载，每个版本的变更清晰可查。</p>
+        <p>从 V0.1.0 首版到 V0.1.8 更新弹窗与一键下载，每个版本的变更清晰可查。</p>
         <span class="go">查看更新日志 ↗</span>
       </a>
     </div>
@@ -367,9 +368,9 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
   <div class="wrap">
     <div class="eyebrow">XINGQIYI · LAUNDRY PHOTO</div>
     <h2>现在，把每一件衣物都留档。</h2>
-    <p class="lead" style="margin:0 auto">V0.1.6 现已发布，安装后即可开始更完整的衣物拍照存档与多店管理体验。</p>
+    <p class="lead" style="margin:0 auto">V0.1.8 现已发布，安装后即可开始更完整的衣物拍照存档与多店管理体验。</p>
     <div class="hero-cta" style="justify-content:center;margin-top:28px">
-      <a class="btn btn-gold" href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/releases" target="_blank" rel="noopener">下载 V0.1.6</a>
+      <a class="btn btn-gold" href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/releases" target="_blank" rel="noopener">下载 V0.1.8</a>
     </div>
     <div class="note">Windows 10/11 · 安装包直接安装 · 持续更新</div>
   </div>
@@ -378,7 +379,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 <footer>
   <div class="wrap">
     <span>星期衣精致洗衣 · 衣物照片系统</span>
-    <span>V0.1.6 · 2026-09-04 发布</span>
+    <span>V0.1.8 · 2026-09-04 发布</span>
   </div>
 </footer>
 
