@@ -763,9 +763,25 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
   }
 
   // ---------- 激活与试用 ----------
-  // 试用状态：activated（已激活）/ trial（试用中）/ expired（试用到期）
+  // 试用状态：activated（已激活）/ trial（试用中）/ expired（试用到期）/ unavailable（密钥缺失）
   function licenseStatus() {
     const c = loadConfig();
+
+    // 密钥缺失：机器码与激活码都无法计算。此时按「未授权」处理而不是放行，
+    // 否则删掉密钥文件就等于永久免费使用，授权机制形同虚设。
+    if (!license.isSecretAvailable()) {
+      return {
+        state: 'unavailable',
+        secretMissing: true,
+        machineCode: '',
+        activationCode: '',
+        activatedAt: '',
+        trialDays: license.TRIAL_DAYS,
+        trialDaysLeft: 0,
+        copiedFromOtherMachine: false
+      };
+    }
+
     const machineCode = license.genMachineCode();
     if (c.activation && license.verifyActivationCode(machineCode, c.activation.code)) {
       return {

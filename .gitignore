@@ -24,6 +24,12 @@ license-tool-gui/
 # 命令行版激活码工具（复用 main/license.js 算法，同样不得公开）
 scripts/license-tool.js
 
+# 激活密钥文件：算法模块运行时读取，密钥本身绝不入库
+main/license-secret.json
+
+# 网页版激活工具（含密钥与算法，供管理员本地打开，禁止发布）
+docs/activate.html
+
 # 代码加密方案文档（仅本地留存，泄露即等于公开混淆配置）
 源代码加密说明.md
 加密方案*.md

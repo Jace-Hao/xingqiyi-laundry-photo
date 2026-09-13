@@ -468,6 +468,9 @@ const LoginPage = {
             试用中，剩余 <b>{{ license.trialDaysLeft }}</b> 天（共 {{ license.trialDays }} 天）
             <a href="#" @click.prevent="showActivate = true">输入激活码</a>
           </template>
+          <template v-else-if="license.state === 'unavailable'">
+            ⚠️ 激活组件不完整，无法验证授权：请重新安装完整安装包，或联系软件维护者
+          </template>
           <template v-else>
             ⚠️ 试用期已结束，请输入激活码后继续使用
           </template>

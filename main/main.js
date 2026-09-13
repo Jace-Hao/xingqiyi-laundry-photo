@@ -300,10 +300,17 @@ async function clientLogin(p) {
 }
 
 handle('auth:login', async (p) => {
-  // 激活拦截：试用到期后必须输入激活码才能继续使用
+  // 激活拦截：试用到期或激活密钥缺失时，必须先解决授权问题才能继续使用
   const lic = store.licenseStatus();
   if (lic.state === 'expired') {
     return { ok: false, expired: true, message: '试用期已结束，请在本机输入激活码后继续使用（机器码：' + lic.machineCode + '）', license: lic };
+  }
+  if (lic.state === 'unavailable') {
+    return {
+      ok: false,
+      license: lic,
+      message: '激活组件不完整（缺少激活密钥文件），无法验证授权。请重新安装完整安装包，或联系软件维护者获取。'
+    };
   }
   const cfg = store.loadConfig();
   if (cfg.mode === 'client') return clientLogin(p);
