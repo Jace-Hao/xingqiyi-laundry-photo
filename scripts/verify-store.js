@@ -93,8 +93,121 @@ check('重复用户名被拒绝', () => expectThrow(() => store.createUser(admin
 check('客户端账号登录获得独立令牌', () => {
   clerkToken = store.login({ username: 'clerk01', password: 'clerk123' }).sessionToken;
 });
-check('多令牌并发：两个会话同时有效', () => {
+// 注意：这里验证的是「不同账号」可并发在线（admin 与 clerk 各自持有令牌），
+// 与「同一账号不可多地登录」不冲突，见下方唯一登录专项用例
+check('不同账号可同时在线（多账号并发）', () => {
   if (!store.current(adminToken) || !store.current(clerkToken)) throw new Error('会话未共存');
+});
+check('同一账号不可多地登录（唯一登录）', () => {
+  const t1 = store.login({ username: 'clerk01', password: 'clerk123' }).sessionToken;
+  // 第一次登录的令牌此时有效
+  if (!store.current(t1)) throw new Error('首次登录令牌应有效');
+  // 异地再次登录：新令牌生效，旧令牌立即失效
+  const t2 = store.login({ username: 'clerk01', password: 'clerk123' }).sessionToken;
+  if (!store.current(t2)) throw new Error('新登录令牌应有效');
+  if (store.current(t1)) throw new Error('旧令牌应已失效，但仍可用');
+  // 被顶下线的旧令牌再操作时，要能拿到「已在其他设备登录」这一明确原因，
+  // 而不是笼统的「未登录」——否则店员会误以为是密码过期而反复重试
+  let msg = '';
+  try {
+    store.listRecords(t1, { silent: true });
+    throw new Error('旧令牌不应能查询');
+  } catch (e) {
+    msg = e.message || '';
+  }
+  if (!/其他设备登录/.test(msg)) throw new Error('被顶下线的提示不明确：' + msg);
+  // 恢复为后续用例可用的令牌
+  clerkToken = store.login({ username: 'clerk01', password: 'clerk123' }).sessionToken;
+});
+check('被顶下线的会话不影响其他账号', () => {
+  if (!store.current(adminToken)) throw new Error('系统管理员会话不应被其他人的登录顶掉');
+});
+check('重新登录后新令牌可用、旧令牌全部失效', () => {
+  const a = store.login({ username: 'clerk01', password: 'clerk123' }).sessionToken;
+  const b = store.login({ username: 'clerk01', password: 'clerk123' }).sessionToken;
+  const c = store.login({ username: 'clerk01', password: 'clerk123' }).sessionToken;
+  if (!store.current(c)) throw new Error('最新令牌应有效');
+  if (store.current(a) || store.current(b)) throw new Error('更早的令牌都应已失效');
+  clerkToken = c;
+});
+check('已失效会话按保留期与数量上限清理（防止 sessions.json 无限膨胀）', () => {
+  // 清理逻辑失效不会让功能出错，只会让会话文件无限增长，
+  // 因此必须单独验证：超过保留期的失效会话要被删掉，数量要压到上限以内，
+  // 且绝不能误删任何有效会话。
+  const sessionsPath = path.join(tmpDir, 'data', 'sessions.json');
+  const backup = fs.readFileSync(sessionsPath, 'utf8');
+  try {
+    const real = JSON.parse(backup);
+    const fake = [];
+    // 250 条「刚失效」：超过 200 条上限，应被裁剪
+    for (let i = 0; i < 250; i++) {
+      fake.push({
+        token: 'fake-revoked-' + i,
+        userId: clerk.id,
+        createdAt: new Date().toISOString(),
+        revoked: true,
+        revokedAt: new Date().toISOString(),
+        revokedReason: '测试用失效会话'
+      });
+    }
+    // 1 条「10 天前失效」：超过 7 天保留期，应被清理
+    fake.push({
+      token: 'fake-expired',
+      userId: clerk.id,
+      createdAt: new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString(),
+      revoked: true,
+      revokedAt: new Date(Date.now() - 10 * 24 * 3600 * 1000).toISOString(),
+      revokedReason: '测试用过期会话'
+    });
+    fs.writeFileSync(sessionsPath, JSON.stringify([...real, ...fake], null, 2), 'utf8');
+
+    // 登录会 createSession → pruneRevokedSessions，借此触发清理
+    const t = store.login({ username: 'clerk01', password: 'clerk123' }).sessionToken;
+    clerkToken = t;
+
+    const after = JSON.parse(fs.readFileSync(sessionsPath, 'utf8'));
+    const revokedAfter = after.filter((s) => s.revoked);
+    if (revokedAfter.length > 200) throw new Error('失效会话未裁剪到上限内：' + revokedAfter.length + ' 条');
+    if (after.some((s) => s.token === 'fake-expired')) throw new Error('超过保留期的失效会话未被清理');
+    if (!after.some((s) => s.token === t)) throw new Error('新建的有效会话被误删');
+    if (!after.some((s) => s.token === adminToken)) throw new Error('其他账号的有效会话被误删');
+  } finally {
+    // 还原会话文件，避免污染后续用例（其中包含它们依赖的有效令牌）
+    fs.writeFileSync(sessionsPath, backup, 'utf8');
+  }
+  // 还原后旧 clerkToken 已作废，重新登录拿到有效令牌供后续用例使用
+  clerkToken = store.login({ username: 'clerk01', password: 'clerk123' }).sessionToken;
+});
+check('镜像离线会话同样受唯一登录约束（不能绕过顶下线）', () => {
+  // 客户端远程登录成功后会用同一令牌在本机建立镜像会话，供服务器失联时降级使用。
+  // 账号被顶下线后，旧的镜像会话必须一并失效，
+  // 否则用户可以靠旧令牌继续离线操作，绕过唯一登录。
+  const u = store.createUser(adminToken, {
+    username: 'mirror01', name: '镜像测试', password: 'pass123456', role: 'capture', store: '人民路店'
+  });
+  const mirrorUser = { id: u.id, username: 'mirror01' };
+
+  try {
+    store.mirrorLogin(mirrorUser, 'mirror-token-A');
+    if (!store.current('mirror-token-A')) throw new Error('首个镜像会话应有效');
+
+    store.mirrorLogin(mirrorUser, 'mirror-token-B');
+    if (!store.current('mirror-token-B')) throw new Error('新的镜像会话应有效');
+    if (store.current('mirror-token-A')) throw new Error('旧的镜像会话应已失效，否则可绕过唯一登录');
+
+    let msg = '';
+    try {
+      store.listRecords('mirror-token-A', { silent: true });
+      throw new Error('失效的镜像会话不应能查询');
+    } catch (e) {
+      msg = e.message || '';
+    }
+    if (!/其他设备登录/.test(msg)) throw new Error('镜像会话失效提示不明确：' + msg);
+  } finally {
+    // 清理本用例创建的账号：后续「数据总览」用例对账号总数有精确断言，
+    // 测试之间不能有副作用，否则会连带把不相关的用例搞失败
+    store.deleteUser(adminToken, u.id);
+  }
 });
 check('非系统管理员无权查看用户列表', () => expectThrow(() => store.listUsers(clerkToken), '仅系统管理员'));
 check('停用账号后其会话立即失效', () => {

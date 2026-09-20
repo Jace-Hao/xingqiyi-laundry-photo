@@ -399,6 +399,22 @@ textarea {
   padding: 8px 10px;
 }
 
+/* 被顶下线（唯一登录）提示：放在表单外的整块提示。
+   比行内提示更醒目，但仍不用红色——红色在本系统专指「表单填写错误」，
+   而被顶下线不是用户输错东西，混用会让人误以为是密码错了。 */
+.login-revoked {
+  margin-top: 14px;
+  padding: 11px 13px;
+  border: 1px solid #c7d7f5;
+  border-left: 4px solid #2563eb;
+  border-radius: 8px;
+  background: #eef4ff;
+  color: #1e3a8a;
+  font-size: 13px;
+  line-height: 1.6;
+  text-align: left;
+}
+
 .login-card .btn-block {
   margin-top: 18px;
   padding: 11px;

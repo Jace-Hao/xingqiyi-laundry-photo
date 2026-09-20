@@ -554,7 +554,11 @@ const SetupPage = {
 
 /* ---------- 登录页 ---------- */
 const LoginPage = {
-  props: { sysInfo: { type: Object, default: null } },
+  props: {
+    sysInfo: { type: Object, default: null },
+    // 被顶下线（唯一登录）时由根应用传入的原因文案；普通进入登录页为空
+    revokedMsg: { type: String, default: '' }
+  },
   emits: ['login', 'server-saved'],
   setup(props, { emit }) {
     const username = Vue.ref('');
@@ -913,7 +917,8 @@ const LoginPage = {
       downloadPackage, cancelDownload,
       // 记住账号 / 记住密码
       savedAccounts, passwordSupported, rememberUser, rememberPass, credNotice,
-      showSavedPanel, pickAccount, removeSaved, clearSaved, roleLabel, onUsernameBlur
+      showSavedPanel, pickAccount, removeSaved, clearSaved, roleLabel, onUsernameBlur,
+      revokedMsg: Vue.computed(() => props.revokedMsg || '')
     };
   },
   template: `
@@ -995,6 +1000,11 @@ const LoginPage = {
             {{ loading ? '登录中…' : '登 录' }}
           </button>
         </form>
+
+        <!-- 被顶下线（唯一登录）的醒目提示：放在表单外，避免与普通登录失败混淆 -->
+        <div v-if="revokedMsg" class="login-revoked">
+          🔒 {{ revokedMsg }}
+        </div>
 
         <div class="login-server-toggle" @click="openServer">
           ⚙️ 服务器设置
@@ -3806,6 +3816,8 @@ const app = createApp({
     function onLogin(data) {
       user.value = data.user;
       token.value = data.sessionToken;
+      // 重新登录成功即清除「被顶下线」提示，否则旧提示会残留在界面上误导用户
+      revokedMsg.value = '';
     }
 
     function onLogout() {
@@ -3832,8 +3844,25 @@ const app = createApp({
       });
     }
 
+    // ---------- 唯一登录：被顶下线时强制退回登录页 ----------
+    // 桥接层在任意接口返回 revoked 时通知这里。必须清掉登录态，
+    // 否则用户会停留在已失效的会话界面上，每次操作只看到一条失败提示，
+    // 既不知道原因，也无法重新登录。
+    const revokedMsg = Vue.ref('');
+    let removeRevokedListener = null;
+    if (window.api.onSessionRevoked) {
+      removeRevokedListener = window.api.onSessionRevoked((message) => {
+        // 未登录状态下收到通知直接忽略，避免把登录页的普通失败提示变成顶号提示
+        if (!user.value) return;
+        revokedMsg.value = message || '账号已在其他设备登录，当前会话已失效，请重新登录';
+        user.value = null;
+        token.value = '';
+      });
+    }
+
     Vue.onUnmounted(() => {
       if (removeForceListener) removeForceListener();
+      if (removeRevokedListener) removeRevokedListener();
     });
 
     async function runInstaller() {
@@ -3867,7 +3896,8 @@ const app = createApp({
       updateModal, downloading, progressPercent, progressText, canAutoDownload,
       onSetupDone, onServerSaved, onLogin, onLogout,
       openUpdateModal, closeUpdateNotice, openReleasePage, downloadNow, cancelDownload,
-      forceModal, installing, runInstaller, openInstallerFolder, fmtSize
+      forceModal, installing, runInstaller, openInstallerFolder, fmtSize,
+      revokedMsg
     };
   },
   template: `
@@ -3965,7 +3995,7 @@ const app = createApp({
         </div>
         <setup-page v-else-if="sysInfo && !sysInfo.mode" @done="onSetupDone"></setup-page>
         <shell v-else-if="user" :user="user" :token="token" :mode="sysInfo ? sysInfo.mode : ''" @logout="onLogout"></shell>
-        <login-page v-else :sys-info="sysInfo" @login="onLogin" @server-saved="onServerSaved"></login-page>
+        <login-page v-else :sys-info="sysInfo" :revoked-msg="revokedMsg" @login="onLogin" @server-saved="onServerSaved"></login-page>
       </div>
     </div>
   `

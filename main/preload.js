@@ -13,8 +13,44 @@ function plain(v) {
   return JSON.parse(JSON.stringify(v));
 }
 
+/**
+ * 会话失效（唯一登录被顶下线）的统一拦截。
+ *
+ * 放在桥接层而不是逐个页面处理：任何接口返回 revoked 时通知所有订阅者，
+ * 根应用监听后强制退回登录页。这样 12 个页面组件无需各自写判断，
+ * 也不会出现「某个页面漏了处理，用户被顶下线却仍停留在已登录界面」的情况。
+ *
+ * 用订阅者列表而非 window.dispatchEvent：contextIsolation 下桥接层处于隔离世界，
+ * 在隔离世界派发的 DOM 事件主世界监听不到，回调注册才能可靠跨边界。
+ */
+const revokedSubscribers = new Set();
+let revokedNotified = false;
+
+function notifySessionRevoked(message) {
+  // 去抖：一次会话失效会让多个并发请求同时返回 revoked，只提示一次
+  if (revokedNotified) return;
+  revokedNotified = true;
+  for (const cb of revokedSubscribers) {
+    try {
+      cb(message || '');
+    } catch (e) {
+      /* 单个订阅者异常不影响其余订阅者 */
+    }
+  }
+}
+
+/** 登录成功后重置去抖标记，使下一次被顶下线仍能正常提示 */
+function resetRevokedNotice() {
+  revokedNotified = false;
+}
+
 function call(channel, payload, sessionToken) {
-  return ipcRenderer.invoke(channel, plain(payload), sessionToken || '');
+  return ipcRenderer.invoke(channel, plain(payload), sessionToken || '').then((res) => {
+    if (res && res.ok === false && res.revoked) notifySessionRevoked(res.message);
+    // 登录接口成功即视为新会话建立，允许下次再提示
+    if (channel === 'auth:login' && res && res.ok) resetRevokedNotice();
+    return res;
+  });
 }
 
 contextBridge.exposeInMainWorld('api', {
@@ -114,5 +150,15 @@ contextBridge.exposeInMainWorld('api', {
     const fn = (_e, p) => cb(p);
     ipcRenderer.on('update:force', fn);
     return () => ipcRenderer.removeListener('update:force', fn);
+  },
+  /**
+   * 订阅「会话被顶下线」通知（唯一登录）。
+   * 任意接口返回 revoked 时触发，回调收到原因文案；返回取消订阅函数。
+   * 根应用据此强制退回登录页，避免用户停留在已失效的会话界面上。
+   */
+  onSessionRevoked: (cb) => {
+    if (typeof cb !== 'function') return () => {};
+    revokedSubscribers.add(cb);
+    return () => revokedSubscribers.delete(cb);
   }
 });

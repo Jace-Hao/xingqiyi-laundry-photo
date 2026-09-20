@@ -13,7 +13,7 @@
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
-const { withRequestIp } = require('./store');
+const { withRequestIp, SESSION_REVOKED_CODE } = require('./store');
 
 function startServer(store, opts = {}) {
   const port = opts.port || 17521;
@@ -105,7 +105,11 @@ function startServer(store, opts = {}) {
       const data = await fn();
       return json(res, 200, { ok: true, data });
     } catch (e) {
-      return json(res, 200, { ok: false, message: e.message || String(e) });
+      // 被顶下线（唯一登录）时带上 revoked 标志：
+      // 客户端模式下界面靠这个字段判断该强制退回登录页，
+      // 而不是把「已在其他设备登录」当成普通业务失败提示
+      const revoked = e && e.code === SESSION_REVOKED_CODE;
+      return json(res, 200, { ok: false, message: e.message || String(e), ...(revoked ? { revoked: true } : {}) });
     }
   }
 

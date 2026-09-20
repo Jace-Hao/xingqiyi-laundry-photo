@@ -229,6 +229,27 @@ const tinyJpeg =
     /强制推送安装包/.test(JSON.stringify(pushLogs.body.data)) &&
     /取消强制推送/.test(JSON.stringify(pushLogs.body.data)));
 
+  // ---------- 唯一登录：revoked 标志必须穿过 HTTP 往返 ----------
+  // 放在文件末尾：clerkSession 在前面的权限拒绝用例中还要用
+  // （那些断言匹配「系统管理员」文案），若提前顶下线会连锁失败。
+  // 复用 clerk01 重新登录，不新建账号，因此不影响数据总览的账号数断言。
+  const clerkSessionB = await call('auth/login', { username: 'clerk01', password: 'clerk123' }, '');
+  const sessionB = clerkSessionB.body.ok ? clerkSessionB.body.data.sessionToken : '';
+  check('同一账号再次登录获得新会话', !!sessionB && sessionB !== clerkSession, '新令牌=' + sessionB);
+
+  const revokedResp = await call('records/list', { barcode: 'NET001', silent: true }, clerkSession);
+  check('被顶下线的旧会话请求失败', revokedResp.body.ok === false, JSON.stringify(revokedResp.body));
+  // 关键断言：客户端模式靠这个标志强制退回登录页；丢了就只剩笼统提示
+  check('HTTP 响应携带 revoked 标志', revokedResp.body.revoked === true, JSON.stringify(revokedResp.body));
+  check('顶下线原因文案提到其他设备', /其他设备登录/.test(String(revokedResp.body.message || '')), String(revokedResp.body.message));
+  check('新会话仍可正常查询', (await call('records/list', { barcode: 'NET001', silent: true }, sessionB)).body.ok === true);
+
+  // 普通未登录不能被误报为顶下线，否则提示张冠李戴
+  const forgedResp = await call('records/list', { silent: true }, 'not-a-real-token');
+  check('伪造令牌失败但不带 revoked 标志', forgedResp.body.ok === false && forgedResp.body.revoked !== true, JSON.stringify(forgedResp.body));
+  const noTokenResp = await call('records/list', { silent: true }, '');
+  check('无令牌失败但不带 revoked 标志', noTokenResp.body.ok === false && noTokenResp.body.revoked !== true, JSON.stringify(noTokenResp.body));
+
   await server.close();
   console.log('\n结果：' + passed + ' 通过，' + failed + ' 失败');
   fs.rmSync(tmpDir, { recursive: true, force: true });

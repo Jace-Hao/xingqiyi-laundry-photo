@@ -5,7 +5,7 @@ const path = require('path');
 const http = require('http');
 const https = require('https');
 const { pathToFileURL } = require('url');
-const { createStore } = require('./store');
+const { createStore, SESSION_REVOKED_CODE } = require('./store');
 const { startServer } = require('./server');
 const { createCredentialStore } = require('./credentials');
 
@@ -226,7 +226,11 @@ function localCall(route, body, token) {
   try {
     return Promise.resolve({ ok: true, data: fn() });
   } catch (e) {
-    return Promise.resolve({ ok: false, message: e.message || String(e) });
+    // 这一层最先捕获数据层抛出的异常，必须把会话失效的错误码转成 revoked 标志带上：
+    // err.code 无法跨 IPC 传递，若在此丢弃，界面就再也分不清
+    // 「被顶下线」与普通的「未登录」，被踢的店员会误以为是密码问题
+    const revoked = e && e.code === SESSION_REVOKED_CODE;
+    return Promise.resolve({ ok: false, message: e.message || String(e), ...(revoked ? { revoked: true } : {}) });
   }
 }
 
@@ -278,7 +282,11 @@ async function dispatch(route, body, sessionToken) {
     }
     return await localCall(route, body, sessionToken);
   } catch (e) {
-    return { ok: false, message: e.message || String(e) };
+    // 必须在此透传 revoked 标志：dispatch 会先于 handle 捕获异常并正常返回，
+    // 若不带上，服务端模式下被顶下线的用户只会看到笼统的失败提示，
+    // 界面无法识别该强制退回登录页
+    const revoked = e && e.code === SESSION_REVOKED_CODE;
+    return { ok: false, message: e.message || String(e), ...(revoked ? { revoked: true } : {}) };
   }
 }
 
@@ -292,9 +300,11 @@ async function syncOfflineRecords() {
 
   // 用当前离线会话在服务端的令牌补传；无有效令牌时跳过本轮
   let remoteToken = '';
-  for (const s of offlineSessions.values()) {
+  let remoteKey = '';
+  for (const [k, s] of offlineSessions.entries()) {
     if (s.serverToken) {
       remoteToken = s.serverToken;
+      remoteKey = k;
       break;
     }
   }
@@ -302,6 +312,7 @@ async function syncOfflineRecords() {
 
   let synced = 0;
   let failed = 0;
+  let tokenRevoked = false;
   for (const item of queue) {
     try {
       if (!fs.existsSync(item.photoAbsPath)) {
@@ -318,6 +329,14 @@ async function syncOfflineRecords() {
       );
       if (!r.ok) {
         failed++;
+        // 令牌被顶下线：这个会话条目已经废了，留着只会让后续每一轮同步都
+        // 先撞上它然后中断，离线数据永远补传不上去。主动清理，
+        // 让下一轮能选到其他有效会话，或明确提示需要重新登录。
+        // 注意不清理队列本身——数据要留到用户重新登录后再传。
+        if (r.revoked) {
+          tokenRevoked = true;
+          if (remoteKey) offlineSessions.delete(remoteKey);
+        }
         break; // 多为连接或权限问题，停止本轮同步，下次再试
       }
       store.replaceOfflineRecord(item.id, r.data);
@@ -328,7 +347,12 @@ async function syncOfflineRecords() {
       break;
     }
   }
-  return { synced, failed, remaining: store.pendingSyncCount() };
+  return {
+    synced,
+    failed,
+    remaining: store.pendingSyncCount(),
+    ...(tokenRevoked ? { reason: '登录会话已在其他设备失效，请重新登录后再同步离线存档' } : {})
+  };
 }
 
 function scheduleSync() {
@@ -346,7 +370,11 @@ function handle(channel, fn) {
     try {
       return await fn(payload, sessionToken);
     } catch (e) {
-      return { ok: false, message: e.message || String(e) };
+      // 被顶下线（唯一登录）时额外给出 revoked 标志：
+      // err.code 无法经结构化克隆传到渲染进程，必须显式放进返回对象，
+      // 界面据此强制退回登录页，而不是当成普通操作失败弹个 toast 了事
+      const revoked = e && e.code === SESSION_REVOKED_CODE;
+      return { ok: false, message: e.message || String(e), ...(revoked ? { revoked: true } : {}) };
     }
   });
 }
@@ -367,8 +395,19 @@ async function clientLogin(p) {
       } catch (e) {
         /* 镜像失败不影响正常登录 */
       }
+      // 清理该账号此前的会话条目。
+      //
+      // 必须做：offlineSessions 是 Map（插入序），而离线同步会遍历取第一个带
+      // serverToken 的条目。唯一登录开启后，账号在其他设备登录会把本机旧令牌
+      // 顶下线；若旧条目残留且排在新条目之前，同步就会先拿失效令牌去请求，
+      // 服务端返回失败后同步中断（break），每次重试都撞同一个死令牌，
+      // 导致离线录入的数据永远补传不上去、队列无限堆积。
+      const username = r.data.user.username;
+      for (const [k, v] of [...offlineSessions.entries()]) {
+        if (k !== r.data.sessionToken && v && v.username === username) offlineSessions.delete(k);
+      }
       offlineSessions.set(r.data.sessionToken, {
-        username: r.data.user.username,
+        username,
         localToken: r.data.sessionToken,
         serverToken: r.data.sessionToken,
         offlineSince: null

@@ -31,6 +31,15 @@ const uid = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
 const genApiToken = () => crypto.randomBytes(6).toString('hex');
 
+/**
+ * 会话被顶下线（唯一登录）时的错误码。
+ *
+ * 定义在模块作用域并随模块导出，使主进程与 HTTP 服务端在包装错误时都能引用，
+ * 把它作为 revoked 标志透传给界面——否则经 IPC / JSON 往返后 err.code 会丢失，
+ * 被顶下线的店员只会看到笼统的「未登录」，误以为密码过期而反复重试。
+ */
+const SESSION_REVOKED_CODE = 'SESSION_REVOKED';
+
 /** 在指定的来源 IP 上下文中执行一段逻辑，期间写入的日志都会带上该 IP */
 function withRequestIp(ip, fn) {
   return requestContext.run({ ip: normalizeIp(ip) }, fn);
@@ -213,16 +222,80 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
   const logBase = (u) => ({ userId: u.id, username: u.username, role: u.role });
 
   // ---------- 会话 ----------
-  function createSession(userId) {
+  /**
+   * 被顶下线的会话保留期：超过该时长的记录会被清理。
+   * 保留一段时间是为了让旧设备在下次请求时能拿到明确的「已在其他设备登录」提示，
+   * 而不是笼统的「未登录」；但也不能无限堆积。
+   */
+  const REVOKED_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  const REVOKED_SESSION_MAX = 200;
+
+  /**
+   * 会话被顶下线时抛出的错误码。
+   * 前后端约定：界面收到该码即强制退回登录页并展示具体原因，
+   * 与普通的「未登录」（令牌过期、伪造、退出）区分开。
+   * 常量本体定义在模块作用域（见文件顶部 SESSION_REVOKED），此处仅为便于阅读说明。
+   */
+
+  /** 清理过期与超量的已失效会话记录（只清 revoked，不动有效会话） */
+  function pruneRevokedSessions(sessions) {
+    const cutoff = Date.now() - REVOKED_SESSION_TTL_MS;
+    const kept = sessions.filter((s) => {
+      if (!s || !s.revoked) return true;
+      const t = Date.parse(s.revokedAt || '');
+      return Number.isFinite(t) && t >= cutoff;
+    });
+    const revoked = kept.filter((s) => s.revoked);
+    if (revoked.length <= REVOKED_SESSION_MAX) return kept;
+    // 超量时按时间倒序保留最近的，避免文件无限增长
+    revoked.sort((a, b) => String(b.revokedAt || '').localeCompare(String(a.revokedAt || '')));
+    const allow = new Set(revoked.slice(0, REVOKED_SESSION_MAX));
+    return kept.filter((s) => !s.revoked || allow.has(s));
+  }
+
+  /**
+   * 创建会话，并执行「唯一登录」：同一账号此前的会话全部标记为已失效。
+   *
+   * 需求：一个账号不可同时多地登录；离线登录除外——离线登录产生的是本机镜像会话，
+   * 不经服务端签发，因此天然不受此处约束。离线期间录入的数据在重新登录后
+   * 会用新的有效会话补传（见 main.js 的 syncOfflineRecords），不会因为旧会话被顶下线而丢失。
+   *
+   * @param {string} userId 账号 id
+   * @param {object} [meta] { username, ip } 用于生成对被顶下线设备可读的提示
+   */
+  function createSession(userId, meta = {}) {
     const token = uid();
+    const at = now();
     const sessions = loadSessions();
-    sessions.push({ token, userId, createdAt: now() });
-    saveSessions(sessions);
-    return token;
+    let revokedCount = 0;
+    for (const s of sessions) {
+      if (!s || s.userId !== userId || s.revoked || s.token === token) continue;
+      s.revoked = true;
+      s.revokedAt = at;
+      s.revokedReason =
+        `账号 ${meta.username || ''} 已于 ${at.replace('T', ' ').slice(0, 19)}` +
+        `${meta.ip ? '（来源 IP ' + meta.ip + '）' : ''} 在其他设备登录，当前会话已失效，请重新登录`;
+      revokedCount++;
+    }
+    sessions.push({ token, userId, createdAt: at });
+    saveSessions(pruneRevokedSessions(sessions));
+    return { token, revokedCount };
   }
 
   function removeSession(token) {
     saveSessions(loadSessions().filter((s) => s.token !== token));
+  }
+
+  /** 取会话原始记录（含 revoked 标记），用于区分「已失效」与「不存在」 */
+  function findSession(token) {
+    if (!token) return null;
+    return loadSessions().find((x) => x && x.token === token) || null;
+  }
+
+  /** 会话是否已被顶下线 */
+  function isSessionRevoked(token) {
+    const s = findSession(token);
+    return !!(s && s.revoked);
   }
 
   // 镜像登录：客户端远程登录成功后，在本机建立同令牌的本地会话，
@@ -232,17 +305,33 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     const entry = users.find((u) => u.username === user.username);
     if (!entry) return null;
     const sessions = loadSessions();
-    if (!sessions.some((s) => s.token === sessionToken)) {
-      sessions.push({ token: sessionToken, userId: entry.id, createdAt: now() });
-      saveSessions(sessions);
+    // 本机此前为该账号建立的镜像会话（旧令牌）一并失效，
+    // 否则被顶下线后仍能用旧令牌降级为本机离线操作，绕过唯一登录
+    let changed = false;
+    for (const s of sessions) {
+      if (s && s.userId === entry.id && !s.revoked && s.token !== sessionToken) {
+        s.revoked = true;
+        s.revokedAt = now();
+        s.revokedReason = '账号在其他设备登录，本机离线会话已失效，请重新登录';
+        changed = true;
+      }
     }
+    const exists = sessions.some((s) => s.token === sessionToken);
+    if (!exists) {
+      // 若该令牌此前被标记失效（例如本机重复登录），复用记录并恢复为有效
+      sessions.push({ token: sessionToken, userId: entry.id, createdAt: now(), mirrored: true });
+      changed = true;
+    }
+    if (changed) saveSessions(pruneRevokedSessions(sessions));
     return entry;
   }
 
   function getSessionUser(token) {
     if (!token) return null;
-    const s = loadSessions().find((x) => x.token === token);
+    const s = findSession(token);
     if (!s) return null;
+    // 已失效会话视为未登录：界面据此退出到登录页
+    if (s.revoked) return null;
     const u = loadUsers().find((x) => x.id === s.userId);
     if (!u || !u.active) {
       removeSession(token);
@@ -251,9 +340,24 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     return u;
   }
 
+  /**
+   * 校验会话有效性。
+   *
+   * 被顶下线（唯一登录）与普通「未登录」必须给出不同提示：
+   * 否则店员会以为是自己密码过期或账号出问题，反复重试甚至找管理员重置密码。
+   * 被顶下线时抛出带 SESSION_REVOKED 标记的错误，界面据此强制退回登录页并展示原因。
+   */
   function requireSession(token) {
     const u = getSessionUser(token);
-    if (!u) throw new Error('未登录或会话已失效，请重新登录');
+    if (!u) {
+      const s = findSession(token);
+      if (s && s.revoked) {
+        const err = new Error(s.revokedReason || '账号已在其他设备登录，当前会话已失效，请重新登录');
+        err.code = SESSION_REVOKED_CODE;
+        throw err;
+      }
+      throw new Error('未登录或会话已失效，请重新登录');
+    }
     return u;
   }
 
@@ -425,15 +529,21 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     }
     user.lastLoginAt = now();
     saveUsers(users);
-    const sessionToken = createSession(user.id);
+    // 唯一登录：创建新会话的同时把该账号此前的会话标记为已失效。
+    // 带上来源 IP，被顶下线的设备能知道是谁在何时何地登录了同一账号。
+    const created = createSession(user.id, { username: user.username, ip: currentRequestIp() });
     appendLog({
       ...logBase(user),
       module: '认证',
       action: '登录',
-      detail: `账号 ${user.username} 登录成功（角色：${roleDef(normalizeRole(user.role, user.permissions)).label}）`,
+      detail:
+        `账号 ${user.username} 登录成功（角色：${roleDef(normalizeRole(user.role, user.permissions)).label}）` +
+        (created.revokedCount
+          ? `，顶下线该账号此前的 ${created.revokedCount} 个会话`
+          : ''),
       result: '成功'
     });
-    return { user: publicUser(user), sessionToken };
+    return { user: publicUser(user), sessionToken: created.token };
   }
 
   function logout(token) {
@@ -1651,4 +1761,4 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
   };
 }
 
-module.exports = { createStore, withRequestIp, normalizeIp };
+module.exports = { createStore, withRequestIp, normalizeIp, SESSION_REVOKED_CODE };
