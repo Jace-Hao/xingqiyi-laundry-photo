@@ -1,12 +1,13 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, session, Menu, protocol, net, Tray, nativeImage, powerSaveBlocker } = require('electron');
+const { app, BrowserWindow, ipcMain, session, Menu, protocol, net, Tray, nativeImage, powerSaveBlocker, safeStorage } = require('electron');
 const path = require('path');
 const http = require('http');
 const https = require('https');
 const { pathToFileURL } = require('url');
 const { createStore } = require('./store');
 const { startServer } = require('./server');
+const { createCredentialStore } = require('./credentials');
 
 app.setName('星期衣精致洗衣衣物照片系统');
 
@@ -40,12 +41,108 @@ const store = createStore({
   photoScheme: PHOTO_SCHEME
 });
 
+// 登录凭据保存（记住账号 / 记住密码）：
+// 文件位于本机用户数据目录，密码经 Electron safeStorage 系统级加密后保存，
+// 明文密码只存在于内存中的输入框，绝不写入磁盘或日志。
+const credentials = createCredentialStore({
+  filePath: path.join(DATA_DIR, 'credentials.json'),
+  safeStorage
+});
+
 let httpServer = null;
 
 // 服务端后台常驻（需求13）：托盘图标、真正退出标志、防休眠句柄
 let tray = null;
 let isQuitting = false;
 let powerSaveId = null;
+
+// ---------- 开机自动启动 ----------
+// 通过 Electron 登录项（Windows 下写入注册表 Run 键）实现，并附带 --hidden 参数，
+// 使自启时静默驻留托盘、不弹窗打扰开机。用户手动启动不带该参数，行为与以前一致。
+const AUTO_LAUNCH_FLAG = '--hidden';
+// 本次进程是否由开机自启拉起。用于界面如实显示「本次启动方式」，创建后不再改动。
+const launchedHidden = process.argv.includes(AUTO_LAUNCH_FLAG);
+// 一次性静默标记：仅「自启后创建的第一个窗口」静默驻留，被 createWindow 消费。
+// 与 launchedHidden 分开，是为了窗口重建、以及界面报告启动方式时互不干扰。
+let pendingHiddenStart = launchedHidden;
+
+/** 读取当前开机自启状态（以系统登录项的真实值为准，不依赖配置缓存） */
+function getAutoLaunch() {
+  try {
+    const s = app.getLoginItemSettings({ args: [AUTO_LAUNCH_FLAG] });
+    return {
+      enabled: !!s.openAtLogin,
+      // 开机时系统是否已登记该登录项但当前进程并非由它启动（少见，用于界面提示）
+      willLaunchAtLogin: !!s.executableWillLaunchAtLogin,
+      restoreState: !!s.restoreState
+    };
+  } catch (e) {
+    return { enabled: false, willLaunchAtLogin: false, restoreState: false, error: e.message || String(e) };
+  }
+}
+
+/**
+ * 设置或取消开机自启。
+ * 仅服务端模式允许开启：客户端是工位机，无需常驻，默认不应开机启动。
+ * 关闭时同时清掉 --hidden 参数，避免残留无效登录项配置。
+ */
+function setAutoLaunch(enable) {
+  const cfg = store.loadConfig();
+  if (enable && cfg.mode !== 'server') {
+    throw new Error('开机自动启动仅服务端模式可用；如需常驻服务，请先在系统设置中切换为服务端模式');
+  }
+  app.setLoginItemSettings({
+    openAtLogin: !!enable,
+    args: enable ? [AUTO_LAUNCH_FLAG] : [],
+    // 开机自启时不需要恢复上次窗口状态，静默驻留托盘即可
+    openAsHidden: false
+  });
+  const after = getAutoLaunch();
+  if (!!enable !== after.enabled) {
+    // 系统未接受设置（如被组策略禁止），必须如实告知，不能假装成功
+    throw new Error('系统未接受开机自启设置，可能被组策略或权限限制');
+  }
+  return after;
+}
+
+/**
+ * 进入客户端模式时回收开机自启登录项。
+ *
+ * 开机自启仅服务端模式允许。本机改为客户端后若仍保留登录项，工位机会每次开机
+ * 自启并常驻，因此切换路径（setMode / setClientConfig）都要调用本函数回收。
+ * 返回是否真的清除了，供界面如实告知；清除失败只记录日志，不阻塞模式切换。
+ */
+function clearAutoLaunchForClient() {
+  try {
+    if (getAutoLaunch().enabled) {
+      setAutoLaunch(false);
+      return true;
+    }
+  } catch (e) {
+    console.error('[autoLaunch] 切换为客户端时清除开机自启失败：' + (e.message || e));
+  }
+  return false;
+}
+
+// ---------- 单实例锁 ----------
+// 开机自启后用户仍可能手动双击图标启动第二个实例，两个实例会争抢同一服务端口，
+// 导致后启动者报端口占用、或客户端连到错误实例。这里强制单实例：
+// 已存在实例时直接退出，并唤起已有窗口。
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  // 不是首个实例：必须立即退出，且绝不能执行任何初始化。
+  //
+  // 注意这里不能用 app.quit()：quit 在 app ready 之前调用会被推迟到 ready 之后，
+  // 因此下方 whenReady 回调仍会执行完，导致第二个实例照样初始化数据库、
+  // 注册协议并监听同一端口——两个进程同时读写同一 data 目录还可能损坏数据文件。
+  // app.exit() 立即结束进程，不触发 before-quit / will-quit，也不会等 ready。
+  app.exit(0);
+} else {
+  app.on('second-instance', () => {
+    // 用户再次启动时把已有窗口唤到前台，而不是毫无反应
+    showMainWindow();
+  });
+}
 
 // ---------- 远程调用（客户端模式把 IPC 转发到服务端节点） ----------
 function remoteCall(route, body, sessionToken) {
@@ -524,6 +621,126 @@ handle('system:roles', () => {
   return { ok: true, data: { roles: store.roleOptions, defs: store.roleDefs } };
 });
 
+// ---------- 内置操作手册 ----------
+// 读取的是 scripts/sync-manual.js 同步到 renderer/assets/manual.md 的副本：
+// 该文件由 electron-builder 的 files: renderer/**/* 打进 app.asar，
+// 而 docs/manual.md 不在打包范围内（打包后读不到），故不能直接读 docs 下的源文件。
+// Electron 的 fs 对 asar 内文件透明支持，readFileSync 可直接读取。
+const MANUAL_FILE = path.join(RENDERER_DIR, 'assets', 'manual.md');
+
+handle('system:manual', () => {
+  const fs = require('fs');
+  try {
+    if (!fs.existsSync(MANUAL_FILE)) {
+      return {
+        ok: false,
+        // 明确区分「没打包进来」与「文件损坏」，便于排查发布遗漏
+        message: '未找到内置手册文件（renderer/assets/manual.md）。请执行 npm run sync-manual 后重新打包。'
+      };
+    }
+    const text = fs.readFileSync(MANUAL_FILE, 'utf8');
+    if (!text.trim()) return { ok: false, message: '内置手册文件为空' };
+    // 从标题行提取手册版本号，供界面显示「手册与软件版本是否一致」
+    const m = text.match(/^#\s+.*?v(\d+\.\d+\.\d+)/m) || text.match(/版本：\s*v(\d+\.\d+\.\d+)/);
+    return {
+      ok: true,
+      data: { text, manualVersion: m ? m[1] : '', appVersion: APP_VERSION }
+    };
+  } catch (e) {
+    return { ok: false, message: '读取手册失败：' + (e.message || String(e)) };
+  }
+});
+
+// ---------- 开机自动启动 ----------
+// 读取状态无需登录（设置页会展示当前状态）；修改必须是系统管理员，
+// 避免工位机被普通账号改成开机常驻。执行顺序：先鉴权 → 再改系统登录项 → 成功后记审计日志。
+handle('system:autoLaunch', () => {
+  try {
+    const data = getAutoLaunch();
+    return {
+      ok: true,
+      data: {
+        ...data,
+        supported: process.platform === 'win32' || process.platform === 'darwin',
+        platform: process.platform,
+        launchedHidden,
+        // 仅服务端可开启：前端据此禁用开关并说明原因
+        serverMode: store.loadConfig().mode === 'server'
+      }
+    };
+  } catch (e) {
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
+handle('system:setAutoLaunch', (p, token) => {
+  const enabled = !!(p && p.enabled);
+  try {
+    // 先鉴权（数据层统一口径），未通过则不会改动系统任何状态
+    store.requireSystemSettings(token);
+    // 执行系统调用；失败会抛错，此时不记日志，避免留下「设置成功」的假记录
+    const data = setAutoLaunch(enabled);
+    // 成功后补记审计日志
+    store.logSystemChange(
+      token,
+      enabled ? '开启开机自启' : '取消开机自启',
+      `开机自动启动：${enabled ? '已开启（登录后静默驻留托盘）' : '已取消'}`
+    );
+    return { ok: true, data: { ...data, enabled } };
+  } catch (e) {
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
+// ---------- 登录凭据保存（记住账号 / 记住密码） ----------
+// 这些接口在登录之前就要可用（登录页需要读取已保存账号来自动填充），因此不校验会话令牌。
+// 安全约束：密码经 safeStorage 系统级加密后才落盘；明文密码只在内存中传给输入框，
+// 不写入日志、不打印、不随网络传输。列表接口刻意不返回密文，避免密文流到界面层。
+handle('credentials:list', () => {
+  try {
+    return { ok: true, data: { accounts: credentials.list(), passwordSupported: credentials.passwordSupported() } };
+  } catch (e) {
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
+// 取出某账号已保存的密码用于自动填充；解密失败时返回空密码并给出可读原因
+handle('credentials:get', (p) => {
+  try {
+    const data = credentials.get((p && p.username) || '');
+    return { ok: true, data };
+  } catch (e) {
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
+// 保存账号（登录成功后调用）。rememberPassword=false 时会清除该账号已保存的密文
+handle('credentials:save', (p) => {
+  try {
+    const data = credentials.save(p || {});
+    return { ok: true, data };
+  } catch (e) {
+    // 保存凭据失败不应影响登录本身，错误只回传给界面提示
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
+handle('credentials:remove', (p) => {
+  try {
+    return { ok: true, data: { removed: credentials.remove((p && p.username) || '') } };
+  } catch (e) {
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
+handle('credentials:clear', () => {
+  try {
+    return { ok: true, data: { cleared: credentials.clear() } };
+  } catch (e) {
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
 // ---------- 激活与试用 ----------
 handle('license:status', () => {
   return { ok: true, data: store.licenseStatus() };
@@ -595,25 +812,33 @@ handle('offline:sync', async () => {
 
 handle('system:setMode', async (mode) => {
   const data = store.setMode(mode);
+  let autoLaunchCleared = false;
   if (data.mode === 'server') {
     await restartServerIfNeeded();
-  } else if (httpServer) {
-    await httpServer.close();
-    httpServer = null;
-    destroyTray();
-  }
-  return { ok: true, data };
-});
-
-handle('system:setClientConfig', async ({ serverUrl, serverToken } = {}) => {
-  try {
-    const data = store.setClientConfig(serverUrl, serverToken);
+  } else {
+    // 开机自启仅服务端允许，切到客户端时回收残留登录项，维持该不变量
+    autoLaunchCleared = clearAutoLaunchForClient();
     if (httpServer) {
       await httpServer.close();
       httpServer = null;
       destroyTray();
     }
-    return { ok: true, data };
+  }
+  return { ok: true, data: { ...data, autoLaunchCleared } };
+});
+
+handle('system:setClientConfig', async ({ serverUrl, serverToken } = {}) => {
+  try {
+    const data = store.setClientConfig(serverUrl, serverToken);
+    // 与 setMode 一致：配置为客户端同样要回收开机自启登录项，
+    // 否则服务端改配为客户端后仍会每次开机自启并常驻
+    const autoLaunchCleared = clearAutoLaunchForClient();
+    if (httpServer) {
+      await httpServer.close();
+      httpServer = null;
+      destroyTray();
+    }
+    return { ok: true, data: { ...data, autoLaunchCleared } };
   } catch (e) {
     return { ok: false, message: e.message || String(e) };
   }
@@ -1180,6 +1405,9 @@ function scheduleSaveWindowState() {
 
 function createWindow() {
   const winState = loadWindowState();
+  // 一次性消费：仅自启后创建的第一个窗口静默驻留，之后的窗口重建都正常显示
+  const startHidden = pendingHiddenStart;
+  pendingHiddenStart = false;
 
   mainWindow = new BrowserWindow({
     width: winState.width,
@@ -1202,6 +1430,17 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
+      // 开机自启时静默驻留托盘，不弹窗打扰开机。
+      // 前提是本机确实在跑服务并有托盘可回来（服务端模式）：
+      // 若模式已被改成客户端（没有托盘），隐藏窗口会导致软件完全无法访问，
+      // 因此这种情况一律正常显示窗口。
+      //
+      // startHidden 取自 createWindow 开头一次性消费的值，只有「开机自启后创建的第一个窗口」
+      // 才会静默；此后任何窗口重建（activate、托盘唤出时窗口已销毁等）都正常显示。
+      if (startHidden && isServerRunning() && tray) {
+        // 不 show，也不抢焦点；窗口保留在后台，随时可从托盘唤出
+        return;
+      }
       mainWindow.show();
       // 在窗口显示后再最大化，确保生效
       if (winState.isMaximized) {
@@ -1282,12 +1521,16 @@ function isServerRunning() {
 
 // 显示并聚焦主窗口（托盘菜单 / 双击托盘图标 / 窗口已销毁时重建）
 function showMainWindow() {
+  // 静默标记已在 createWindow 中一次性消费，这里无需再处理：
+  // 用户主动唤出时重建的窗口必然正常显示，不会被藏起来
   if (!mainWindow || mainWindow.isDestroyed()) {
     createWindow();
     return;
   }
-  mainWindow.show();
-  mainWindow.focus();
+  // 复用统一的焦点恢复逻辑（含 restore 与 webContents.focus）：
+  // 静默驻留后首次唤出若缺少 webContents.focus()，会重现 v0.1.7 那个
+  // 「窗口显示出来但所有输入框点不动、必须重启软件」的问题
+  ensureWindowFocus();
 }
 
 // 创建系统托盘图标（服务端模式），提供「显示主窗口」与「退出程序」入口
@@ -1339,6 +1582,11 @@ function destroyTray() {
 }
 
 app.whenReady().then(async () => {
+  // 第二道单实例守卫：正常情况下未获锁的实例早已 app.exit(0)，不会走到这里。
+  // 保留这层判断是防止将来重构时（例如改动退出方式）让重复实例重新初始化，
+  // 造成两个进程同时读写同一 data 目录、争抢同一服务端口。
+  if (!gotSingleInstanceLock) return;
+
   store.ensureSeedData();
   Menu.setApplicationMenu(null);
 

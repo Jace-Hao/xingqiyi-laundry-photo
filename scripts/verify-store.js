@@ -228,6 +228,85 @@ check('源码中所有日志动作均已登记（防止将来漂移）', () => {
   if (found.size < 15) throw new Error('扫描到的动作类型异常偏少：' + found.size + '，正则可能失效');
 });
 
+check('主进程调用 logSystemChange 的动作类型均已登记（跨文件扫描）', () => {
+  // store.js 的扫描管不到 main.js：主进程执行系统级操作（如开机自启）后
+  // 通过 logSystemChange 补记审计，若传入未登记的动作名会被拒绝，导致设置成功却无日志。
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main', 'main.js'), 'utf8');
+  const options = store.logActionOptions(adminToken);
+
+  /** 从 idx 处的左括号开始，按括号配对返回参数数组（仅按顶层逗号切分） */
+  function splitArgs(text, openIdx) {
+    let depth = 0;
+    let buf = '';
+    const args = [];
+    for (let i = openIdx; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === '(') depth++;
+      else if (ch === ')') {
+        depth--;
+        if (depth === 0) {
+          if (buf.trim()) args.push(buf);
+          return args;
+        }
+      }
+      // 只按顶层逗号切分，嵌套调用内的逗号不算
+      if (ch === ',' && depth === 1) {
+        args.push(buf);
+        buf = '';
+        continue;
+      }
+      if (depth >= 1) buf += ch;
+    }
+    return args;
+  }
+
+  // 只取第二个实参（动作名）中的字符串字面量，忽略第三个实参（detail 文案），
+  // 否则会误把 detail 里三元表达式的文案当成动作类型
+  const found = new Set();
+  const callRe = /logSystemChange\s*\(/g;
+  let cm;
+  let callCount = 0;
+  while ((cm = callRe.exec(src)) !== null) {
+    const args = splitArgs(src, cm.index + 'logSystemChange'.length);
+    if (args.length < 3) throw new Error('logSystemChange 调用参数不足 3 个，签名可能已变更');
+    callCount++;
+    const strRe = /'([^']+)'/g;
+    let sm;
+    while ((sm = strRe.exec(args[1])) !== null) found.add(sm[1]);
+  }
+  if (!callCount) throw new Error('未在 main.js 中找到 logSystemChange 调用，扫描可能失效');
+  if (!found.size) throw new Error('未从调用中提取到任何动作名，解析可能失效');
+
+  const unregistered = [...found].filter((a) => !options.includes(a));
+  if (unregistered.length) throw new Error('主进程使用了未登记的动作类型：' + unregistered.join('、'));
+});
+
+check('logSystemChange 记录系统变更并拒绝未登记动作', () => {
+  // 需要系统设置权限
+  expectThrow(() => store.logSystemChange(clerkToken, '开启开机自启', '测试'), '系统管理员');
+  // 未登记的动作必须被拒，避免产生筛选不到的孤儿日志
+  expectThrow(() => store.logSystemChange(adminToken, '随手写的动作', '测试'), '未登记的操作类型');
+  expectThrow(() => store.logSystemChange(adminToken, '', '测试'), '未登记的操作类型');
+
+  const before = store.listLogs(adminToken, { silent: true, pageSize: 500 }).total;
+  store.logSystemChange(adminToken, '开启开机自启', '开机自动启动：已开启（登录后静默驻留托盘）');
+  store.logSystemChange(adminToken, '取消开机自启', '开机自动启动：已取消');
+  const r = store.listLogs(adminToken, { silent: true, pageSize: 500 });
+  if (r.total !== before + 2) throw new Error('日志条数应增加 2，实际增加 ' + (r.total - before));
+
+  const on = store.listLogs(adminToken, { silent: true, action: '开启开机自启', pageSize: 10 });
+  if (on.total !== 1) throw new Error('「开启开机自启」应可按类型筛出 1 条，实际 ' + on.total);
+  if (on.items[0].module !== '系统设置') throw new Error('模块应为「系统设置」，实际 ' + on.items[0].module);
+  if (on.items[0].userId !== store.current(adminToken).id) throw new Error('日志未记录操作人');
+  if (on.items[0].result !== '成功') throw new Error('结果应为成功');
+
+  // 两个动作都必须出现在筛选清单里，否则管理员无法按类型查这类审计
+  const options = store.logActionOptions(adminToken);
+  if (!options.includes('开启开机自启') || !options.includes('取消开机自启')) {
+    throw new Error('筛选清单缺少开机自启动作类型');
+  }
+});
+
 console.log('== 数据总览 ==');
 check('总览数据正确', () => {
   const o = store.overview(adminToken);

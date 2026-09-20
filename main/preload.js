@@ -63,6 +63,16 @@ contextBridge.exposeInMainWorld('api', {
   systemInfo: () => ipcRenderer.invoke('system:info'),
   // 四级角色清单与能力矩阵（本地静态元数据，渲染角色下拉用）
   roleOptions: () => ipcRenderer.invoke('system:roles'),
+  // 内置操作手册（本地读取，不随客户端转发到服务器）
+  manual: () => ipcRenderer.invoke('system:manual'),
+  // 登录凭据保存（本地，绝不随客户端转发到服务器）：
+  // 这里刻意用 ipcRenderer.invoke 直连本机，而不是 call()——
+  // call() 在客户端模式会把参数发到远程服务端，那样密码就会离开本机。
+  listCredentials: () => ipcRenderer.invoke('credentials:list'),
+  getCredential: (username) => ipcRenderer.invoke('credentials:get', { username }),
+  saveCredential: (payload) => ipcRenderer.invoke('credentials:save', payload),
+  removeCredential: (username) => ipcRenderer.invoke('credentials:remove', { username }),
+  clearCredentials: () => ipcRenderer.invoke('credentials:clear'),
   licenseStatus: () => ipcRenderer.invoke('license:status'),
   activate: (code) => ipcRenderer.invoke('license:activate', code),
   offlineStatus: () => ipcRenderer.invoke('offline:status'),
@@ -90,6 +100,9 @@ contextBridge.exposeInMainWorld('api', {
   openUpdateDir: () => ipcRenderer.invoke('system:openUpdateDir'),
   openUpdatePage: () => ipcRenderer.invoke('system:openUpdatePage'),
   copyText: (text) => ipcRenderer.invoke('system:copyText', text),
+  // 开机自动启动（服务端模式可用，修改需系统管理员）
+  autoLaunch: () => ipcRenderer.invoke('system:autoLaunch'),
+  setAutoLaunch: (token, enabled) => ipcRenderer.invoke('system:setAutoLaunch', { enabled: !!enabled }, token),
   // 强制推送安装包（服务端设置 / 客户端查询）
   forceUpdate: () => ipcRenderer.invoke('system:forceUpdate'),
   setForceUpdate: (token, enabled, fileName) =>

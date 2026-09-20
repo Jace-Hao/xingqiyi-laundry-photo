@@ -27,6 +27,10 @@ scripts/license-tool.js
 # 激活密钥文件：算法模块运行时读取，密钥本身绝不入库
 main/license-secret.json
 
+# 登录凭据文件：正常落在运行时用户目录（userData/data），此处为防御性忽略，
+# 避免在仓库目录内调试生成时被误提交（内含加密密码密文，同样不应入库）
+credentials.json
+
 # 网页版激活工具（含密钥与算法，供管理员本地打开，禁止发布）
 docs/activate.html
 

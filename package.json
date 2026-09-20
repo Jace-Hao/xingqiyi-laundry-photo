@@ -11,8 +11,10 @@
   "scripts": {
     "start": "electron .",
     "postinstall": "node scripts/copy-vue.js",
+    "sync-manual": "node scripts/sync-manual.js",
+    "prebuild": "node scripts/copy-vue.js && node scripts/sync-manual.js",
     "build": "electron-builder --win",
-    "verify": "node scripts/verify-store.js && node scripts/verify-server.js && node scripts/verify-templates.js && node scripts/verify-watermark.js"
+    "verify": "node scripts/verify-store.js && node scripts/verify-server.js && node scripts/verify-templates.js && node scripts/verify-watermark.js && node scripts/verify-credentials.js && node scripts/sync-manual.js && node scripts/verify-manual-sync.js && node scripts/verify-manual-render.js"
   },
   "author": "星期衣精致洗衣",
   "license": "MIT",

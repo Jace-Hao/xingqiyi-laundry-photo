@@ -266,6 +266,139 @@ textarea {
   margin: 10px 0 0;
 }
 
+/* ---------- 登录页：已保存账号下拉 ---------- */
+/* 相对定位容器，供下拉面板绝对定位对齐输入框 */
+.login-user-field {
+  position: relative;
+}
+
+.login-user-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  background: #fff;
+  border: 1px solid var(--border, #e3e8ef);
+  border-radius: 10px;
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.16);
+  max-height: 260px;
+  overflow-y: auto;
+  text-align: left;
+}
+
+.login-user-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border, #eef1f5);
+}
+
+.login-user-item:hover {
+  background: #f4f8ff;
+}
+
+.login-user-item:last-of-type {
+  border-bottom: none;
+}
+
+.lui-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.lui-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.lui-sub {
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--text-sub);
+}
+
+.lui-key {
+  font-size: 10px;
+  padding: 1px 5px;
+  margin-left: 2px;
+}
+
+.lui-meta {
+  margin-top: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+}
+
+.lui-meta .tag {
+  font-size: 11px;
+  padding: 1px 7px;
+}
+
+.lui-del {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-sub);
+  font-size: 12px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.lui-del:hover {
+  background: #fde8e8;
+  color: var(--danger);
+}
+
+.login-user-foot {
+  padding: 6px 8px;
+  border-top: 1px solid var(--border, #eef1f5);
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* ---------- 登录页：记住账号 / 记住密码 ---------- */
+.login-remember {
+  margin-top: 14px;
+  gap: 18px;
+}
+
+.login-remember label {
+  font-size: 13px;
+}
+
+/* 勾选框禁用时（系统不支持加密保存密码）降低视觉存在感 */
+.login-remember label input:disabled {
+  cursor: not-allowed;
+}
+
+.login-cred-tip {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-sub);
+  text-align: left;
+}
+
+/* 风险与不可用提示：用琥珀色引起注意，但不用红色——红色在本系统表示错误/失败 */
+.login-cred-tip.warn {
+  color: #92600a;
+  background: #fef9ec;
+  border: 1px solid #f5e0b0;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
 .login-card .btn-block {
   margin-top: 18px;
   padding: 11px;
@@ -283,6 +416,209 @@ textarea {
   font-size: 12px;
   color: var(--text-sub);
   line-height: 1.6;
+}
+
+/* ---------- 内置操作手册 ---------- */
+/* 手册版本与软件版本不一致时的提示条（琥珀色，不用红色以免与错误混淆） */
+.manual-version-warn {
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  border: 1px solid #f5e0b0;
+  border-radius: 8px;
+  background: #fef9ec;
+  color: #92600a;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* 左目录 + 右正文的两栏布局；窄屏时目录收到上方横排 */
+.manual-wrap {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.manual-toc {
+  flex: 0 0 220px;
+  position: sticky;
+  top: 0;
+  max-height: calc(100vh - 140px);
+  overflow-y: auto;
+  background: #fff;
+  border: 1px solid var(--border, #e3e9f4);
+  border-radius: 12px;
+  padding: 12px 8px;
+}
+
+.manual-toc-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-sub);
+  padding: 0 10px 8px;
+  letter-spacing: 0.04em;
+}
+
+.manual-toc-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.manual-toc-item {
+  padding: 6px 10px;
+  border-radius: 7px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  cursor: pointer;
+  word-break: break-word;
+}
+
+.manual-toc-item:hover {
+  background: #f2f6fc;
+}
+
+.manual-toc-item.active {
+  background: #eaf1ff;
+  color: var(--primary, #1d4ed8);
+  font-weight: 600;
+}
+
+/* 三级条目缩进，形成层级感 */
+.manual-toc-item.sub {
+  padding-left: 22px;
+  font-size: 12.5px;
+  color: var(--text-sub);
+}
+
+.manual-toc-item.sub.active {
+  color: var(--primary, #1d4ed8);
+}
+
+.manual-toc-empty {
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-sub);
+}
+
+.manual-body {
+  flex: 1;
+  min-width: 0;
+  max-height: calc(100vh - 140px);
+  overflow-y: auto;
+  scroll-behavior: smooth;
+}
+
+/* 窄屏：目录改为顶部横向滚动条，避免挤压正文 */
+@media (max-width: 900px) {
+  .manual-wrap {
+    flex-direction: column;
+  }
+
+  .manual-toc {
+    flex: none;
+    width: 100%;
+    position: static;
+    max-height: none;
+  }
+
+  .manual-toc-list {
+    flex-direction: row;
+    overflow-x: auto;
+    gap: 6px;
+  }
+
+  .manual-toc-item.sub {
+    padding-left: 10px;
+  }
+
+  .manual-body {
+    width: 100%;
+    max-height: none;
+  }
+}
+
+/* ---------- Markdown 正文排版 ---------- */
+/* 仅覆盖手册渲染器产出的标签（h1~h4 / p / ul / li / table / strong） */
+.markdown {
+  font-size: 14px;
+  line-height: 1.75;
+  color: var(--text);
+}
+
+.markdown h1 {
+  font-size: 21px;
+  margin: 0 0 16px;
+  padding-bottom: 10px;
+  border-bottom: 2px solid var(--border, #e3e9f4);
+}
+
+.markdown h2 {
+  font-size: 17px;
+  margin: 26px 0 10px;
+  padding-left: 10px;
+  border-left: 3px solid var(--primary, #1d4ed8);
+}
+
+.markdown h3 {
+  font-size: 15px;
+  margin: 20px 0 8px;
+  color: #1f3a5f;
+}
+
+.markdown h4 {
+  font-size: 14px;
+  margin: 16px 0 6px;
+  color: var(--text-sub);
+}
+
+.markdown p {
+  margin: 8px 0;
+}
+
+.markdown ul.md-list {
+  margin: 8px 0;
+  padding-left: 22px;
+}
+
+.markdown ul.md-list li {
+  margin: 4px 0;
+}
+
+.markdown strong {
+  font-weight: 600;
+  color: #14213d;
+}
+
+.markdown .md-preamble {
+  margin-bottom: 12px;
+}
+
+/* 表格：手册大量使用表格，需要清晰的边框与斑马纹 */
+.markdown table.md-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  font-size: 13px;
+}
+
+.markdown table.md-table th,
+.markdown table.md-table td {
+  border: 1px solid var(--border, #e3e9f4);
+  padding: 7px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown table.md-table th {
+  background: #f4f7fc;
+  font-weight: 600;
+  color: #1f3a5f;
+  white-space: nowrap;
+}
+
+.markdown table.md-table tbody tr:nth-child(even) {
+  background: #fafbfd;
 }
 
 /* ---------- 整体布局 ---------- */

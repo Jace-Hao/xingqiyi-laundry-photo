@@ -944,6 +944,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     '查询记录', '查看记录', '批量导出照片', '按日期导出照片',
     '新增用户', '修改用户', '删除用户',
     '查询日志', '修改端口', '重置连接码', '修改照片路径',
+    '开启开机自启', '取消开机自启',
     '强制推送安装包', '取消强制推送', '初始化'
   ];
 
@@ -958,6 +959,29 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     const known = LOG_ACTIONS.filter((a) => set.has(a));
     const extra = [...set].filter((a) => !LOG_ACTIONS.includes(a)).sort((a, b) => a.localeCompare(b, 'zh-CN'));
     return [...known, ...extra];
+  }
+
+  /**
+   * 记录一条系统级变更日志（如开机自启）。
+   *
+   * 用于主进程执行了不属于数据层的系统操作（Electron 登录项、托盘等）之后补记审计。
+   * 只接受已登记的操作类型，避免调用方传入未登记值导致日志筛选下拉里查不到该类型。
+   * @param {string} token 会话令牌，用于确定操作人并要求系统设置权限
+   * @param {string} action 已登记的操作类型
+   * @param {string} detail 变更详情
+   */
+  function logSystemChange(token, action, detail) {
+    const me = requireSystemSettings(token);
+    const act = String(action || '').trim();
+    if (!LOG_ACTIONS.includes(act)) throw new Error('未登记的操作类型：' + act);
+    appendLog({
+      ...logBase(me),
+      module: '系统设置',
+      action: act,
+      detail: String(detail || ''),
+      result: '成功'
+    });
+    return true;
   }
 
   // ---------- 数据总览（管理端） ----------
@@ -1589,7 +1613,10 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     listLogs,
     logActionOptions,
     logFilterUsers,
-    logFilterUsers,
+    // 供主进程在执行非数据层的系统操作（如开机自启）时鉴权与补记审计：
+    // 先 requireSystemSettings 鉴权 → 执行系统调用 → logSystemChange 记日志
+    requireSystemSettings,
+    logSystemChange,
     // 角色定义：前端渲染四级角色下拉与能力提示，避免与后端能力矩阵不一致
     roleOptions: ROLE_LABELS,
     roleDefs: ROLES,

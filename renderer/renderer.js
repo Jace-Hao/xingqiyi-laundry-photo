@@ -126,6 +126,237 @@ function drawTimeWatermark(ctx, width, height, timeText) {
 }
 
 /**
+ * 内置操作手册的轻量 Markdown 渲染器（零依赖）。
+ *
+ * 为什么自写而不用 marked 之类：本项目是「零运行时依赖 + 本地 vendor」风格
+ * （Vue 也是 vendor 进 renderer/assets 的），且手册只用到很小的语法子集
+ * （标题、段落、无序列表、表格、粗体）。自写解析器避免为几 KB 文档引入依赖，
+ * 也让「支持哪些语法」与 scripts/sync-manual.js 的校验清单严格对齐。
+ *
+ * 安全：所有文本先 HTML 转义再拼装标签，手册内容不会作为 HTML 执行。
+ * 手册虽然是本地可信文件，但不依赖这一点——转义是默认动作，没有例外分支。
+ *
+ * 支持的语法（超出范围的写法会被 sync-manual.js 在构建期拦截）：
+ *   # ~ #### 标题、- 无序列表、| 表格 |、**粗体**、普通段落、<!-- roles:xxx --> 标记
+ */
+function escapeHtml(s) {
+  return String(s === undefined || s === null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** 行内格式：目前只需 **粗体**（先转义，再在转义后的文本上匹配，避免标记被转义破坏） */
+function inlineMd(escaped) {
+  return escaped.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+}
+
+/** 把标题文本转成安全的锚点 id（用于目录跳转） */
+function slugify(text) {
+  const s = String(text || '').trim().toLowerCase();
+  // 只保留中文、字母、数字，其余转为短横线；避免空格与标点破坏 id
+  return 'md-' + (s.replace(/[^\u4e00-\u9fa5a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'sec');
+}
+
+/**
+ * 解析手册文本为「章节块」列表，供按角色裁剪与目录生成。
+ *
+ * 每个块：{ level, title, roles, content }
+ *   - roles 来自紧随标题的 <!-- roles:xxx --> 标记；无标记则为 null
+ *   - 子章节继承父章节 roles：这样只需标注少数章节，避免大量重复标记
+ *
+ * 返回扁平数组，渲染时按 level 自行组装层级。
+ */
+function parseManualSections(text) {
+  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+  const sections = [];
+  let current = null;
+  let expectRoles = false; // 标记：下一个非空行若是 roles 注释则归给当前标题
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\s+$/, '');
+
+    const hm = line.match(/^(#{1,4})\s+(.*)$/);
+    if (hm) {
+      current = { level: hm[1].length, title: hm[2].trim(), roles: null, content: [] };
+      sections.push(current);
+      expectRoles = true;
+      continue;
+    }
+
+    // roles 标记必须紧跟标题（中间只允许空行），避免误关联到正文
+    const rm = line.match(/^<!--\s*roles:\s*([^>]*?)\s*-->$/);
+    if (rm && expectRoles && current) {
+      current.roles = rm[1].split(',').map((s) => s.trim()).filter(Boolean);
+      continue;
+    }
+    if (line.trim()) expectRoles = false;
+
+    // 标题之前的前言：用 level 0 的合成块承载，避免被静默丢弃。
+    // 渲染时该块只输出正文、不输出标题，也不进目录。
+    if (!current) {
+      if (!line.trim()) continue; // 前言的前导空行无需保留
+      current = { level: 0, title: '', roles: null, content: [], preamble: true };
+      sections.push(current);
+    }
+    current.content.push(line);
+  }
+
+  // 子章节继承父章节的 roles（仅在自己没有标记时）
+  const stack = [];
+  for (const s of sections) {
+    while (stack.length && stack[stack.length - 1].level >= s.level) stack.pop();
+    if (s.roles === null && stack.length) s.roles = stack[stack.length - 1].roles;
+    stack.push(s);
+  }
+  return sections;
+}
+
+/**
+ * 判断某章节对指定角色是否可见；roles 为 null 表示所有角色可见。
+ *
+ * 系统管理员一律可见全部章节：它是搭建与排障角色，对软件有完整访问权，
+ * 需要能查阅店员端操作文档才能指导门店使用与定位问题。
+ * 这也避免手册作者在每处 roles 标记里都要补写 sysadmin（漏写就会造成
+ * 「系统管理员反而比门店管理员看到的章节少」这类反直觉结果）。
+ */
+function sectionVisible(roles, role) {
+  if (!roles || !roles.length) return true;
+  if (!role) return false;
+  if (isSysAdminRole(role)) return true;
+  return roles.includes(role);
+}
+
+/** 把章节的正文（不含标题）渲染为 HTML */
+function renderSectionBody(contentLines) {
+  const out = [];
+  let i = 0;
+  let listOpen = false;
+
+  const closeList = () => {
+    if (listOpen) {
+      out.push('</ul>');
+      listOpen = false;
+    }
+  };
+
+  while (i < contentLines.length) {
+    const line = contentLines[i];
+    const trimmed = line.trim();
+
+    // 空行：结束列表，段落之间自然分隔
+    if (!trimmed) {
+      closeList();
+      i++;
+      continue;
+    }
+
+    // 表格：表头行 + 分隔行（| --- | --- |）+ 若干数据行
+    if (trimmed.startsWith('|') && i + 1 < contentLines.length) {
+      const sep = contentLines[i + 1].trim();
+      if (/^\|?[\s:|-]+\|[\s:|-]*$/.test(sep) && sep.includes('-')) {
+        closeList();
+        const parseRow = (r) =>
+          r.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+        const head = parseRow(trimmed);
+        i += 2; // 跳过表头与分隔行
+        const rows = [];
+        while (i < contentLines.length && contentLines[i].trim().startsWith('|')) {
+          rows.push(parseRow(contentLines[i].trim()));
+          i++;
+        }
+        let html = '<table class="md-table"><thead><tr>';
+        for (const h of head) html += '<th>' + inlineMd(escapeHtml(h)) + '</th>';
+        html += '</tr></thead><tbody>';
+        for (const r of rows) {
+          html += '<tr>';
+          // 单元格数与表头对齐：多的截断、少的补空，避免表格错位
+          for (let c = 0; c < head.length; c++) {
+            html += '<td>' + inlineMd(escapeHtml(r[c] === undefined ? '' : r[c])) + '</td>';
+          }
+          html += '</tr>';
+        }
+        html += '</tbody></table>';
+        out.push(html);
+        continue;
+      }
+    }
+
+    // 无序列表
+    const lm = trimmed.match(/^-\s+(.*)$/);
+    if (lm) {
+      if (!listOpen) {
+        out.push('<ul class="md-list">');
+        listOpen = true;
+      }
+      out.push('<li>' + inlineMd(escapeHtml(lm[1])) + '</li>');
+      i++;
+      continue;
+    }
+
+    // 普通段落：连续的文本行合并为一段
+    closeList();
+    const para = [trimmed];
+    i++;
+    while (i < contentLines.length) {
+      const nx = contentLines[i].trim();
+      if (!nx || nx.startsWith('#') || nx.startsWith('|') || nx.startsWith('- ') || nx.startsWith('<!--')) break;
+      para.push(nx);
+      i++;
+    }
+    out.push('<p>' + inlineMd(escapeHtml(para.join(' '))) + '</p>');
+  }
+
+  closeList();
+  return out.join('\n');
+}
+
+/**
+ * 渲染整篇手册为 HTML（已按角色裁剪）。
+ * @param {string} text 手册 Markdown 原文
+ * @param {string} role 当前登录角色（sysadmin/storeadmin/capture/query）
+ * @returns {{ html:string, toc:Array<{id,title,level}> }}
+ */
+function renderManual(text, role) {
+  const sections = parseManualSections(text);
+  const html = [];
+  const toc = [];
+  const usedIds = new Set();
+
+  for (const s of sections) {
+    if (!sectionVisible(s.roles, role)) continue;
+
+    // 前言块（标题之前的正文）：只输出正文，不生成标题、不占目录、不参与 id 分配
+    if (s.preamble) {
+      const preBody = renderSectionBody(s.content);
+      if (preBody) html.push('<div class="md-preamble">' + preBody + '</div>');
+      continue;
+    }
+
+    // 标题可能重复（如多个「说明」小节），追加序号保证 id 唯一，否则目录跳转会错
+    let id = slugify(s.title);
+    if (usedIds.has(id)) {
+      let n = 2;
+      while (usedIds.has(id + '-' + n)) n++;
+      id = id + '-' + n;
+    }
+    usedIds.add(id);
+
+    const tag = 'h' + Math.min(4, Math.max(1, s.level));
+    html.push('<' + tag + ' id="' + id + '" class="md-' + tag + '">' + inlineMd(escapeHtml(s.title)) + '</' + tag + '>');
+    const body = renderSectionBody(s.content);
+    if (body) html.push(body);
+
+    // 目录只收 h2/h3，h1 是手册标题、h4 过细，收进来会太长
+    if (s.level === 2 || s.level === 3) toc.push({ id, title: s.title, level: s.level });
+  }
+
+  return { html: html.join('\n'), toc };
+}
+
+/**
  * 共用的「版本与安装包下载」逻辑。
  * 登录页、客户端设置页、管理端系统设置页都要展示当前版本并支持一键下载安装包，
  * 统一在此实现，避免多份拷贝出现行为不一致。
@@ -326,29 +557,188 @@ const LoginPage = {
   props: { sysInfo: { type: Object, default: null } },
   emits: ['login', 'server-saved'],
   setup(props, { emit }) {
-    // 记住最后登录账号：仅缓存用户名，密码不落盘，下次打开自动填充并聚焦密码框
-    const LAST_USER_KEY = 'xqy.lastUsername';
-    function readLastUsername() {
-      try {
-        return localStorage.getItem(LAST_USER_KEY) || '';
-      } catch (e) {
-        return '';
-      }
-    }
-    function writeLastUsername(name) {
-      try {
-        if (name) localStorage.setItem(LAST_USER_KEY, name);
-        else localStorage.removeItem(LAST_USER_KEY);
-      } catch (e) {
-        /* 忽略存储不可用时的异常 */
-      }
-    }
-
-    const username = Vue.ref(readLastUsername());
+    const username = Vue.ref('');
     const password = Vue.ref('');
     const passwordInput = Vue.ref(null);
     const error = Vue.ref('');
     const loading = Vue.ref(false);
+
+    // ---------- 记住账号 / 记住密码 ----------
+    // 凭据由主进程用 Electron safeStorage（系统级凭据保护）加密后保存，密码不明文落盘。
+    // 默认只记住账号名、不记住密码：记住密码需用户显式勾选（每个账号各自记住）。
+    const savedAccounts = Vue.ref([]); // [{ username, name, store, role, hasPassword }]
+    const passwordSupported = Vue.ref(false); // 系统是否支持加密保存密码
+    const rememberUser = Vue.ref(true);
+    const rememberPass = Vue.ref(false);
+    const credNotice = Vue.ref(''); // 密码未能保存时的原因
+    const showSavedPanel = Vue.ref(false);
+
+    // 兼容旧版本：把 localStorage 里记住的最后账号迁移到凭据存储，避免升级后丢失
+    const LEGACY_USER_KEY = 'xqy.lastUsername';
+    function migrateLegacyLastUser() {
+      try {
+        const legacy = localStorage.getItem(LEGACY_USER_KEY);
+        if (!legacy) return '';
+        localStorage.removeItem(LEGACY_USER_KEY);
+        return String(legacy).trim();
+      } catch (e) {
+        return '';
+      }
+    }
+
+    async function loadSavedAccounts() {
+      try {
+        const r = await window.api.listCredentials();
+        if (r.ok && r.data) {
+          savedAccounts.value = r.data.accounts || [];
+          passwordSupported.value = !!r.data.passwordSupported;
+          return savedAccounts.value;
+        }
+      } catch (e) {
+        /* 读取失败时退化为不记忆，不影响登录 */
+      }
+      savedAccounts.value = [];
+      return [];
+    }
+
+    /** 当前输入的账号名对应的已保存条目（不区分大小写） */
+    function findSaved(name) {
+      const u = String(name || '').trim().toLowerCase();
+      return savedAccounts.value.find((a) => String(a.username).toLowerCase() === u) || null;
+    }
+
+    /**
+     * 按账号名填充已保存的密码。
+     * 切换账号时必须清掉上一个账号的密码：否则会把 A 账号的密码显示在 B 账号的
+     * 输入框里，既是凭据泄露也会导致用 A 的密码登 B 而失败。
+     */
+    async function fillPasswordFor(name) {
+      const saved = findSaved(name);
+      if (!saved || !saved.hasPassword) {
+        password.value = '';
+        rememberPass.value = false;
+        return;
+      }
+      try {
+        const r = await window.api.getCredential(saved.username);
+        if (r.ok && r.data && r.data.password) {
+          password.value = r.data.password;
+          rememberPass.value = true;
+          credNotice.value = r.data.error || '';
+        } else {
+          password.value = '';
+          rememberPass.value = false;
+          credNotice.value = (r.ok && r.data && r.data.error) || '';
+        }
+      } catch (e) {
+        password.value = '';
+        rememberPass.value = false;
+      }
+    }
+
+    /**
+     * 账号输入框失焦时按账号名填充已保存的密码。
+     *
+     * 刻意不用 Vue.watch(username)：那会在用户手动输入的**每一次按键**都触发，
+     * 而输入中途的账号名往往匹配不到已保存条目，会把已填好的密码清空
+     * （例如自动填充了账号 A 和密码，用户想改成 B，删掉一个字符的瞬间密码就没了）。
+     * 改为失焦时填充：输入过程中绝不动密码框。
+     */
+    function onUsernameBlur() {
+      const name = String(username.value || '').trim();
+      if (!name) {
+        rememberPass.value = false;
+        return;
+      }
+      const saved = findSaved(name);
+      rememberPass.value = !!(saved && saved.hasPassword);
+      if (saved && saved.hasPassword && !password.value) {
+        // 仅在密码框为空时填充，不覆盖用户已经手动输入的密码
+        fillPasswordFor(name);
+      }
+    }
+
+    /** 登录成功后保存凭据；保存失败不影响登录，只提示 */
+    async function saveCredentialAfterLogin(user) {
+      const name = String((user && (user.username || user.name)) || username.value || '').trim();
+      if (!name) return;
+      if (!rememberUser.value && !rememberPass.value) {
+        // 两个都不勾：清掉该账号已保存的凭据，符合用户预期
+        try {
+          await window.api.removeCredential(name);
+        } catch (e) {
+          /* 忽略 */
+        }
+        await loadSavedAccounts();
+        return;
+      }
+      try {
+        const r = await window.api.saveCredential({
+          username: name,
+          password: rememberPass.value ? password.value : '',
+          rememberPassword: rememberPass.value,
+          name: (user && user.name) || '',
+          store: (user && user.store) || '',
+          role: (user && user.role) || ''
+        });
+        if (r.ok) {
+          credNotice.value = r.data.notice || '';
+          if (r.data.notice) toast(r.data.notice, 'error');
+        } else if (r.message) {
+          toast(r.message, 'error');
+        }
+      } catch (e) {
+        /* 保存凭据失败不影响已成功的登录 */
+      }
+      await loadSavedAccounts();
+    }
+
+    /** 从下拉中选定账号 */
+    async function pickAccount(name) {
+      username.value = String(name || '').trim();
+      // 显式关闭面板：下拉项用 mousedown.prevent 阻止了默认行为（也阻止了输入框失焦），
+      // 若不主动关闭，面板会滞留，不能依赖 blur 的副作用顺序
+      showSavedPanel.value = false;
+      await fillPasswordFor(username.value);
+      // 有密码则直接聚焦登录按钮所在区域，无密码则聚焦密码框等待输入
+      if (passwordInput.value && passwordInput.value.focus) passwordInput.value.focus();
+    }
+
+    /** 删除单个已保存账号 */
+    async function removeSaved(name) {
+      if (!window.confirm('确定不再记住账号 ' + name + '？已保存的密码会一并清除。')) return;
+      try {
+        const r = await window.api.removeCredential(name);
+        if (r.ok) {
+          toast('已移除该账号的保存记录', 'success');
+          await loadSavedAccounts();
+          // 删到最后一个时关掉面板，避免残留一个空框
+          if (!savedAccounts.value.length) showSavedPanel.value = false;
+        } else {
+          toast(r.message || '移除失败', 'error');
+        }
+      } catch (e) {
+        toast('移除失败：' + (e.message || e), 'error');
+      }
+    }
+
+    /** 清空全部已保存凭据 */
+    async function clearSaved() {
+      if (!window.confirm('确定清空本机保存的全部账号与密码？此操作不可恢复。')) return;
+      try {
+        const r = await window.api.clearCredentials();
+        if (r.ok) {
+          toast('已清空本机保存的登录凭据', 'success');
+          await loadSavedAccounts();
+          // 列表已空，关闭面板避免残留一个空框
+          showSavedPanel.value = false;
+        } else {
+          toast(r.message || '清空失败', 'error');
+        }
+      } catch (e) {
+        toast('清空失败：' + (e.message || e), 'error');
+      }
+    }
 
     const showServer = Vue.ref(false);
     const serverUrl = Vue.ref('');
@@ -412,15 +802,38 @@ const LoginPage = {
       }
     }
 
-    // 挂载时加载激活状态、当前版本与更新信息（loadAll 内部已串联这三步）
-    Vue.onMounted(() => {
+    // 挂载时加载激活状态、版本信息，并恢复已保存的登录凭据
+    Vue.onMounted(async () => {
       loadAll();
-      // 账号已被记住时，自动聚焦密码框，省去再次点击账号框
-      if (username.value && passwordInput.value) {
-        Vue.nextTick(() => {
-          if (passwordInput.value && passwordInput.value.focus) passwordInput.value.focus();
-        });
+
+      const accounts = await loadSavedAccounts();
+
+      // 兼容旧版本：把 localStorage 记住的最后账号迁移到凭据存储（只迁账号名，不含密码）
+      const legacy = migrateLegacyLastUser();
+      if (legacy && !findSaved(legacy)) {
+        try {
+          await window.api.saveCredential({
+            username: legacy,
+            password: '',
+            rememberPassword: false
+          });
+          await loadSavedAccounts();
+        } catch (e) {
+          /* 迁移失败不影响登录，用户手动输入即可 */
+        }
       }
+
+      // 自动填充最近登录的账号：有保存密码则连密码一起填，否则聚焦密码框
+      const list = accounts.length ? accounts : savedAccounts.value;
+      const first = list[0];
+      if (first) {
+        username.value = first.username;
+        rememberUser.value = true;
+        await fillPasswordFor(first.username);
+      }
+      Vue.nextTick(() => {
+        if (passwordInput.value && passwordInput.value.focus) passwordInput.value.focus();
+      });
     });
 
     function openServer() {
@@ -469,7 +882,10 @@ const LoginPage = {
       try {
         const r = await window.api.login(username.value.trim(), password.value);
         if (r.ok) {
-          writeLastUsername(username.value.trim());
+          // 按「记住账号 / 记住密码」勾选状态保存凭据。
+          // 用 await：保存失败需要把原因提示出来（例如系统不支持加密保存密码），
+          // 且不保存就 emit 会导致界面切走、toast 无处展示。
+          await saveCredentialAfterLogin(r.data.user);
           toast('登录成功，欢迎 ' + (r.data.user.name || r.data.user.username), 'success');
           emit('login', r.data);
         } else if (r.expired) {
@@ -494,7 +910,10 @@ const LoginPage = {
       license, showActivate, activateCode, activateMsg, activating,
       doActivate, copyMachineCode,
       version, updateInfo, downloading, canAutoDownload, progressPercent, progressText,
-      downloadPackage, cancelDownload
+      downloadPackage, cancelDownload,
+      // 记住账号 / 记住密码
+      savedAccounts, passwordSupported, rememberUser, rememberPass, credNotice,
+      showSavedPanel, pickAccount, removeSaved, clearSaved, roleLabel, onUsernameBlur
     };
   },
   template: `
@@ -505,9 +924,72 @@ const LoginPage = {
         <div class="login-sub">衣物照片系统</div>
         <form @submit.prevent="submit">
           <label>账号</label>
-          <input v-model="username" placeholder="请输入账号" autocomplete="username" />
+          <div class="login-user-field">
+            <input
+              v-model="username"
+              placeholder="请输入账号"
+              autocomplete="username"
+              @focus="showSavedPanel = savedAccounts.length > 0"
+              @blur="onUsernameBlur(); showSavedPanel = false"
+            />
+            <!-- 已保存账号下拉：面板项用 mousedown.prevent，
+                 否则输入框 blur 会先关闭面板，导致 click 永远不触发 -->
+            <div v-if="showSavedPanel && savedAccounts.length" class="login-user-list">
+              <div
+                v-for="a in savedAccounts"
+                :key="a.username"
+                class="login-user-item"
+                @mousedown.prevent="pickAccount(a.username)"
+              >
+                <div class="lui-main">
+                  <div class="lui-name">
+                    {{ a.username }}
+                    <span v-if="a.name && a.name !== a.username" class="lui-sub">（{{ a.name }}）</span>
+                    <span v-if="a.hasPassword" class="tag tag-green lui-key" title="已保存密码">🔑</span>
+                  </div>
+                  <div class="lui-meta">
+                    <span v-if="a.role" class="tag tag-gray">{{ roleLabel(a.role) }}</span>
+                    <span v-if="a.store" class="tag" style="margin-left:4px">{{ a.store }}</span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  class="lui-del"
+                  title="不再记住该账号"
+                  @mousedown.prevent.stop="removeSaved(a.username)"
+                >✕</button>
+              </div>
+              <div class="login-user-foot">
+                <button type="button" class="btn btn-ghost btn-sm" @mousedown.prevent.stop="clearSaved">
+                  清空全部保存记录
+                </button>
+              </div>
+            </div>
+          </div>
+
           <label>密码</label>
           <input ref="passwordInput" v-model="password" type="password" placeholder="请输入密码" autocomplete="current-password" />
+
+          <div class="check-row login-remember">
+            <label><input type="checkbox" v-model="rememberUser" />记住账号</label>
+            <label :title="passwordSupported ? '' : '本机系统凭据保护不可用，无法加密保存密码'">
+              <input type="checkbox" v-model="rememberPass" :disabled="!passwordSupported" />记住密码
+            </label>
+          </div>
+          <div v-if="!passwordSupported" class="login-cred-tip warn">
+            本机系统凭据保护不可用，密码无法加密保存，「记住密码」已禁用（仅记住账号名）。
+          </div>
+          <!-- 共用电脑风险必须明确告知：记住密码后，任何能打开本软件的人
+               从下拉选中该账号即可登录，因此默认不勾选，需用户主动开启 -->
+          <div v-else-if="rememberPass" class="login-cred-tip warn">
+            ⚠️ 共用电脑请谨慎勾选「记住密码」：开启后，任何能打开本软件的人
+            从账号下拉中选中该账号即可直接登录。建议仅在个人专用电脑上开启。
+          </div>
+          <div v-else class="login-cred-tip">
+            密码经系统凭据保护加密后保存在本机，不会明文存储，也不会上传到服务器。
+          </div>
+          <div v-if="credNotice" class="login-cred-tip warn">{{ credNotice }}</div>
+
           <div v-if="error" class="form-error">{{ error }}</div>
           <button class="btn btn-primary btn-block" type="submit" :disabled="loading">
             {{ loading ? '登录中…' : '登 录' }}
@@ -2461,6 +2943,59 @@ const AdminSystemPage = {
     const forceFile = Vue.ref(''); // 下拉选中的安装包文件名
     const savingForce = Vue.ref(false);
 
+    // ---------- 开机自动启动（仅服务端可设置） ----------
+    // autoLaunchInfo: { enabled, supported, platform, serverMode, launchedHidden }
+    const autoLaunchInfo = Vue.ref(null);
+    const savingAutoLaunch = Vue.ref(false);
+
+    async function loadAutoLaunch() {
+      try {
+        const r = await window.api.autoLaunch();
+        if (r.ok && r.data) autoLaunchInfo.value = r.data;
+      } catch (e) {
+        /* 读取失败时保持 null，界面显示为「未知」并禁用开关 */
+      }
+    }
+
+    // 仅「服务端模式 + 系统支持 + 状态读取成功」时可设置，避免客户端工位机被误设为常驻
+    const canSetAutoLaunch = Vue.computed(() => {
+      const a = autoLaunchInfo.value;
+      return !!(a && a.supported && a.serverMode);
+    });
+    const autoLaunchDisabledReason = Vue.computed(() => {
+      const a = autoLaunchInfo.value;
+      if (!a) return '当前无法读取系统登录项状态，请点击「刷新状态」重试；若仍失败，可能是系统策略限制了该功能。';
+      if (!a.supported) return '当前操作系统不支持开机自动启动（仅 Windows 与 macOS 可用）。';
+      if (!a.serverMode) return '仅服务端模式可开启开机自动启动。客户端为工位机、无需常驻；如需本机提供照片服务，请先在启动设置中切换为服务端模式。';
+      return '';
+    });
+
+    async function toggleAutoLaunch(enable) {
+      savingAutoLaunch.value = true;
+      try {
+        const r = await window.api.setAutoLaunch(props.token, enable);
+        if (r.ok) {
+          // 以主进程返回的真实系统状态为准，而不是直接采信本次请求值
+          await loadAutoLaunch();
+          toast(
+            enable
+              ? '已开启开机自动启动：开机后静默驻留托盘提供服务，需要界面时从托盘图标打开'
+              : '已取消开机自动启动',
+            'success'
+          );
+        } else {
+          // 设置被拒绝（权限或系统策略）：同步回读真实状态，避免开关显示与实际不一致
+          await loadAutoLaunch();
+          toast(r.message || '设置失败', 'error');
+        }
+      } catch (e) {
+        await loadAutoLaunch();
+        toast('设置失败：' + (e.message || e), 'error');
+      } finally {
+        savingAutoLaunch.value = false;
+      }
+    }
+
     async function loadForceUpdate() {
       const r = await window.api.forceUpdate();
       if (r.ok && r.data) {
@@ -2605,6 +3140,7 @@ const AdminSystemPage = {
       loadVersion();
       checkUpdate(false);
       loadForceUpdate();
+      loadAutoLaunch();
     }
 
     async function savePort() {
@@ -2677,7 +3213,9 @@ const AdminSystemPage = {
       photoPathInput, savingPath, chooseDir, savePath, remoteLocked,
       version, updateInfo, checking, checkUpdate, openUpdateFolder, openUpdatePage, copyFirewallCmd,
       downloading, downloadUpdateNow, cancelUpdateDownload, canAutoDownload, progressPercent, progressText, fmtSize,
-      forceInfo, forceFile, savingForce, setForceUpdate, loadForceUpdate
+      forceInfo, forceFile, savingForce, setForceUpdate, loadForceUpdate,
+      autoLaunchInfo, savingAutoLaunch, toggleAutoLaunch,
+      loadAutoLaunch, canSetAutoLaunch, autoLaunchDisabledReason
     };
   },
   template: `
@@ -2737,6 +3275,43 @@ const AdminSystemPage = {
             照片按原始分辨率保存为 JPG 文件；修改路径前会先校验目标目录，避免覆盖同名文件。
           </p>
         </div>
+      </div>
+
+      <div v-if="info" class="card" style="margin-top:18px">
+        <div class="card-title">🚀 开机自动启动</div>
+        <div class="info-row">
+          <span>当前状态</span>
+          <b v-if="!autoLaunchInfo">未知（读取失败，可点击刷新）</b>
+          <b v-else-if="autoLaunchInfo.enabled" style="color:#16a34a">已开启</b>
+          <b v-else>未开启</b>
+        </div>
+        <div v-if="autoLaunchInfo && autoLaunchInfo.launchedHidden" class="info-row">
+          <span>本次启动方式</span>
+          <b>开机自动启动（静默驻留托盘）</b>
+        </div>
+        <div style="display:flex;gap:10px;margin-top:16px;align-items:center">
+          <button
+            v-if="autoLaunchInfo && autoLaunchInfo.enabled"
+            class="btn btn-ghost"
+            :disabled="savingAutoLaunch"
+            @click="toggleAutoLaunch(false)"
+          >{{ savingAutoLaunch ? '设置中…' : '取消开机自启' }}</button>
+          <button
+            v-else
+            class="btn btn-primary"
+            :disabled="savingAutoLaunch || !canSetAutoLaunch"
+            @click="toggleAutoLaunch(true)"
+          >{{ savingAutoLaunch ? '设置中…' : '开启开机自启' }}</button>
+          <button class="btn btn-ghost btn-sm" :disabled="savingAutoLaunch" @click="loadAutoLaunch">刷新状态</button>
+        </div>
+        <p v-if="!canSetAutoLaunch" class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#fef9ec;border:1px solid #f5e0b0;border-radius:8px">
+          ⚠️ {{ autoLaunchDisabledReason }}
+        </p>
+        <p v-else class="setup-desc" style="margin-top:14px">
+          开启后，本机登录 Windows 时自动启动本软件并静默驻留托盘（不弹窗），
+          持续为各客户端提供照片服务，避免门店断电重启后服务没起来。
+          需要操作界面时点托盘图标即可打开。仅服务端电脑需要开启。
+        </p>
       </div>
 
       <div v-if="info" class="card" style="margin-top:18px">
@@ -2827,6 +3402,115 @@ const AdminSystemPage = {
   `
 };
 
+/* ---------- 内置操作手册（所有角色可见，章节按角色裁剪） ---------- */
+const ManualPage = {
+  props: {
+    token: { type: String, required: true },
+    user: { type: Object, default: null }
+  },
+  setup(props) {
+    const loading = Vue.ref(true);
+    const error = Vue.ref('');
+    const html = Vue.ref('');
+    const toc = Vue.ref([]);
+    const manualVersion = Vue.ref('');
+    const appVersion = Vue.ref('');
+    const activeId = Vue.ref('');
+    const bodyEl = Vue.ref(null);
+
+    async function load() {
+      loading.value = true;
+      error.value = '';
+      try {
+        const r = await window.api.manual();
+        if (r.ok && r.data && r.data.text) {
+          const role = String((props.user && props.user.role) || '');
+          const out = renderManual(r.data.text, role);
+          html.value = out.html;
+          toc.value = out.toc;
+          manualVersion.value = r.data.manualVersion || '';
+          appVersion.value = r.data.appVersion || '';
+          activeId.value = out.toc.length ? out.toc[0].id : '';
+        } else {
+          html.value = '';
+          toc.value = [];
+          error.value = (r && r.message) || '读取内置手册失败';
+        }
+      } catch (e) {
+        html.value = '';
+        toc.value = [];
+        error.value = '读取内置手册失败：' + (e.message || e);
+      } finally {
+        loading.value = false;
+      }
+    }
+
+    function goto(id) {
+      activeId.value = id;
+      Vue.nextTick(() => {
+        const root = bodyEl.value;
+        if (!root) return;
+        const el = root.querySelector('[id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]');
+        if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
+
+    // 手册版本与软件版本不一致时提示：说明发版时忘了同步手册，
+    // 避免店员照着旧文档操作新版软件
+    const versionMismatch = Vue.computed(() => {
+      const m = manualVersion.value;
+      const a = appVersion.value;
+      return !!(m && a && m !== a);
+    });
+
+    Vue.onMounted(load);
+    return { loading, error, html, toc, activeId, bodyEl, goto, load, manualVersion, appVersion, versionMismatch };
+  },
+  template: `
+    <div>
+      <div class="page-head">
+        <h2>操作手册</h2>
+        <p>软件使用与运维说明，按当前账号角色显示相关章节</p>
+      </div>
+
+      <div v-if="versionMismatch" class="manual-version-warn">
+        ⚠️ 内置手册版本为 v{{ manualVersion }}，与当前软件版本 v{{ appVersion }} 不一致，
+        文档可能未随本版更新，请以实际界面为准。
+      </div>
+
+      <div v-if="loading" class="card empty">正在加载操作手册…</div>
+      <div v-else-if="error" class="card">
+        <div class="empty">{{ error }}</div>
+        <div style="text-align:center;margin-top:14px">
+          <button class="btn btn-ghost btn-sm" @click="load">重试</button>
+        </div>
+      </div>
+      <div v-else class="manual-wrap">
+        <!-- 目录：只收 h2/h3，点击滚动到对应章节 -->
+        <aside class="manual-toc">
+          <div class="manual-toc-title">目录</div>
+          <div class="manual-toc-list">
+            <div
+              v-for="t in toc"
+              :key="t.id"
+              class="manual-toc-item"
+              :class="{ active: activeId === t.id, sub: t.level === 3 }"
+              @click="goto(t.id)"
+            >{{ t.title }}</div>
+            <div v-if="!toc.length" class="manual-toc-empty">无目录</div>
+          </div>
+        </aside>
+
+        <!-- 正文：内容由 renderManual 生成，其中所有文本均已 HTML 转义后再拼装标签，
+             因此这里用 v-html 输出的是受控的静态结构，不会执行手册中的任何标记 -->
+        <div ref="bodyEl" class="manual-body card">
+          <div class="markdown" v-html="html"></div>
+        </div>
+      </div>
+    </div>
+  `
+};
+
 /* ---------- 主界面框架（侧边栏 + 页面切换） ---------- */
 const Shell = {
   props: { user: { type: Object, required: true }, token: { type: String, required: true }, mode: { type: String, default: '' } },
@@ -2911,32 +3595,38 @@ const Shell = {
       users: AdminUsersPage,
       logs: AdminLogsPage,
       data: QueryPage,
-      system: AdminSystemPage
+      system: AdminSystemPage,
+      manual: ManualPage
     };
 
     const pages = (() => {
+      let list;
       if (isAdmin) {
-        return [
+        list = [
           { key: 'overview', icon: '📊', label: '数据总览' },
           { key: 'users', icon: '👥', label: '用户与权限' },
           { key: 'logs', icon: '📋', label: '操作日志' },
           { key: 'data', icon: '🗂️', label: '数据查看' },
           { key: 'system', icon: '🛠️', label: '系统设置' }
         ];
-      }
-      if (isStoreAdmin) {
-        return [
+      } else if (isStoreAdmin) {
+        list = [
           { key: 'home', icon: '🏠', label: '首页' },
           { key: 'logs', icon: '📋', label: '本店日志' },
           { key: 'query', icon: '🗂️', label: '本店订单' },
           { key: 'settings', icon: '⚙️', label: '设置' }
         ];
+      } else {
+        list = [{ key: 'home', icon: '🏠', label: '首页' }];
+        // 拍照能力由角色派生，查询账号不显示拍照入口
+        if (canCapture) list.push({ key: 'capture', icon: '📷', label: '衣物拍照' });
+        list.push({ key: 'query', icon: '🔍', label: '记录查询' });
+        list.push({ key: 'settings', icon: '⚙️', label: '设置' });
       }
-      const list = [{ key: 'home', icon: '🏠', label: '首页' }];
-      // 拍照能力由角色派生，查询账号不显示拍照入口
-      if (canCapture) list.push({ key: 'capture', icon: '📷', label: '衣物拍照' });
-      list.push({ key: 'query', icon: '🔍', label: '记录查询' });
-      list.push({ key: 'settings', icon: '⚙️', label: '设置' });
+      // 操作手册对所有角色可见，统一在末尾追加：
+      // 放在这里而不是三个分支各写一次，避免将来新增角色时漏加手册入口。
+      // 手册内部已按角色裁剪章节，因此同一入口对不同角色显示不同内容。
+      list.push({ key: 'manual', icon: '📖', label: '操作手册' });
       return list;
     })();
 
