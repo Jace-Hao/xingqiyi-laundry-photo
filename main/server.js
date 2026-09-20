@@ -84,6 +84,8 @@ function startServer(store, opts = {}) {
       'users/delete': () => store.deleteUser(sessionToken, body.id),
       // 日志与总览
       'logs/list': () => store.listLogs(sessionToken, body),
+      'logs/actionOptions': () => store.logActionOptions(sessionToken),
+      'logs/filterUsers': () => store.logFilterUsers(sessionToken),
       'stats/overview': () => store.overview(sessionToken),
       // 系统设置（仅服务端本机管理员使用）
       'system/info': () => ({ ...store.systemInfo(), localOnly: true }),

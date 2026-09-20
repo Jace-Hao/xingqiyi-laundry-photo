@@ -36,27 +36,33 @@ contextBridge.exposeInMainWorld('api', {
 
   // 用户管理（只传原始类型参数，对象在桥接层内组装）
   listUsers: (token) => call('users:list', undefined, token),
-  createUser: (token, username, name, role, password, capture, query) =>
+  createUser: (token, username, name, role, password, capture, query, store) =>
     call(
       'users:create',
-      { username, name, role, password, permissions: { capture: !!capture, query: !!query } },
+      { username, name, role, password, permissions: { capture: !!capture, query: !!query }, store: store || '' },
       token
     ),
-  updateUser: (token, id, name, role, active, capture, query, newPassword) => {
+  updateUser: (token, id, name, role, active, capture, query, newPassword, store) => {
     const p = { id, name, role, active: !!active, newPassword: newPassword || undefined };
     if (capture !== undefined && capture !== null && query !== undefined && query !== null) {
       p.permissions = { capture: !!capture, query: !!query };
     }
+    // store 传 null/undefined 表示本次不修改门店；传空字符串表示清空门店
+    if (store !== undefined && store !== null) p.store = String(store);
     return call('users:update', p, token);
   },
   deleteUser: (token, id) => call('users:delete', { id }, token),
 
   // 日志与总览
   listLogs: (token, payload) => call('logs:list', payload, token),
+  logActionOptions: (token) => call('logs:actionOptions', undefined, token),
+  logFilterUsers: (token) => call('logs:filterUsers', undefined, token),
   overview: (token) => call('stats:overview', undefined, token),
 
   // 系统配置（本地，不随客户端转发）
   systemInfo: () => ipcRenderer.invoke('system:info'),
+  // 四级角色清单与能力矩阵（本地静态元数据，渲染角色下拉用）
+  roleOptions: () => ipcRenderer.invoke('system:roles'),
   licenseStatus: () => ipcRenderer.invoke('license:status'),
   activate: (code) => ipcRenderer.invoke('license:activate', code),
   offlineStatus: () => ipcRenderer.invoke('offline:status'),

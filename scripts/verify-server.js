@@ -144,7 +144,7 @@ const tinyJpeg =
 
   // 越权
   const denied = await call('users/list', undefined, clerkSession);
-  check('客户端远程越权被拒绝', denied.body.ok === false && /仅管理员/.test(denied.body.message || ''));
+  check('客户端远程越权被拒绝', denied.body.ok === false && /系统管理员/.test(denied.body.message || ''), denied.body.message);
 
   // 日志与总览
   const logs = await call('logs/list', { silent: true }, session);
@@ -186,7 +186,7 @@ const tinyJpeg =
     JSON.stringify(fuEmpty.body.data.files));
 
   const fuNoPerm = await call('system/setForceUpdate', { enabled: true, fileName: INSTALLER }, clerkSession);
-  check('客户端账号无权设置强制推送', fuNoPerm.body.ok === false && /仅管理员/.test(fuNoPerm.body.message || ''),
+  check('客户端账号无权设置强制推送', fuNoPerm.body.ok === false && /系统管理员/.test(fuNoPerm.body.message || ''),
     fuNoPerm.body.message);
 
   const fuBadFile = await call('system/setForceUpdate', { enabled: true, fileName: 'not-exist-9.9.9.exe' }, session);

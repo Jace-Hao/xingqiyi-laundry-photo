@@ -38,6 +38,93 @@ function fmtSize(n) {
   return (n / 1048576).toFixed(1) + ' MB';
 }
 
+// 四级角色中文标签（单一数据源，供各页面共用）。
+// 同时兼容 v1.0.0 的旧角色值（admin/client），升级后旧数据也能正常显示。
+const ROLE_LABELS = {
+  sysadmin: '系统管理员',
+  storeadmin: '门店管理员',
+  capture: '拍照账号',
+  query: '查询账号',
+  // 旧值兼容
+  admin: '系统管理员',
+  client: '拍照账号'
+};
+
+function roleLabel(role) {
+  const r = String(role || '').trim();
+  return ROLE_LABELS[r] || r || '-';
+}
+
+// 是否系统管理员（兼容旧 admin 值）
+function isSysAdminRole(role) {
+  return role === 'sysadmin' || role === 'admin';
+}
+
+// 角色标签配色：系统管理员沿用原「管理员」的橙色，门店管理员用主色蓝，
+// 拍照账号用绿色（可录入），查询账号用灰色（只读）。
+// 不用红色——红色在本系统中表示「停用/失败」，混用会造成误读。
+function roleTagClass(role) {
+  if (isSysAdminRole(role)) return 'tag-orange';
+  if (role === 'storeadmin') return '';
+  if (role === 'capture') return 'tag-green';
+  return 'tag-gray';
+}
+
+/** 水印用的拍照时间文本，如 2026-09-20 14:05 */
+function watermarkTimeText(d) {
+  const dt = d || new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return (
+    dt.getFullYear() + '-' + p(dt.getMonth() + 1) + '-' + p(dt.getDate()) +
+    ' ' + p(dt.getHours()) + ':' + p(dt.getMinutes())
+  );
+}
+
+/**
+ * 在照片右上角绘制「拍照时间」水印。
+ *
+ * 设计要点：
+ * - 字号按图像短边比例缩放（约 2.2%），摄像头可能是 4000×3000，
+ *   固定像素字号在高分辨率下会小到无法辨认；
+ * - 半透明深色底 + 白字，兼顾浅色衣物与深色衣物背景下的可读性；
+ * - 水印在拍照时就烧录进 JPEG，因此导出/打印的照片同样带有存证时间。
+ */
+function drawTimeWatermark(ctx, width, height, timeText) {
+  if (!ctx || !width || !height) return;
+  const shortSide = Math.min(width, height);
+  const fontSize = Math.max(12, Math.round(shortSide * 0.022));
+  const padX = Math.round(fontSize * 0.7);
+  const padY = Math.round(fontSize * 0.42);
+  const margin = Math.round(shortSide * 0.018);
+
+  ctx.save();
+  ctx.font = '600 ' + fontSize + 'px "Microsoft YaHei", "PingFang SC", sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+
+  const textWidth = ctx.measureText(timeText).width;
+  const boxW = Math.ceil(textWidth + padX * 2);
+  const boxH = Math.ceil(fontSize + padY * 2);
+  const boxX = Math.max(0, width - boxW - margin);
+  const boxY = Math.max(0, margin);
+
+  // 半透明深色底，保证在浅色衣物上也能看清
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.52)';
+  const radius = Math.max(2, Math.round(fontSize * 0.22));
+  ctx.beginPath();
+  if (ctx.roundRect) {
+    ctx.roundRect(boxX, boxY, boxW, boxH, radius);
+  } else {
+    // 老版本 Chromium 没有 roundRect，退回直角矩形
+    ctx.rect(boxX, boxY, boxW, boxH);
+  }
+  ctx.fill();
+
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.96)';
+  ctx.fillText(timeText, boxX + padX, boxY + boxH / 2);
+  ctx.restore();
+}
+
 /**
  * 共用的「版本与安装包下载」逻辑。
  * 登录页、客户端设置页、管理端系统设置页都要展示当前版本并支持一键下载安装包，
@@ -544,6 +631,13 @@ const HomePage = {
     const recent = Vue.ref([]);
     const detail = Vue.ref(null);
 
+    // 拍照能力由角色派生：查询账号与门店管理员没有拍照入口，
+    // 首页不能显示会跳转到不存在页面的快捷卡片
+    const canCapture = Vue.computed(() => !!(props.user && props.user.permissions && props.user.permissions.capture));
+    const isStoreAdmin = Vue.computed(() => props.user && props.user.role === 'storeadmin');
+    // 门店管理员看到的是本店全部订单，统计口径文案需据实说明
+    const countLabel = Vue.computed(() => (isStoreAdmin.value ? '本店订单总数' : '我的存档总数'));
+
     async function load() {
       const r = await window.api.listRecords(props.token, { page: 1, pageSize: 100, silent: true });
       if (r.ok) {
@@ -561,37 +655,42 @@ const HomePage = {
     }
 
     Vue.onMounted(load);
-    return { user: props.user, stats, recent, detail, openDetail, fmt };
+    return {
+      user: props.user, stats, recent, detail, openDetail, fmt,
+      canCapture, isStoreAdmin, countLabel, roleLabel
+    };
   },
   template: `
     <div>
       <div class="page-head">
         <h2>你好，{{ user.name || user.username }}</h2>
-        <p>欢迎使用星期衣精致洗衣衣物照片系统，收衣拍照留存，取衣核对更放心</p>
+        <p>{{ roleLabel(user.role) }} · 欢迎使用星期衣精致洗衣衣物照片系统</p>
       </div>
 
       <div class="stat-row">
-        <div class="stat-card"><div class="lbl">我的存档总数</div><div class="num">{{ stats.myCount }}</div></div>
+        <div class="stat-card"><div class="lbl">{{ countLabel }}</div><div class="num">{{ stats.myCount }}</div></div>
         <div class="stat-card"><div class="lbl">今日新增（最近 100 条内）</div><div class="num">{{ stats.todayCount }}</div></div>
         <div class="stat-card"><div class="lbl">当前账号</div><div class="num" style="font-size:19px;padding-top:10px">{{ user.username }}</div></div>
       </div>
 
       <div class="quick-row">
-        <button class="quick-card" @click="$emit('goto', 'capture')">
+        <button v-if="canCapture" class="quick-card" @click="$emit('goto', 'capture')">
           <div class="t">📷 衣物拍照</div>
           <div class="d">扫描或输入衣物条形码，拍摄最大分辨率照片存档</div>
         </button>
         <button class="quick-card" @click="$emit('goto', 'query')">
-          <div class="t">🔍 记录查询</div>
-          <div class="d">按条形码、备注、日期查找已存档的照片</div>
+          <div class="t">{{ isStoreAdmin ? '🗂️ 本店订单' : '🔍 记录查询' }}</div>
+          <div class="d">{{ isStoreAdmin ? '查看本门店所有账号登记的衣物存档数据' : '按条形码、备注、日期查找已存档的照片' }}</div>
         </button>
       </div>
 
       <h3 class="section-title">最近存档</h3>
-      <div v-if="!recent.length" class="card empty">还没有存档记录，去「衣物拍照」添加第一张照片吧</div>
+      <div v-if="!recent.length" class="card empty">
+        {{ canCapture ? '还没有存档记录，去「衣物拍照」添加第一张照片吧' : '还没有存档记录' }}
+      </div>
       <div v-else class="record-grid">
         <div v-for="r in recent" :key="r.id" class="record-card" @click="openDetail(r)">
-          <div class="record-photo"><img :src="r.photoUrl" /></div>
+          <div class="record-photo"><img :src="r.photoUrl" loading="lazy" decoding="async" /></div>
           <div class="record-meta">
             <div class="record-customer">{{ r.barcode }}</div>
             <div class="record-tags">
@@ -750,11 +849,17 @@ const CapturePage = {
         toast('摄像头画面未就绪', 'error');
         return;
       }
+      // 时间取拍摄这一刻：连拍时每张各自记录自己的拍摄时间，
+      // 不能等到统一保存时才取时间，否则连拍的多张会显示同一时刻
+      const shotAt = new Date();
       // 按摄像头当前（最大）分辨率绘制，不做缩放
       const canvas = document.createElement('canvas');
       canvas.width = v.videoWidth;
       canvas.height = v.videoHeight;
-      canvas.getContext('2d').drawImage(v, 0, 0);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(v, 0, 0);
+      // 右上角烧录拍照时间水印：存进照片本身，导出/打印后依然可见
+      drawTimeWatermark(ctx, canvas.width, canvas.height, watermarkTimeText(shotAt));
       shots.value.push(canvas.toDataURL('image/jpeg', 0.92));
       if (!resolution.value) resolution.value = v.videoWidth + ' × ' + v.videoHeight;
     }
@@ -982,7 +1087,10 @@ const CapturePage = {
 const QueryPage = {
   props: {
     token: { type: String, required: true },
-    adminMode: { type: Boolean, default: false }
+    adminMode: { type: Boolean, default: false },
+    // 门店管理员视图：可见本店全部订单，但无账号管理与全店筛选能力
+    storeMode: { type: Boolean, default: false },
+    user: { type: Object, default: null }
   },
   setup(props) {
     const keyword = Vue.ref('');
@@ -990,6 +1098,7 @@ const QueryPage = {
     const dateFrom = Vue.ref('');
     const dateTo = Vue.ref('');
     const userIdFilter = Vue.ref('all');
+    const storeFilter = Vue.ref('all');
     const users = Vue.ref([]);
     const items = Vue.ref([]);
     const total = Vue.ref(0);
@@ -1296,6 +1405,31 @@ const QueryPage = {
       if (r.ok) users.value = r.data;
     }
 
+    // 门店筛选候选：从账号列表汇总已用过的门店名（仅管理端可见）
+    const storeOptions = Vue.computed(() => {
+      const set = new Set();
+      for (const u of users.value) {
+        const s = String(u.store || '').trim();
+        if (s) set.add(s);
+      }
+      return [...set].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+    });
+
+    // 客户端模式下区分「本人录入」与「同店他人录入」，避免误删他人订单
+    const myId = Vue.computed(() => (props.user && props.user.id) || '');
+    function isMine(r) {
+      return !!r && !!myId.value && r.userId === myId.value;
+    }
+
+    // 能否删除：系统管理员可删任意记录；能拍照录入的账号（拍照账号）才有自己的记录可删。
+    // 门店管理员与查询账号不录入订单，永远没有本人记录，批量删除对其无意义且必然失败，
+    // 因此不显示勾选框与批量删除按钮（后端同样会逐条拦截越权删除）。
+    const canDelete = Vue.computed(() => {
+      if (props.adminMode) return true;
+      const u = props.user || {};
+      return !!(u.permissions && u.permissions.capture);
+    });
+
     async function search(reset) {
       if (reset) page.value = 1;
       loading.value = true;
@@ -1306,6 +1440,7 @@ const QueryPage = {
           dateFrom: dateFrom.value,
           dateTo: dateTo.value,
           userId: userIdFilter.value,
+          storeFilter: storeFilter.value,
           page: page.value,
           pageSize: pageSize.value
         });
@@ -1329,6 +1464,7 @@ const QueryPage = {
       dateFrom.value = '';
       dateTo.value = '';
       userIdFilter.value = 'all';
+      storeFilter.value = 'all';
       search(true);
     }
 
@@ -1404,9 +1540,17 @@ const QueryPage = {
 
     Vue.onMounted(() => {
       loadUsers();
-      // 首屏先按容器尺寸计算每页数量，再查询
-      Vue.nextTick(() => recalcPageSize());
+      // 首屏必须先按容器尺寸算出每页数量再查询。
+      // 此前的写法把 recalcPageSize 放在 nextTick 里、而 search 同步执行，
+      // 导致首次查询仍用初始的 12 张，之后虽改了 pageSize 却不再重查（页面大小变化不生效）。
+      recalcPageSize();
       search(true);
+      // 布局可能在挂载后才稳定，补算一次；数量有变化则重新查询
+      Vue.nextTick(() => {
+        const before = pageSize.value;
+        recalcPageSize();
+        if (pageSize.value !== before) search(true);
+      });
       window.addEventListener('resize', onResize);
       window.addEventListener('keydown', onKeydown);
       document.addEventListener('mousemove', onDocMouseMove);
@@ -1423,6 +1567,7 @@ const QueryPage = {
 
     return {
       keyword, barcodeFilter, dateFrom, dateTo, userIdFilter, users, items, total,
+      storeFilter, storeOptions, isMine, canDelete,
       page, pageSize, totalPages, loading, detail, detailIndex, gridEl,
       selected, batchDeleting, toggleSelect, selectAll, batchDelete,
       exporting, exportByBarcode, exportByDate,
@@ -1431,14 +1576,14 @@ const QueryPage = {
       zoomScale, panX, panY, imgLoaded, imgNatural,
       closeDetail, prevPhoto, nextPhoto, zoomIn, zoomOut, zoomReset,
       onWheel, onImgMouseDown, onImgDblClick, onImgLoad,
-      adminMode: props.adminMode
+      adminMode: props.adminMode, storeMode: props.storeMode
     };
   },
   template: `
     <div>
       <div class="page-head">
-        <h2>{{ adminMode ? '数据查看' : '记录查询' }}</h2>
-        <p>{{ adminMode ? '查看系统中所有账号登记的衣物存档数据' : '按条形码、备注、日期查找您存档的照片' }}</p>
+        <h2>{{ adminMode ? '数据查看' : (storeMode ? '本店订单' : '记录查询') }}</h2>
+        <p>{{ adminMode ? '查看系统中所有门店账号登记的衣物存档数据' : (storeMode ? '查看本门店所有账号登记的衣物存档数据' : '按条形码、备注、日期查找本店存档的照片') }}</p>
       </div>
 
       <div class="card">
@@ -1466,20 +1611,27 @@ const QueryPage = {
               <option v-for="u in users" :key="u.id" :value="u.id">{{ u.username }}（{{ u.name }}）</option>
             </select>
           </div>
+          <div v-if="adminMode" class="f-item f-user">
+            <label>所属门店</label>
+            <select v-model="storeFilter">
+              <option value="all">全部门店</option>
+              <option v-for="s in storeOptions" :key="s" :value="s">{{ s }}</option>
+            </select>
+          </div>
           <button class="btn btn-primary" @click="search(true)">查询</button>
           <button class="btn btn-ghost" @click="reset">重置</button>
         </div>
 
         <div class="batch-bar" v-if="items.length">
-          <label class="batch-check"><input type="checkbox" :checked="selected.length === items.length && items.length > 0" @change="selectAll" />全选本页</label>
-          <span class="pager-info">已选 {{ selected.length }} 条</span>
+          <label v-if="canDelete" class="batch-check"><input type="checkbox" :checked="selected.length === items.length && items.length > 0" @change="selectAll" />全选本页</label>
+          <span v-if="canDelete" class="pager-info">已选 {{ selected.length }} 条</span>
           <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="exportByBarcode">
             {{ exporting ? '导出中…' : '⬇ 按订单号批量下载' }}
           </button>
           <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="exportByDate" title="按上方日期范围导出照片，并生成条码+文件位置表格">
             ⬇ 按日期导出
           </button>
-          <button class="btn btn-danger btn-sm" :disabled="!selected.length || batchDeleting" @click="batchDelete">
+          <button v-if="canDelete" class="btn btn-danger btn-sm" :disabled="!selected.length || batchDeleting" @click="batchDelete">
             {{ batchDeleting ? '删除中…' : '批量删除' }}
           </button>
         </div>
@@ -1489,16 +1641,21 @@ const QueryPage = {
           <div v-else-if="!items.length" class="empty">暂无符合条件的存档记录</div>
           <div v-else class="record-grid">
             <div v-for="r in items" :key="r.id" class="record-card" @click="openDetail(r)">
-              <div class="record-photo"><img :src="r.photoUrl" /></div>
+              <div class="record-photo"><img :src="r.photoUrl" loading="lazy" decoding="async" /></div>
               <div class="record-meta">
                 <div class="record-customer">{{ r.barcode }}</div>
                 <div class="record-tags">
                   <span class="tag tag-orange">第 {{ r.seq }} 张</span>
-                  <span v-if="adminMode" class="tag tag-owner">{{ r.username }}</span>
+                  <span
+                    v-if="adminMode || !isMine(r)"
+                    class="tag tag-owner"
+                    :title="isMine(r) ? '本人录入' : '同门店同事录入'"
+                  >{{ r.username }}</span>
+                  <span v-if="adminMode && r.storeName" class="tag">{{ r.storeName }}</span>
                 </div>
                 <div class="record-time">{{ fmt(r.createdAt) }}</div>
               </div>
-              <label class="card-check" :class="{ on: selected.includes(r.id) }" @click.stop>
+              <label v-if="canDelete" class="card-check" :class="{ on: selected.includes(r.id) }" @click.stop>
                 <input type="checkbox" :checked="selected.includes(r.id)" @change="toggleSelect(r)" />
               </label>
             </div>
@@ -1518,7 +1675,8 @@ const QueryPage = {
           <div class="lightbox-info">
             <span class="lightbox-barcode">{{ detail.barcode }}</span>
             <span class="lightbox-seq">第 {{ detail.seq }} 张</span>
-            <span v-if="adminMode" class="lightbox-owner">{{ detail.username }}</span>
+            <span v-if="adminMode || !isMine(detail)" class="lightbox-owner">{{ detail.username }}</span>
+            <span v-if="adminMode && detail.storeName" class="lightbox-owner">门店：{{ detail.storeName }}</span>
             <span class="lightbox-time">{{ fmt(detail.createdAt) }}</span>
             <span v-if="detail.note" class="lightbox-note" :title="detail.note">备注：{{ detail.note }}</span>
             <span v-if="imgNatural.w" class="lightbox-dim">{{ imgNatural.w }}×{{ imgNatural.h }}</span>
@@ -1565,7 +1723,12 @@ const QueryPage = {
           <button class="lightbox-btn" title="实际大小（0）" @click="zoomReset">1:1</button>
           <button class="lightbox-btn" title="放大（+）" @click="zoomIn">＋</button>
           <span class="lightbox-hint">滚轮缩放 · 拖拽平移 · 双击放大 · ←/→ 切换 · Esc 关闭</span>
-          <button class="lightbox-btn lightbox-danger" @click="remove(detail)">删除记录</button>
+          <button
+            v-if="adminMode || isMine(detail)"
+            class="lightbox-btn lightbox-danger"
+            @click="remove(detail)"
+          >删除记录</button>
+          <span v-else class="lightbox-hint">该记录由同门店同事录入，仅可查看与导出，不可删除</span>
         </div>
       </div>
     </div>
@@ -1619,8 +1782,17 @@ const SettingsPage = {
       }
     }
 
+    // 所属门店：只读展示，由系统管理员在「用户与权限管理」中分配
+    const storeLabel = Vue.computed(() => {
+      const u = props.user || {};
+      if (isSysAdminRole(u.role)) return '不限（可查看全部记录）';
+      const s = String(u.store || '').trim();
+      if (!s) return u.role === 'storeadmin' ? '未分配（异常配置，请联系系统管理员）' : '未分配（仅可见本人记录）';
+      return s + (u.role === 'storeadmin' ? '（可见本店全部记录）' : '（可见同店记录）');
+    });
+
     return {
-      user: props.user, oldPassword, newPassword, confirmPassword, saving, submit, fmt,
+      user: props.user, oldPassword, newPassword, confirmPassword, saving, submit, fmt, storeLabel, roleLabel,
       version, updateInfo, downloading, canAutoDownload, progressPercent, progressText,
       downloadPackage, cancelDownload
     };
@@ -1637,7 +1809,8 @@ const SettingsPage = {
           <div class="card-title">👤 账号信息</div>
           <div class="info-row"><span>账号</span><b>{{ user.username }}</b></div>
           <div class="info-row"><span>姓名</span><b>{{ user.name }}</b></div>
-          <div class="info-row"><span>角色</span><b>{{ user.role === 'admin' ? '管理员' : '客户端账号' }}</b></div>
+          <div class="info-row"><span>角色</span><b>{{ roleLabel(user.role) }}</b></div>
+          <div class="info-row"><span>所属门店</span><b>{{ storeLabel }}</b></div>
           <div class="info-row"><span>拍照权限</span><b>{{ user.permissions && user.permissions.capture ? '已开通' : '未开通' }}</b></div>
           <div class="info-row"><span>查询权限</span><b>{{ user.permissions && user.permissions.query ? '已开通' : '未开通' }}</b></div>
           <div class="info-row"><span>创建时间</span><b>{{ fmt(user.createdAt) }}</b></div>
@@ -1697,7 +1870,20 @@ const AdminOverviewPage = {
     }
 
     Vue.onMounted(load);
-    return { o, fmt };
+
+    // 四级角色构成：按固定顺序展示，后端 overview 返回 roleCount；
+    // 旧版后端未返回该字段时退化为 0，避免模板渲染 undefined
+    const ROLE_ORDER = ['sysadmin', 'storeadmin', 'capture', 'query'];
+    const roleBreakdown = Vue.computed(() => {
+      const counts = (o.value && o.value.roleCount) || {};
+      return ROLE_ORDER.map((key) => ({
+        key,
+        label: roleLabel(key),
+        count: Number(counts[key]) || 0
+      }));
+    });
+
+    return { o, fmt, roleBreakdown };
   },
   template: `
     <div>
@@ -1713,12 +1899,21 @@ const AdminOverviewPage = {
         <div class="stat-card"><div class="lbl">今日新增存档</div><div class="num">{{ o.todayRecordCount }}</div></div>
       </div>
 
+      <!-- 四级角色构成：让系统管理员掌握账号分布（后端 overview 的 roleCount） -->
+      <h3 class="section-title">账号角色构成</h3>
+      <div v-if="o" class="overview-grid">
+        <div v-for="r in roleBreakdown" :key="r.key" class="stat-card">
+          <div class="lbl">{{ r.label }}</div>
+          <div class="num">{{ r.count }}</div>
+        </div>
+      </div>
+
       <h3 class="section-title">最近存档</h3>
       <div class="card">
         <div v-if="o && !o.recentRecords.length" class="empty">暂无存档记录</div>
         <div v-else-if="o" class="record-grid">
           <div v-for="r in o.recentRecords" :key="r.id" class="record-card" style="cursor:default">
-            <div class="record-photo"><img :src="r.photoUrl" /></div>
+            <div class="record-photo"><img :src="r.photoUrl" loading="lazy" decoding="async" /></div>
             <div class="record-meta">
               <div class="record-customer">{{ r.barcode }}</div>
               <div class="record-tags">
@@ -1762,10 +1957,54 @@ const AdminUsersPage = {
     const form = Vue.ref(emptyForm());
     const saving = Vue.ref(false);
 
+    // 四级角色清单与能力矩阵：从后端取（单一数据源），
+    // 避免前端硬编码一份而与后端权限判定脱节
+    const roleOptions = Vue.ref([
+      { value: 'sysadmin', label: '系统管理员' },
+      { value: 'storeadmin', label: '门店管理员' },
+      { value: 'capture', label: '拍照账号' },
+      { value: 'query', label: '查询账号' }
+    ]);
+    const roleDefs = Vue.ref({});
+
+    async function loadRoles() {
+      try {
+        const r = await window.api.roleOptions();
+        if (r.ok && r.data) {
+          if (Array.isArray(r.data.roles) && r.data.roles.length) roleOptions.value = r.data.roles;
+          if (r.data.defs) roleDefs.value = r.data.defs;
+        }
+      } catch (e) {
+        /* 拉取失败时退回内置清单，不影响账号管理 */
+      }
+    }
+
+    // 当前所选角色的派生权限（只读展示用）
+    const derivedPermissions = Vue.computed(() => {
+      const def = roleDefs.value[form.value.role];
+      if (def) return { capture: !!def.capture, query: !!def.query };
+      // 后端能力矩阵未加载到时的兜底，与后端 ROLES 定义保持一致
+      if (isSysAdminRole(form.value.role)) return { capture: true, query: true };
+      if (form.value.role === 'query') return { capture: false, query: true };
+      if (form.value.role === 'storeadmin') return { capture: false, query: true };
+      return { capture: true, query: true };
+    });
+
+    // 角色能力说明：让管理员在选择时就明白各角色能做什么
+    const roleHint = Vue.computed(() => {
+      const hints = {
+        sysadmin: '可查看全部与全部门店的订单、设置账号与权限、查看所有门店操作日志、修改系统设置。无需分配门店。',
+        storeadmin: '可查看本门店全部订单与本门店操作日志，不能拍照录入、不能管理账号、不能删除订单。必须分配门店。',
+        capture: '可拍照录入订单，并查询本人与同门店同事的订单。不能查看操作日志、不能管理账号。',
+        query: '仅可查询本人与同门店同事的订单，不能拍照录入。不能查看操作日志、不能管理账号。'
+      };
+      return hints[form.value.role] || '权限由角色决定。';
+    });
+
     function emptyForm() {
       return {
-        id: '', username: '', name: '', role: 'client',
-        password: '', newPassword: '', active: true,
+        id: '', username: '', name: '', role: 'capture',
+        password: '', newPassword: '', active: true, store: '',
         permissions: { capture: true, query: true }
       };
     }
@@ -1790,6 +2029,7 @@ const AdminUsersPage = {
         password: '',
         newPassword: '',
         active: u.active,
+        store: u.store || '',
         permissions: { capture: !!u.permissions.capture, query: !!u.permissions.query }
       };
       modal.value = 'edit';
@@ -1797,6 +2037,13 @@ const AdminUsersPage = {
 
     async function submit() {
       const f = form.value;
+      // 门店管理员必须分配门店：先在前端拦住，给出明确提示（后端同样校验）
+      if (f.role === 'storeadmin' && !String(f.store || '').trim()) {
+        toast('门店管理员必须分配门店', 'error');
+        return;
+      }
+      // 权限由角色决定，提交派生值而不是表单勾选值（表单已不再提供勾选）
+      const perms = derivedPermissions.value;
       saving.value = true;
       try {
         let r;
@@ -1807,8 +2054,9 @@ const AdminUsersPage = {
             f.name,
             f.role,
             f.password,
-            f.permissions.capture,
-            f.permissions.query
+            perms.capture,
+            perms.query,
+            f.store
           );
         } else {
           r = await window.api.updateUser(
@@ -1817,9 +2065,10 @@ const AdminUsersPage = {
             f.name,
             f.role,
             f.active,
-            f.permissions.capture,
-            f.permissions.query,
-            f.newPassword
+            perms.capture,
+            perms.query,
+            f.newPassword,
+            f.store
           );
         }
         if (r.ok) {
@@ -1861,8 +2110,26 @@ const AdminUsersPage = {
       }
     }
 
-    Vue.onMounted(load);
-    return { users, modal, form, saving, openCreate, openEdit, submit, toggleActive, remove, fmt };
+    // 门店候选：从现有账号中汇总已用过的门店名，便于选择、减少拼写不一致
+    const storeOptions = Vue.computed(() => {
+      const set = new Set();
+      for (const u of users.value) {
+        const s = String(u.store || '').trim();
+        if (s) set.add(s);
+      }
+      return [...set].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+    });
+
+    Vue.onMounted(() => {
+      loadRoles();
+      load();
+    });
+    return {
+      users, modal, form, saving, storeOptions,
+      roleOptions, derivedPermissions, roleHint,
+      openCreate, openEdit, submit, toggleActive, remove,
+      fmt, roleLabel, roleTagClass, isSysAdminRole
+    };
   },
   template: `
     <div>
@@ -1881,7 +2148,7 @@ const AdminUsersPage = {
           <table>
             <thead>
               <tr>
-                <th>用户名</th><th>姓名</th><th>角色</th><th>功能权限</th>
+                <th>用户名</th><th>姓名</th><th>角色</th><th>门店</th><th>功能权限</th>
                 <th>状态</th><th>创建时间</th><th>最近登录</th><th>操作</th>
               </tr>
             </thead>
@@ -1889,12 +2156,20 @@ const AdminUsersPage = {
               <tr v-for="u in users" :key="u.id">
                 <td><b>{{ u.username }}</b></td>
                 <td>{{ u.name }}</td>
-                <td><span class="tag" :class="u.role === 'admin' ? 'tag-orange' : 'tag-gray'">{{ u.role === 'admin' ? '管理员' : '客户端' }}</span></td>
+                <td><span class="tag" :class="roleTagClass(u.role)">{{ roleLabel(u.role) }}</span></td>
                 <td>
-                  <span v-if="u.role === 'admin'" class="tag tag-gray">全部功能</span>
+                  <span v-if="u.store" class="tag">{{ u.store }}</span>
+                  <span v-else-if="isSysAdminRole(u.role)" class="tag tag-gray">不限（可见全部）</span>
+                  <span v-else-if="u.role === 'storeadmin'" class="tag tag-red">未分配（异常）</span>
+                  <span v-else style="color:#9aa0a6">未分配</span>
+                </td>
+                <td>
+                  <!-- 权限由角色派生，此处仅做只读展示，不可单独勾选 -->
+                  <span v-if="isSysAdminRole(u.role)" class="tag tag-gray">全部功能</span>
                   <template v-else>
                     <span class="tag" :class="u.permissions.capture ? 'tag-green' : 'tag-gray'">拍照 {{ u.permissions.capture ? '开' : '关' }}</span>
                     <span class="tag" :class="u.permissions.query ? 'tag-green' : 'tag-gray'" style="margin-left:4px">查询 {{ u.permissions.query ? '开' : '关' }}</span>
+                    <span v-if="u.role === 'storeadmin'" class="tag tag-orange" style="margin-left:4px">本店日志</span>
                   </template>
                 </td>
                 <td><span class="tag" :class="u.active ? 'tag-green' : 'tag-red'">{{ u.active ? '启用' : '停用' }}</span></td>
@@ -1926,9 +2201,23 @@ const AdminUsersPage = {
             <input v-model="form.name" placeholder="用于界面显示" />
             <label>角色</label>
             <select v-model="form.role">
-              <option value="client">客户端（店员）</option>
-              <option value="admin">管理员</option>
+              <option v-for="r in roleOptions" :key="r.value" :value="r.value">{{ r.label }}</option>
             </select>
+            <div class="form-hint">{{ roleHint }}</div>
+            <label>所属门店{{ form.role === 'storeadmin' ? '（必填）' : '' }}</label>
+            <input
+              v-model="form.store"
+              list="store-options"
+              maxlength="40"
+              :placeholder="form.role === 'storeadmin' ? '如：人民路店（门店管理员必须分配）' : '如：人民路店（留空表示不归属任何门店）'"
+            />
+            <datalist id="store-options">
+              <option v-for="s in storeOptions" :key="s" :value="s"></option>
+            </datalist>
+            <div class="form-hint">
+              同一门店的账号可互相查询彼此的订单照片；门店名称必须完全一致才会归为同店。
+              系统管理员可查看全部记录，无需分配门店。
+            </div>
             <template v-if="modal === 'create'">
               <label>初始密码（至少 6 位）</label>
               <input v-model="form.password" type="password" placeholder="请设置初始密码" />
@@ -1940,10 +2229,17 @@ const AdminUsersPage = {
                 <label><input type="checkbox" v-model="form.active" />账号启用</label>
               </div>
             </template>
-            <label>功能权限（客户端账号生效）</label>
+            <!-- 权限由角色固定派生，不再提供勾选：避免出现「门店管理员可拍照」这类与角色矛盾的账号 -->
+            <label>功能权限（由角色决定，不可单独修改）</label>
             <div class="check-row">
-              <label><input type="checkbox" v-model="form.permissions.capture" />衣物拍照</label>
-              <label><input type="checkbox" v-model="form.permissions.query" />记录查询</label>
+              <span class="tag" :class="derivedPermissions.capture ? 'tag-green' : 'tag-gray'">
+                拍照 {{ derivedPermissions.capture ? '开' : '关' }}
+              </span>
+              <span class="tag" :class="derivedPermissions.query ? 'tag-green' : 'tag-gray'" style="margin-left:4px">
+                查询 {{ derivedPermissions.query ? '开' : '关' }}
+              </span>
+              <span v-if="form.role === 'storeadmin'" class="tag tag-orange" style="margin-left:4px">本店日志</span>
+              <span v-if="isSysAdminRole(form.role)" class="tag tag-gray" style="margin-left:4px">账号与系统设置</span>
             </div>
           </div>
           <div class="modal-foot">
@@ -1960,7 +2256,11 @@ const AdminUsersPage = {
 
 /* ---------- 管理端 · 操作日志 ---------- */
 const AdminLogsPage = {
-  props: { token: { type: String, required: true } },
+  props: {
+    token: { type: String, required: true },
+    // Shell 统一向各页面传入 user；日志页用其角色区分「本店日志」与「全部日志」的范围说明
+    user: { type: Object, default: null }
+  },
   setup(props) {
     const keyword = Vue.ref('');
     const action = Vue.ref('all');
@@ -1973,16 +2273,28 @@ const AdminLogsPage = {
     const page = Vue.ref(1);
     const pageSize = 20;
     const loading = Vue.ref(false);
-    const actions = [
-      '登录', '登录失败', '退出登录', '修改密码',
-      '新增存档', '删除存档', '查询记录', '查看记录',
-      '新增用户', '修改用户', '重置密码', '删除用户',
-      '查询日志', '修改端口', '重置连接码', '修改照片路径', '初始化'
-    ];
+    // 操作类型清单由后端提供（登记清单 ∪ 日志中实际出现过的类型），
+    // 前端不再硬编码，避免出现「新增条码」这类选项缺失的问题
+    const actions = Vue.ref([]);
+
+    async function loadActions() {
+      try {
+        const r = await window.api.logActionOptions(props.token);
+        if (r.ok && Array.isArray(r.data)) actions.value = r.data;
+      } catch (e) {
+        /* 拉取失败时下拉仅保留「全部操作」，不影响日志查询本身 */
+      }
+    }
 
     async function loadUsers() {
-      const r = await window.api.listUsers(props.token);
-      if (r.ok) users.value = r.data;
+      // 用日志专用接口而非 listUsers：门店管理员无账号管理权限，
+      // 且该接口已按角色收窄（系统管理员=全部，门店管理员=仅本店账号）
+      try {
+        const r = await window.api.logFilterUsers(props.token);
+        if (r.ok && Array.isArray(r.data)) users.value = r.data;
+      } catch (e) {
+        users.value = [];
+      }
     }
 
     async function search(reset) {
@@ -2037,21 +2349,26 @@ const AdminLogsPage = {
     }
 
     Vue.onMounted(() => {
+      loadActions();
       loadUsers();
       search(true);
     });
 
+    // 门店管理员只能看本店日志，标题据实说明范围，避免误以为在看全部
+    const isStoreAdmin = String((props.user && props.user.role) || '') === 'storeadmin';
+    const scopeText = isStoreAdmin ? '本门店账号' : '所有账号';
+
     return {
       keyword, action, userIdFilter, dateFrom, dateTo, users, items, total,
       page, pageSize, totalPages, loading, actions,
-      search, reset, prev, next, fmt
+      search, reset, prev, next, fmt, roleLabel, scopeText
     };
   },
   template: `
     <div>
       <div class="page-head">
         <h2>操作日志查询</h2>
-        <p>查询所有账号的登录与操作记录，支持按账号、操作类型、关键词和日期筛选</p>
+        <p>查询{{ scopeText }}的登录与操作记录，支持按账号、操作类型、关键词和日期筛选</p>
       </div>
 
       <div class="card">
@@ -2101,7 +2418,7 @@ const AdminLogsPage = {
                 <td>{{ fmt(l.time) }}</td>
                 <td><b>{{ l.username }}</b></td>
                 <td class="ip-cell">{{ l.ip || '-' }}</td>
-                <td>{{ l.role === 'admin' ? '管理员' : (l.role === 'client' ? '客户端' : l.role) }}</td>
+                <td>{{ roleLabel(l.role) }}</td>
                 <td>{{ l.module }}</td>
                 <td>{{ l.action }}</td>
                 <td><span class="tag" :class="l.result === '失败' ? 'tag-red' : 'tag-green'">{{ l.result }}</span></td>
@@ -2515,7 +2832,13 @@ const Shell = {
   props: { user: { type: Object, required: true }, token: { type: String, required: true }, mode: { type: String, default: '' } },
   emits: ['logout'],
   setup(props, { emit }) {
-    const isAdmin = props.user.role === 'admin';
+    // 四级角色决定可见菜单：
+    // 系统管理员=全部管理页；门店管理员=本店订单+本店日志（只查不拍）；
+    // 拍照账号=拍照+查询；查询账号=仅查询
+    const role = String((props.user && props.user.role) || '');
+    const isAdmin = isSysAdminRole(role);
+    const isStoreAdmin = role === 'storeadmin';
+    const canCapture = isAdmin || !!(props.user && props.user.permissions && props.user.permissions.capture);
     const version = Vue.ref('');
     const latestVersion = Vue.ref('');
     const hasUpdate = Vue.ref(false);
@@ -2574,24 +2897,48 @@ const Shell = {
       if (statusTimer) clearInterval(statusTimer);
     });
 
-    const pages = isAdmin
-      ? [
+    // ---------- 按角色装配菜单 ----------
+    // 系统管理员：数据总览 / 用户与权限 / 操作日志（全部）/ 数据查看（全部门店）/ 系统设置
+    // 门店管理员：首页 / 操作日志（仅本店）/ 订单查询（仅本店）/ 设置
+    // 拍照账号：首页 / 衣物拍照 / 记录查询 / 设置
+    // 查询账号：首页 / 记录查询 / 设置
+    const comps = {
+      home: HomePage,
+      capture: CapturePage,
+      query: QueryPage,
+      settings: SettingsPage,
+      overview: AdminOverviewPage,
+      users: AdminUsersPage,
+      logs: AdminLogsPage,
+      data: QueryPage,
+      system: AdminSystemPage
+    };
+
+    const pages = (() => {
+      if (isAdmin) {
+        return [
           { key: 'overview', icon: '📊', label: '数据总览' },
           { key: 'users', icon: '👥', label: '用户与权限' },
           { key: 'logs', icon: '📋', label: '操作日志' },
           { key: 'data', icon: '🗂️', label: '数据查看' },
           { key: 'system', icon: '🛠️', label: '系统设置' }
-        ]
-      : [
+        ];
+      }
+      if (isStoreAdmin) {
+        return [
           { key: 'home', icon: '🏠', label: '首页' },
-          { key: 'capture', icon: '📷', label: '衣物拍照' },
-          { key: 'query', icon: '🔍', label: '记录查询' },
+          { key: 'logs', icon: '📋', label: '本店日志' },
+          { key: 'query', icon: '🗂️', label: '本店订单' },
           { key: 'settings', icon: '⚙️', label: '设置' }
         ];
-
-    const comps = isAdmin
-      ? { overview: AdminOverviewPage, users: AdminUsersPage, logs: AdminLogsPage, data: QueryPage, system: AdminSystemPage }
-      : { home: HomePage, capture: CapturePage, query: QueryPage, settings: SettingsPage };
+      }
+      const list = [{ key: 'home', icon: '🏠', label: '首页' }];
+      // 拍照能力由角色派生，查询账号不显示拍照入口
+      if (canCapture) list.push({ key: 'capture', icon: '📷', label: '衣物拍照' });
+      list.push({ key: 'query', icon: '🔍', label: '记录查询' });
+      list.push({ key: 'settings', icon: '⚙️', label: '设置' });
+      return list;
+    })();
 
     const active = Vue.ref(pages[0].key);
 
@@ -2602,7 +2949,8 @@ const Shell = {
     }
 
     return {
-      user: props.user, mode: props.mode, isAdmin, pages, comps, active, doLogout, version,
+      user: props.user, mode: props.mode, isAdmin, isStoreAdmin, canCapture,
+      roleText: roleLabel(role), pages, comps, active, doLogout, version,
       latestVersion, hasUpdate,
       online, pending, syncing, doSync
     };
@@ -2614,7 +2962,7 @@ const Shell = {
           <img class="logo-brand" src="./assets/logo.png" alt="星期衣" />
           <div>
             <div class="brand-name">星期衣精致洗衣</div>
-            <div class="brand-sub">衣物照片系统 · {{ isAdmin ? '管理端' : '客户端' }}</div>
+            <div class="brand-sub">衣物照片系统 · {{ isAdmin ? '管理端' : (isStoreAdmin ? '门店管理' : '客户端') }}</div>
           </div>
         </div>
         <nav class="nav">
@@ -2633,7 +2981,7 @@ const Shell = {
             <div class="avatar">{{ (user.name || user.username).charAt(0) }}</div>
             <div>
               <div class="user-name">{{ user.name || user.username }}</div>
-              <div class="user-role">{{ isAdmin ? '管理员' : '店员账号' }} · {{ mode === 'client' ? '已连接服务器' : '本机服务端' }}</div>
+              <div class="user-role">{{ roleText }} · {{ mode === 'client' ? '已连接服务器' : '本机服务端' }}</div>
             </div>
           </div>
           <button class="btn btn-ghost btn-block" @click="doLogout">退出登录</button>
@@ -2657,6 +3005,7 @@ const Shell = {
           :user="user"
           :token="token"
           :admin-mode="isAdmin"
+          :store-mode="isStoreAdmin"
           @goto="active = $event"
         ></component>
       </main>

@@ -126,9 +126,80 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     return actual.length === exp.length && crypto.timingSafeEqual(actual, exp);
   }
 
+  /**
+   * 门店名规范化。
+   * 空串表示「未分配门店」——此时不参与同门店互查，避免两个未分配门店的账号
+   * 因为空值相等而互相看到对方全部存档。
+   */
+  function normalizeStore(v) {
+    const s = String(v === undefined || v === null ? '' : v).trim();
+    return s.length > 40 ? s.slice(0, 40) : s;
+  }
+
+  /**
+   * 四级角色与能力矩阵（单一数据源）。
+   * scope 决定订单/日志的可见范围：all = 全部门店，store = 仅本门店。
+   * 门店管理员按需求「只查不拍」：可查看本店订单与本店操作日志，不参与拍照录入。
+   */
+  const ROLES = {
+    sysadmin: { label: '系统管理员', capture: true, query: true, viewStoreLogs: true, manageUsers: true, systemSettings: true, scope: 'all' },
+    storeadmin: { label: '门店管理员', capture: false, query: true, viewStoreLogs: true, manageUsers: false, systemSettings: false, scope: 'store' },
+    capture: { label: '拍照账号', capture: true, query: true, viewStoreLogs: false, manageUsers: false, systemSettings: false, scope: 'store' },
+    query: { label: '查询账号', capture: false, query: true, viewStoreLogs: false, manageUsers: false, systemSettings: false, scope: 'store' }
+  };
+  const ROLE_KEYS = Object.keys(ROLES);
+  const ROLE_LABELS = ROLE_KEYS.map((k) => ({ value: k, label: ROLES[k].label }));
+
+  /** 角色能力定义；未知角色按最小权限处理（只能查询，不能拍照/管理） */
+  function roleDef(role) {
+    return ROLES[role] || { label: String(role || '-'), capture: false, query: true, viewStoreLogs: false, manageUsers: false, systemSettings: false, scope: 'store' };
+  }
+
+  /** 是否具备某项能力 */
+  function roleCan(role, cap) {
+    return !!roleDef(role)[cap];
+  }
+
+  /**
+   * 角色值规范化，同时兼容 v1.1.0 之前的旧角色（admin / client）。
+   * 旧 client 账号按其原有功能开关自动对应：拍照+查询 → 拍照账号；仅查询 → 查询账号；
+   * 仅拍照（旧版可配出的少见组合）→ 拍照账号（新模型下拍照账号本就含查询）。
+   */
+  function normalizeRole(role, permissions) {
+    const r = String(role || '').trim();
+    if (ROLE_KEYS.includes(r)) return r;
+    if (r === 'admin') return 'sysadmin';
+    const p = permissions || {};
+    if (r === 'client' || r === '') {
+      if (!p.query && p.capture) return 'capture';
+      if (p.query && !p.capture) return 'query';
+      return 'capture';
+    }
+    return 'query';
+  }
+
+  /** 是否系统管理员（兼容旧 admin 值，避免升级瞬间权限真空） */
+  function isSysAdmin(u) {
+    if (!u) return false;
+    return u.role === 'sysadmin' || u.role === 'admin';
+  }
+
+  /** 当前账号是否可见某条存档：本人存档，或与本人同门店（门店非空）的存档 */
+  function canViewRecord(me, r) {
+    if (!me) return false;
+    if (isSysAdmin(me)) return true;
+    if (r.userId === me.id) return true;
+    const myStore = normalizeStore(me.store);
+    return !!myStore && r.storeName === myStore;
+  }
+
   function publicUser(u) {
     const { passwordHash, salt, ...rest } = u;
-    return rest;
+    const role = normalizeRole(rest.role, rest.permissions);
+    const def = ROLES[role];
+    // permissions 与角色保持一致后回写，兼容仍读取该字段的旧客户端镜像
+    const permissions = def ? { capture: !!def.capture, query: !!def.query } : { capture: false, query: true };
+    return { ...rest, role, permissions, store: normalizeStore(rest.store), roleLabel: roleDef(role).label };
   }
 
   // ---------- 操作日志 ----------
@@ -186,16 +257,39 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     return u;
   }
 
+  /** 仅系统管理员：账号与权限设置、系统设置、全部门店数据与日志 */
   function requireSessionAdmin(token) {
     const u = requireSession(token);
-    if (u.role !== 'admin') throw new Error('无权限：仅管理员可执行该操作');
+    if (!isSysAdmin(u)) throw new Error('无权限：仅系统管理员可执行该操作');
     return u;
   }
 
+  /** 系统设置类操作（端口、连接码、照片路径、强制推送等） */
+  function requireSystemSettings(token) {
+    const u = requireSession(token);
+    if (!roleCan(u.role, 'systemSettings')) throw new Error('无权限：仅系统管理员可执行该操作');
+    return u;
+  }
+
+  /** 可查看操作日志的角色：系统管理员（全部）与门店管理员（本店） */
+  function requireLogViewer(token) {
+    const u = requireSession(token);
+    if (!roleCan(u.role, 'viewStoreLogs')) throw new Error('无权限：仅系统管理员或门店管理员可查看操作日志');
+    return u;
+  }
+
+  /**
+   * 功能权限校验：按角色能力矩阵判定，不再直接读 permissions 字段。
+   * 角色的能力是固定的（如门店管理员只查不拍），避免账号被配出与角色矛盾的权限。
+   */
   function requireSessionPermission(token, perm) {
     const u = requireSession(token);
-    if (u.role === 'admin') return u;
-    if (!u.permissions || !u.permissions[perm]) throw new Error('无权限：当前账号未开通该功能，请联系管理员');
+    const role = normalizeRole(u.role, u.permissions);
+    if (isSysAdmin(u)) return u;
+    if (!roleCan(role, perm)) {
+      const label = perm === 'capture' ? '衣物拍照' : '订单查询';
+      throw new Error(`无权限：${roleDef(role).label}不含「${label}」功能，请联系系统管理员`);
+    }
     return u;
   }
 
@@ -211,10 +305,11 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
         id: uid(),
         username: 'admin',
         name: '系统管理员',
-        role: 'admin',
+        role: 'sysadmin',
         salt,
         passwordHash: hashPassword('admin123', salt),
         permissions: { capture: true, query: true },
+        store: '',
         active: true,
         createdAt: now(),
         lastLoginAt: null,
@@ -224,12 +319,46 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       appendLog({
         userId: admin.id,
         username: 'admin',
-        role: 'admin',
+        role: 'sysadmin',
         module: '系统',
         action: '初始化',
-        detail: '首次启动，创建默认管理员账号 admin（初始密码 admin123）',
+        detail: '首次启动，创建默认系统管理员账号 admin（初始密码 admin123）',
         result: '成功'
       });
+    } else {
+      // 旧角色迁移（v1.0.0 → v1.1.0）：admin/client 二分改为四级角色。
+      // 按原有功能开关自动对应，升级后各账号实际能力与升级前一致，无需人工干预。
+      let roleMigrated = false;
+      for (const u of users) {
+        const oldRole = u.role;
+        const nextRole = normalizeRole(oldRole, u.permissions);
+        if (nextRole !== oldRole) {
+          u.role = nextRole;
+          roleMigrated = true;
+        }
+        // 权限与角色对齐（旧数据可能出现「查询账号却开着拍照」这类矛盾配置）
+        const def = roleDef(nextRole);
+        if (!u.permissions || u.permissions.capture !== !!def.capture || u.permissions.query !== !!def.query) {
+          u.permissions = { capture: !!def.capture, query: !!def.query };
+          roleMigrated = true;
+        }
+        if (u.store === undefined) {
+          u.store = '';
+          roleMigrated = true;
+        }
+      }
+      if (roleMigrated) {
+        saveUsers(users);
+        appendLog({
+          userId: null,
+          username: 'system',
+          role: 'sysadmin',
+          module: '系统',
+          action: '初始化',
+          detail: `升级迁移：将 ${users.length} 个账号的旧角色（admin/client）映射为四级角色，并按角色对齐功能权限`,
+          result: '成功'
+        });
+      }
     }
 
     // 旧版本数据迁移：早期记录以客户姓名索引，统一迁移为条形码索引并补编号
@@ -249,6 +378,17 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       if (r.seq !== seqCounter[r.barcode]) {
         r.seq = seqCounter[r.barcode];
         migrated = true;
+      }
+    }
+    // 门店字段迁移：老存档没有 storeName，按其所属账号当前门店回填，
+    // 使升级后历史照片同样能在同门店内互查
+    if (records.some((r) => r.storeName === undefined)) {
+      const storeByUserId = new Map(loadUsers().map((u) => [u.id, normalizeStore(u.store)]));
+      for (const r of records) {
+        if (r.storeName === undefined) {
+          r.storeName = storeByUserId.get(r.userId) || '';
+          migrated = true;
+        }
       }
     }
     if (migrated) saveRecords(records);
@@ -290,7 +430,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       ...logBase(user),
       module: '认证',
       action: '登录',
-      detail: `账号 ${user.username} 登录成功（进入${user.role === 'admin' ? '管理端' : '客户端'}）`,
+      detail: `账号 ${user.username} 登录成功（角色：${roleDef(normalizeRole(user.role, user.permissions)).label}）`,
       result: '成功'
     });
     return { user: publicUser(user), sessionToken };
@@ -371,6 +511,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       seq,
       userId: me.id,
       username: me.username,
+      storeName: normalizeStore(me.store),
       note: String(p.note || '').trim(),
       photoFile: `${safeBarcode}/${photoName}`,
       createdAt: now()
@@ -399,10 +540,16 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
 
   function listRecords(token, p = {}) {
     const me = requireSessionPermission(token, 'query');
-    const isAdmin = me.role === 'admin';
+    const isAdmin = isSysAdmin(me);
     let list = loadRecords();
-    if (!isAdmin) list = list.filter((r) => r.userId === me.id);
-    else if (p.userId && p.userId !== 'all') list = list.filter((r) => r.userId === p.userId);
+    // 非系统管理员的可见范围：本人存档 + 同门店（门店非空）的存档
+    // 门店管理员自身不录入订单，其可见范围即等于本门店全部订单
+    if (!isAdmin) list = list.filter((r) => canViewRecord(me, r));
+    else {
+      if (p.userId && p.userId !== 'all') list = list.filter((r) => r.userId === p.userId);
+      const sf = normalizeStore(p.storeFilter);
+      if (sf && sf !== 'all') list = list.filter((r) => normalizeStore(r.storeName) === sf);
+    }
 
     const barcodeFilter = String(p.barcode || '').trim().toLowerCase();
     if (barcodeFilter) list = list.filter((r) => String(r.barcode || '').toLowerCase() === barcodeFilter);
@@ -410,7 +557,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     const kw = String(p.keyword || '').trim().toLowerCase();
     if (kw) {
       list = list.filter((r) =>
-        [r.barcode, r.note, r.username].some((v) => String(v || '').toLowerCase().includes(kw))
+        [r.barcode, r.note, r.username, r.storeName].some((v) => String(v || '').toLowerCase().includes(kw))
       );
     }
     if (p.dateFrom) list = list.filter((r) => r.createdAt >= new Date(p.dateFrom + 'T00:00:00').toISOString());
@@ -440,10 +587,11 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     const me = requireSession(token);
     const r = loadRecords().find((x) => x.id === id);
     if (!r) throw new Error('记录不存在或已被删除');
-    if (me.role !== 'admin' && r.userId !== me.id) throw new Error('无权限查看该记录');
+    // 查看范围：本人或同门店（门店非空）均可查看；删除仍限本人与管理员，避免同事误删
+    if (!canViewRecord(me, r)) throw new Error('无权限查看该记录');
     appendLog({
       ...logBase(me),
-      module: me.role === 'admin' ? '数据查看' : '衣物查询',
+      module: isSysAdmin(me) ? '数据查看' : '衣物查询',
       action: '查看记录',
       detail: `查看存档详情：条码「${r.barcode}」第 ${r.seq} 张（所属账号 ${r.username}）`,
       result: '成功'
@@ -457,7 +605,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     const idx = records.findIndex((r) => r.id === id);
     if (idx === -1) throw new Error('记录不存在或已被删除');
     const r = records[idx];
-    if (me.role !== 'admin' && r.userId !== me.id) throw new Error('无权限删除该记录');
+    if (!isSysAdmin(me) && r.userId !== me.id) throw new Error('无权限删除该记录');
     records.splice(idx, 1);
     saveRecords(records);
     try {
@@ -467,7 +615,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     }
     appendLog({
       ...logBase(me),
-      module: me.role === 'admin' ? '数据管理' : '衣物查询',
+      module: isSysAdmin(me) ? '数据管理' : '衣物查询',
       action: '删除存档',
       detail: `删除衣物照片存档：条码「${r.barcode}」第 ${r.seq} 张（所属账号 ${r.username}）`,
       result: '成功'
@@ -490,7 +638,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
         kept.push(r);
         continue;
       }
-      if (me.role !== 'admin' && r.userId !== me.id) {
+      if (!isSysAdmin(me) && r.userId !== me.id) {
         skipped++;
         continue;
       }
@@ -505,7 +653,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     saveRecords(kept);
     appendLog({
       ...logBase(me),
-      module: me.role === 'admin' ? '数据管理' : '衣物查询',
+      module: isSysAdmin(me) ? '数据管理' : '衣物查询',
       action: '批量删除存档',
       detail: `批量删除衣物照片存档 ${deleted} 条${skipped ? `，跳过无权限 ${skipped} 条` : ''}`,
       result: '成功'
@@ -532,9 +680,9 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       ? [...new Set(p.barcodes.map((x) => String(x || '').trim()).filter(Boolean))]
       : [];
     let records = loadRecords();
-    const isAdmin = me.role === 'admin';
-    // 客户端账号只能导出自己的存档
-    if (!isAdmin) records = records.filter((r) => r.userId === me.id);
+    const isAdmin = isSysAdmin(me);
+    // 非系统管理员的导出范围：本人 + 同门店可见的存档
+    if (!isAdmin) records = records.filter((r) => canViewRecord(me, r));
     if (barcodes.length) {
       const set = new Set(barcodes.map((b) => b.toLowerCase()));
       records = records.filter((r) => set.has(String(r.barcode || '').toLowerCase()));
@@ -571,7 +719,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     }
     appendLog({
       ...logBase(me),
-      module: me.role === 'admin' ? '数据管理' : '记录查询',
+      module: isSysAdmin(me) ? '数据管理' : '记录查询',
       action: '批量导出照片',
       detail:
         `按条码文件夹批量导出衣物照片：${folderCount} 个文件夹、${exported} 张` +
@@ -596,18 +744,21 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     if (!p.password || String(p.password).length < 6) throw new Error('初始密码长度至少 6 位');
     const users = loadUsers();
     if (users.some((u) => u.username.toLowerCase() === username.toLowerCase())) throw new Error('用户名已存在');
+    // 角色限定为四级枚举；旧值（admin/client）由 normalizeRole 自动映射，保证接口向后兼容
+    const role = normalizeRole(p.role, p.permissions);
+    const def = roleDef(role);
+    if (role === 'storeadmin' && !normalizeStore(p.store)) throw new Error('门店管理员必须分配门店');
     const salt = crypto.randomBytes(16).toString('hex');
     const user = {
       id: uid(),
       username,
       name: String(p.name || '').trim() || username,
-      role: p.role === 'admin' ? 'admin' : 'client',
+      role,
       salt,
       passwordHash: hashPassword(p.password, salt),
-      permissions: {
-        capture: p.permissions ? !!p.permissions.capture : true,
-        query: p.permissions ? !!p.permissions.query : true
-      },
+      // 权限由角色决定，不接受外部传入，防止出现「门店管理员可拍照」这类与角色矛盾的账号
+      permissions: { capture: !!def.capture, query: !!def.query },
+      store: normalizeStore(p.store),
       active: true,
       createdAt: now(),
       lastLoginAt: null,
@@ -619,7 +770,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       ...logBase(me),
       module: '用户管理',
       action: '新增用户',
-      detail: `创建账号 ${user.username}（${user.role === 'admin' ? '管理员' : '客户端'}，姓名：${user.name}）`,
+      detail: `创建账号 ${user.username}（${def.label}，姓名：${user.name}${user.store ? '，门店：' + user.store : ''}）`,
       result: '成功'
     });
     return publicUser(user);
@@ -633,10 +784,19 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     const isSelf = user.id === me.id;
     const changes = [];
 
-    if (p.role !== undefined && p.role !== user.role) {
-      if (isSelf) throw new Error('不能修改自己的角色');
-      user.role = p.role === 'admin' ? 'admin' : 'client';
-      changes.push(`角色改为${user.role === 'admin' ? '管理员' : '客户端'}`);
+    if (p.role !== undefined) {
+      // 旧值（admin/client）自动映射为四级角色；已是新值则原样保留
+      const nextRole = normalizeRole(p.role, p.permissions);
+      if (nextRole !== normalizeRole(user.role, user.permissions)) {
+        if (isSelf) throw new Error('不能修改自己的角色');
+        const nextStore = p.store !== undefined ? normalizeStore(p.store) : normalizeStore(user.store);
+        if (nextRole === 'storeadmin' && !nextStore) throw new Error('门店管理员必须分配门店');
+        user.role = nextRole;
+        // 权限随角色派生，保证不出现「门店管理员可拍照」这类矛盾账号
+        const def = roleDef(nextRole);
+        user.permissions = { capture: !!def.capture, query: !!def.query };
+        changes.push(`角色改为${def.label}（权限随之调整：拍照${def.capture ? '开' : '关'}/查询${def.query ? '开' : '关'}）`);
+      }
     }
     if (p.name !== undefined && String(p.name).trim() && String(p.name).trim() !== user.name) {
       user.name = String(p.name).trim();
@@ -647,9 +807,26 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       user.active = !!p.active;
       changes.push(user.active ? '启用账号' : '停用账号');
     }
-    if (p.permissions) {
-      user.permissions = { capture: !!p.permissions.capture, query: !!p.permissions.query };
-      changes.push(`权限改为「拍照:${user.permissions.capture ? '开' : '关'}/查询:${user.permissions.query ? '开' : '关'}」`);
+    // 权限不再单独可配：四级角色的能力是固定的，由角色变更时同步派生。
+    // 此处仅在角色未变而权限与角色不一致时做一次纠偏（兼容历史数据）。
+    const curDef = roleDef(normalizeRole(user.role, user.permissions));
+    if (user.permissions.capture !== !!curDef.capture || user.permissions.query !== !!curDef.query) {
+      user.permissions = { capture: !!curDef.capture, query: !!curDef.query };
+      changes.push(`权限与角色对齐「拍照:${user.permissions.capture ? '开' : '关'}/查询:${user.permissions.query ? '开' : '关'}」`);
+    }
+    if (p.store !== undefined) {
+      const nextStore = normalizeStore(p.store);
+      const prevStore = normalizeStore(user.store);
+      if (nextStore !== prevStore) {
+        // 门店管理员失去门店会使其日志/订单范围失去依据，必须拦住。
+        // 注意此处要独立于上面的角色分支判断：角色不变、只清空门店同样要拒绝。
+        if (!nextStore && normalizeRole(user.role, user.permissions) === 'storeadmin') {
+          throw new Error('门店管理员必须分配门店');
+        }
+        user.store = nextStore;
+        // 历史存档保留创建时的门店快照（衣物实际收存于原门店），仅影响此后新增的记录
+        changes.push(`门店改为「${nextStore || '未分配'}」（原「${prevStore || '未分配'}」，历史存档仍归属原门店）`);
+      }
     }
     if (p.newPassword) {
       if (String(p.newPassword).length < 6) throw new Error('重置密码长度至少 6 位');
@@ -690,10 +867,28 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     return true;
   }
 
-  // ---------- 日志查询（管理端） ----------
+  // ---------- 日志查询（系统管理员：全部；门店管理员：仅本店） ----------
   function listLogs(token, p = {}) {
-    const me = requireSessionAdmin(token);
+    const me = requireLogViewer(token);
+    const isAdmin = isSysAdmin(me);
+    // 门店管理员只能看到本店账号产生的日志：先按账号门店归属收窄，
+    // 之后的账号/关键词筛选都在这个范围内进行，无法借筛选参数越权看到他店日志。
+    let storeUserIds = null;
+    if (!isAdmin) {
+      const myStore = normalizeStore(me.store);
+      if (!myStore) {
+        // 门店管理员未分配门店属于配置异常：返回空集而不是放开为「全部」
+        return { items: [], total: 0, page: 1, pageSize: Number(p.pageSize) || 20 };
+      }
+      storeUserIds = new Set(
+        loadUsers()
+          .filter((u) => normalizeStore(u.store) === myStore)
+          .map((u) => u.id)
+      );
+    }
+
     let list = loadLogs();
+    if (storeUserIds) list = list.filter((l) => storeUserIds.has(l.userId));
     if (p.userId && p.userId !== 'all') list = list.filter((l) => l.userId === p.userId);
     if (p.action && p.action !== 'all') list = list.filter((l) => l.action === p.action);
     const kw = String(p.keyword || '').trim().toLowerCase();
@@ -716,11 +911,53 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
         ...logBase(me),
         module: '日志查询',
         action: '查询日志',
-        detail: `查询操作日志：关键词「${kw || '无'}」，共 ${total} 条，第 ${page} 页`,
+        detail: `查询操作日志：${isAdmin ? '全部账号' : '本门店账号'}，关键词「${kw || '无'}」，共 ${total} 条，第 ${page} 页`,
         result: '成功'
       });
     }
     return { items, total, page, pageSize };
+  }
+
+  /**
+   * 日志页可选的账号列表：系统管理员为全部账号，门店管理员仅本店账号。
+   * 用于日志页「所属账号」筛选下拉，避免门店管理员看到他店账号名。
+   */
+  function logFilterUsers(token) {
+    const me = requireLogViewer(token);
+    const users = loadUsers().map(publicUser);
+    if (isSysAdmin(me)) {
+      return users.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    }
+    const myStore = normalizeStore(me.store);
+    if (!myStore) return [];
+    return users
+      .filter((u) => normalizeStore(u.store) === myStore)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  // 操作类型清单（单一数据源）：前端日志筛选下拉直接取这里，
+  // 避免像以前那样前端硬编码一份而与后端实际写入的类型脱节（曾出现「新增条码」缺失）。
+  // 新增日志动作时，只需在此登记一次。
+  const LOG_ACTIONS = [
+    '登录', '登录失败', '退出登录', '修改密码', '重置密码',
+    '新增条码', '新增存档照片', '离线存档', '删除存档', '批量删除存档',
+    '查询记录', '查看记录', '批量导出照片', '按日期导出照片',
+    '新增用户', '修改用户', '删除用户',
+    '查询日志', '修改端口', '重置连接码', '修改照片路径',
+    '强制推送安装包', '取消强制推送', '初始化'
+  ];
+
+  /** 可选操作类型 = 登记清单 ∪ 日志中实际出现过的类型（兼容历史遗留数据） */
+  function logActionOptions(token) {
+    requireSession(token);
+    const set = new Set(LOG_ACTIONS);
+    for (const l of loadLogs()) {
+      const a = String((l && l.action) || '').trim();
+      if (a) set.add(a);
+    }
+    const known = LOG_ACTIONS.filter((a) => set.has(a));
+    const extra = [...set].filter((a) => !LOG_ACTIONS.includes(a)).sort((a, b) => a.localeCompare(b, 'zh-CN'));
+    return [...known, ...extra];
   }
 
   // ---------- 数据总览（管理端） ----------
@@ -738,7 +975,12 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     return {
       userCount: users.length,
       activeUserCount: users.filter((u) => u.active).length,
-      adminCount: users.filter((u) => u.role === 'admin').length,
+      adminCount: users.filter((u) => isSysAdmin(u)).length,
+      // 各角色账号数（含门店管理员），管理端总览展示用
+      roleCount: ROLE_KEYS.reduce((acc, k) => {
+        acc[k] = users.filter((u) => normalizeRole(u.role, u.permissions) === k).length;
+        return acc;
+      }, {}),
       recordCount: records.length,
       todayRecordCount: records.filter((r) => r.createdAt.slice(0, 10) === todayIso).length,
       logCount: logs.length,
@@ -1091,18 +1333,20 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     const users = loadUsers();
     const idx = users.findIndex((u) => u.username === user.username);
     const salt = crypto.randomBytes(16).toString('hex');
+    // 保留服务端下发的四级角色（旧值自动映射）；权限由角色派生，
+    // 保证离线降级后门店管理员仍为「只查不拍」，不会因镜像拿到拍照权限
+    const role = normalizeRole(user.role, user.permissions);
+    const def = roleDef(role);
     const entry = {
       id: user.id,
       username: user.username,
       name: user.name || user.username,
-      role: user.role === 'admin' ? 'admin' : 'client',
+      role,
       salt,
       passwordHash: hashPassword(plainPassword, salt),
-      permissions: {
-        capture: !!(user.permissions && user.permissions.capture),
-        query: !!(user.permissions && user.permissions.query)
-      },
+      permissions: { capture: !!def.capture, query: !!def.query },
       active: user.active !== false,
+      store: normalizeStore(user.store),
       createdAt: user.createdAt || now(),
       lastLoginAt: user.lastLoginAt || null,
       mirrored: true,
@@ -1169,6 +1413,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       seq,
       userId: me.id,
       username: me.username,
+      storeName: normalizeStore(me.store),
       note: String(p.note || '').trim(),
       photoFile: `${safeBarcode}/${photoName}`,
       createdAt: now(),
@@ -1259,12 +1504,14 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
 
     fs.mkdirSync(targetDir, { recursive: true });
     let records = loadRecords();
-    if (me.role !== 'admin') records = records.filter((r) => r.userId === me.id);
+    if (!isSysAdmin(me)) records = records.filter((r) => canViewRecord(me, r));
     records = records.filter((r) => r.createdAt >= fromIso && r.createdAt <= toIso);
     if (!records.length) throw new Error('该日期范围内没有存档记录，无法导出');
 
     const photoDir = getPhotoDir();
-    const rows = [['条码', '文件位置']];
+    // 表格按订单（条码）汇总：每个条码一条记录，记录其归档文件夹位置，
+    // 不逐张照片罗列（照片仍全部复制到该文件夹内）
+    const rows = [['条码', '照片数量', '文件位置']];
     let exported = 0;
     let skipped = 0;
     let failed = 0;
@@ -1275,12 +1522,16 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       if (!byBarcode.has(code)) byBarcode.set(code, []);
       byBarcode.get(code).push(r);
     }
-    for (const [code, group] of byBarcode) {
+    // 按条码排序，便于表格查阅与核对
+    const sortedCodes = [...byBarcode.keys()].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+    for (const code of sortedCodes) {
+      const group = byBarcode.get(code);
       const safeCode = code.replace(/[\\/:*?"<>|]/g, '_').slice(0, 64) || '未命名';
       const dir = path.join(targetDir, safeCode);
       fs.mkdirSync(dir, { recursive: true });
       folderCount++;
       group.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+      let copied = 0;
       for (const r of group) {
         const src = path.join(photoDir, r.photoFile);
         const ext = path.extname(r.photoFile) || '.jpg';
@@ -1289,12 +1540,13 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
         try {
           fs.copyFileSync(src, dst);
           exported++;
-          rows.push([code, dst]);
+          copied++;
         } catch (e) {
           if (fs.existsSync(src)) failed++;
           else skipped++;
         }
       }
+      rows.push([code, copied, dir]);
     }
 
     // 生成 CSV 归档表格（带 BOM，Excel 打开中文不乱码）
@@ -1304,7 +1556,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
 
     appendLog({
       ...logBase(me),
-      module: me.role === 'admin' ? '数据管理' : '记录查询',
+      module: isSysAdmin(me) ? '数据管理' : '记录查询',
       action: '按日期导出照片',
       detail:
         `按日期范围导出衣物照片：${dateFrom} 至 ${dateTo}，` +
@@ -1335,6 +1587,12 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     updateUser,
     deleteUser,
     listLogs,
+    logActionOptions,
+    logFilterUsers,
+    logFilterUsers,
+    // 角色定义：前端渲染四级角色下拉与能力提示，避免与后端能力矩阵不一致
+    roleOptions: ROLE_LABELS,
+    roleDefs: ROLES,
     overview,
     systemInfo,
     licenseStatus,

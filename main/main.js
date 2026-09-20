@@ -120,6 +120,8 @@ function localCall(route, body, token) {
     'users/update': () => store.updateUser(token, b),
     'users/delete': () => store.deleteUser(token, b.id),
     'logs/list': () => store.listLogs(token, b),
+    'logs/actionOptions': () => store.logActionOptions(token),
+    'logs/filterUsers': () => store.logFilterUsers(token),
     'stats/overview': () => store.overview(token)
   };
   const fn = routes[route];
@@ -506,12 +508,20 @@ handle('users:update', (p, token) => dispatch('users/update', p, token));
 handle('users:delete', (p, token) => dispatch('users/delete', p, token));
 
 handle('logs:list', (p, token) => dispatch('logs/list', p, token));
+handle('logs:actionOptions', (_p, token) => dispatch('logs/actionOptions', undefined, token));
+handle('logs:filterUsers', (_p, token) => dispatch('logs/filterUsers', undefined, token));
 handle('stats:overview', (_p, token) => dispatch('stats/overview', undefined, token));
 
 // ---------- 系统配置类（本地，不随客户端转发） ----------
 handle('system:info', () => {
   const info = store.systemInfo();
   return { ok: true, data: info };
+});
+
+// 四级角色清单与能力矩阵：静态元数据，取数据层单一数据源，
+// 供前端渲染角色下拉与能力提示，避免前端再硬编码一份而与后端脱节
+handle('system:roles', () => {
+  return { ok: true, data: { roles: store.roleOptions, defs: store.roleDefs } };
 });
 
 // ---------- 激活与试用 ----------

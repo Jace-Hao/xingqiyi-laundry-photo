@@ -64,9 +64,11 @@ console.log('== 认证与会话 ==');
 check('错误密码登录失败', () => expectThrow(() => store.login({ username: 'admin', password: 'wrong' }), '密码错误'));
 check('无令牌访问被拒绝', () => expectThrow(() => store.listUsers(''), '未登录'));
 check('伪造令牌被拒绝', () => expectThrow(() => store.listUsers('fake-token'), '未登录'));
-check('管理员登录返回会话令牌', () => {
+check('系统管理员登录返回会话令牌', () => {
   const r = store.login({ username: 'admin', password: 'admin123' });
-  if (!r.sessionToken || !r.user || r.user.role !== 'admin') throw new Error('返回数据异常');
+  if (!r.sessionToken || !r.user) throw new Error('返回数据异常');
+  if (r.user.role !== 'sysadmin') throw new Error('角色应为 sysadmin，实际 ' + r.user.role);
+  if (r.user.roleLabel !== '系统管理员') throw new Error('角色标签错误：' + r.user.roleLabel);
   if (r.user.passwordHash !== undefined) throw new Error('泄露了密码哈希');
   adminToken = r.sessionToken;
 });
@@ -82,9 +84,10 @@ check('退出登录后令牌立即失效', () => {
 });
 
 console.log('== 用户管理与权限 ==');
-check('创建客户端账号', () => {
+check('创建客户端账号（旧值 client 自动映射为拍照账号）', () => {
   clerk = store.createUser(adminToken, { username: 'clerk01', name: '店员小王', password: 'clerk123', permissions: { capture: true, query: true } });
-  if (clerk.role !== 'client') throw new Error('角色错误');
+  if (clerk.role !== 'capture') throw new Error('角色应为 capture，实际 ' + clerk.role);
+  if (clerk.roleLabel !== '拍照账号') throw new Error('角色标签错误：' + clerk.roleLabel);
 });
 check('重复用户名被拒绝', () => expectThrow(() => store.createUser(adminToken, { username: 'CLERK01', password: '123456' }), '已存在'));
 check('客户端账号登录获得独立令牌', () => {
@@ -93,7 +96,7 @@ check('客户端账号登录获得独立令牌', () => {
 check('多令牌并发：两个会话同时有效', () => {
   if (!store.current(adminToken) || !store.current(clerkToken)) throw new Error('会话未共存');
 });
-check('客户端账号无权查看用户列表', () => expectThrow(() => store.listUsers(clerkToken), '仅管理员'));
+check('非系统管理员无权查看用户列表', () => expectThrow(() => store.listUsers(clerkToken), '仅系统管理员'));
 check('停用账号后其会话立即失效', () => {
   const limited = store.createUser(adminToken, { username: 'temp01', name: '临时', password: 'temp123' });
   const tk = store.login({ username: 'temp01', password: 'temp123' }).sessionToken;
@@ -101,10 +104,15 @@ check('停用账号后其会话立即失效', () => {
   expectThrow(() => store.listRecords(tk, { silent: true }), '未登录');
   expectThrow(() => store.login({ username: 'temp01', password: 'temp123' }), '停用');
 });
-check('关闭拍照权限后该账号无法存档', () => {
-  store.updateUser(adminToken, { id: clerk.id, permissions: { capture: false, query: true } });
+check('改为查询账号后不能拍照，改回拍照账号后恢复', () => {
+  // 新模型下权限由角色派生，不再单独配置 permissions
+  store.updateUser(adminToken, { id: clerk.id, role: 'query' });
+  const asQuery = store.current(clerkToken);
+  if (asQuery.role !== 'query' || asQuery.permissions.capture) throw new Error('查询账号仍带拍照权限：' + JSON.stringify(asQuery));
   expectThrow(() => store.addRecord(clerkToken, { imageData: tinyJpeg, barcode: 'B000' }), '无权限');
-  store.updateUser(adminToken, { id: clerk.id, permissions: { capture: true, query: true } });
+  store.updateUser(adminToken, { id: clerk.id, role: 'capture' });
+  const asCapture = store.current(clerkToken);
+  if (asCapture.role !== 'capture' || !asCapture.permissions.capture) throw new Error('拍照账号缺少拍照权限：' + JSON.stringify(asCapture));
 });
 check('管理员不能删除自己的账号', () => {
   const me = store.current(adminToken);
@@ -186,8 +194,38 @@ check('日志按账号筛选', () => {
   if (!r.items.every((l) => l.userId === clerk.id)) throw new Error('筛选结果错误');
 });
 check('日志按操作类型筛选', () => {
-  const r = store.listLogs(adminToken, { action: '新增存档', silent: true });
-  if (!r.items.every((l) => l.action === '新增存档')) throw new Error('筛选结果错误');
+  // 用真实存在的类型筛选（此前误用「新增存档」这一后端从不写入的值，
+  // 空结果集使 every 恒为真，断言形同虚设）
+  const r = store.listLogs(adminToken, { action: '新增条码', silent: true });
+  if (!r.items.length) throw new Error('筛选「新增条码」应有结果，实际 0 条');
+  if (!r.items.every((l) => l.action === '新增条码')) throw new Error('筛选结果错误');
+});
+check('操作类型筛选清单覆盖日志中实际出现的全部类型', () => {
+  const options = store.logActionOptions(adminToken);
+  const r = store.listLogs(adminToken, { silent: true, pageSize: 200 });
+  const used = [...new Set(r.items.map((l) => l.action))];
+  const missing = used.filter((a) => !options.includes(a));
+  if (missing.length) throw new Error('以下类型无法在下拉中选择：' + missing.join('、'));
+  if (!options.includes('新增条码')) throw new Error('清单缺少「新增条码」（历史 BUG 复现）');
+  if (options.includes('新增存档')) throw new Error('清单含后端从不写入的「新增存档」');
+  // 每个清单选项都能作为筛选值使用且不报错
+  for (const a of options) {
+    const rr = store.listLogs(adminToken, { action: a, silent: true, pageSize: 5 });
+    if (!rr.items.every((l) => l.action === a)) throw new Error('按「' + a + '」筛选结果不纯');
+  }
+});
+
+check('源码中所有日志动作均已登记（防止将来漂移）', () => {
+  // 动态测试只能覆盖被触发到的分支，离线存档/强制推送等类型需静态扫描兜底
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main', 'store.js'), 'utf8');
+  const found = new Set();
+  const re = /action:\s*'([^']+)'/g;
+  let m;
+  while ((m = re.exec(src)) !== null) found.add(m[1]);
+  const options = store.logActionOptions(adminToken);
+  const unregistered = [...found].filter((a) => !options.includes(a));
+  if (unregistered.length) throw new Error('源码写入但未登记：' + unregistered.join('、'));
+  if (found.size < 15) throw new Error('扫描到的动作类型异常偏少：' + found.size + '，正则可能失效');
 });
 
 console.log('== 数据总览 ==');
@@ -199,8 +237,8 @@ check('总览数据正确', () => {
 });
 
 console.log('== 系统配置 ==');
-check('修改端口需管理员权限', () => {
-  expectThrow(() => store.updateSystemSettings(clerkToken, { port: 8080 }), '仅管理员');
+check('修改端口需系统管理员权限', () => {
+  expectThrow(() => store.updateSystemSettings(clerkToken, { port: 8080 }), '系统管理员');
 });
 check('非法端口被拒绝', () => {
   expectThrow(() => store.updateSystemSettings(adminToken, { port: 0 }), '端口');
@@ -287,6 +325,413 @@ check('客户端批量删除不能删除他人记录', () => {
 });
 check('批量删除不存在的记录返回失败', () => {
   expectThrow(() => store.deleteRecords(adminToken, ['no-such-id']), '没有可删除');
+});
+
+console.log('== 门店分组与同店互见 ==');
+let sa1, sa2, sb1, sn1, sn2;
+let sa1Token, sa2Token, sb1Token, sn1Token, sn2Token;
+
+check('创建同门店/跨门店/未分配门店账号', () => {
+  sa1 = store.createUser(adminToken, { username: 'store_a1', name: '人民路店甲', password: 'pass123456', store: '人民路店', permissions: { capture: true, query: true } });
+  sa2 = store.createUser(adminToken, { username: 'store_a2', name: '人民路店乙', password: 'pass123456', store: '人民路店', permissions: { capture: true, query: true } });
+  sb1 = store.createUser(adminToken, { username: 'store_b1', name: '解放路店甲', password: 'pass123456', store: '解放路店', permissions: { capture: true, query: true } });
+  sn1 = store.createUser(adminToken, { username: 'store_n1', name: '未分配甲', password: 'pass123456', store: '', permissions: { capture: true, query: true } });
+  sn2 = store.createUser(adminToken, { username: 'store_n2', name: '未分配乙', password: 'pass123456', permissions: { capture: true, query: true } });
+  if (sa1.store !== '人民路店') throw new Error('门店未写入：' + JSON.stringify(sa1.store));
+  if (sn2.store !== '') throw new Error('未传门店应为空字符串：' + JSON.stringify(sn2.store));
+  sa1Token = store.login({ username: 'store_a1', password: 'pass123456' }).sessionToken;
+  sa2Token = store.login({ username: 'store_a2', password: 'pass123456' }).sessionToken;
+  sb1Token = store.login({ username: 'store_b1', password: 'pass123456' }).sessionToken;
+  sn1Token = store.login({ username: 'store_n1', password: 'pass123456' }).sessionToken;
+  sn2Token = store.login({ username: 'store_n2', password: 'pass123456' }).sessionToken;
+});
+
+let recSa1, recSa2, recSb1, recSn1, recSn2;
+check('录入订单时写入门店快照', () => {
+  recSa1 = store.addRecord(sa1Token, { imageData: tinyJpeg, barcode: 'STORE-A1-001', note: '人民路店甲的衣服' });
+  recSa2 = store.addRecord(sa2Token, { imageData: tinyJpeg, barcode: 'STORE-A2-001', note: '人民路店乙的衣服' });
+  recSb1 = store.addRecord(sb1Token, { imageData: tinyJpeg, barcode: 'STORE-B1-001', note: '解放路店的衣服' });
+  recSn1 = store.addRecord(sn1Token, { imageData: tinyJpeg, barcode: 'STORE-N1-001' });
+  recSn2 = store.addRecord(sn2Token, { imageData: tinyJpeg, barcode: 'STORE-N2-001' });
+  if (recSa1.storeName !== '人民路店' || recSb1.storeName !== '解放路店') throw new Error('门店快照错误');
+  if (recSn1.storeName !== '' || recSn2.storeName !== '') throw new Error('未分配门店的记录 storeName 应为空');
+});
+
+check('同门店账号可互相查看订单照片', () => {
+  const list = store.listRecords(sa1Token, { silent: true, pageSize: 100 });
+  const codes = list.items.map((x) => x.barcode).sort();
+  if (codes.length !== 2) throw new Error('应为本人+同店共 2 条，实际 ' + codes.length + '：' + codes.join(','));
+  if (!codes.includes('STORE-A1-001') || !codes.includes('STORE-A2-001')) throw new Error('同店记录缺失：' + codes.join(','));
+  const list2 = store.listRecords(sa2Token, { silent: true, pageSize: 100 });
+  if (!list2.items.some((x) => x.barcode === 'STORE-A1-001')) throw new Error('A2 看不到同店 A1 的记录');
+  const d = store.getRecord(sa1Token, recSa2.id);
+  if (d.barcode !== 'STORE-A2-001') throw new Error('同店详情读取异常');
+});
+
+check('跨门店记录相互隔离', () => {
+  const list = store.listRecords(sa1Token, { silent: true, pageSize: 100 });
+  if (list.items.some((x) => x.barcode === 'STORE-B1-001')) throw new Error('看到了他店记录');
+  const listB = store.listRecords(sb1Token, { silent: true, pageSize: 100 });
+  const codes = listB.items.map((x) => x.barcode);
+  if (codes.length !== 1 || codes[0] !== 'STORE-B1-001') throw new Error('B 店可见范围错误：' + codes.join(','));
+  expectThrow(() => store.getRecord(sa1Token, recSb1.id), '无权限');
+  expectThrow(() => store.getRecord(sb1Token, recSa1.id), '无权限');
+});
+
+check('未分配门店的账号之间不互见', () => {
+  const list = store.listRecords(sn1Token, { silent: true, pageSize: 100 });
+  const codes = list.items.map((x) => x.barcode);
+  if (codes.length !== 1 || codes[0] !== 'STORE-N1-001') throw new Error('空门店不应互见，实际：' + codes.join(','));
+  expectThrow(() => store.getRecord(sn1Token, recSn2.id), '无权限');
+});
+
+check('管理员可按门店筛选记录', () => {
+  const all = store.listRecords(adminToken, { silent: true, pageSize: 200 });
+  const expect = all.items.filter((x) => x.storeName === '人民路店').length;
+  if (expect !== 2) throw new Error('人民路店应有 2 条，实际 ' + expect);
+  const filtered = store.listRecords(adminToken, { silent: true, pageSize: 200, storeFilter: '人民路店' });
+  if (filtered.total !== expect) throw new Error('筛选数量不符：期望 ' + expect + ' 实际 ' + filtered.total);
+  if (!filtered.items.every((x) => x.storeName === '人民路店')) throw new Error('筛选结果混入他店记录');
+  const allFilter = store.listRecords(adminToken, { silent: true, pageSize: 200, storeFilter: 'all' });
+  if (allFilter.total !== all.total) throw new Error('storeFilter=all 不应过滤');
+});
+
+check('关键词搜索可命中门店名', () => {
+  const r = store.listRecords(adminToken, { silent: true, keyword: '解放路店' });
+  if (r.total < 1) throw new Error('门店名搜索无结果');
+  if (!r.items.every((x) => x.storeName === '解放路店' || String(x.note || '').includes('解放路'))) {
+    throw new Error('门店名搜索结果混入无关记录：' + r.total);
+  }
+});
+
+check('同门店可见但不扩大删除权限', () => {
+  expectThrow(() => store.deleteRecord(sa1Token, recSa2.id), '无权限');
+  // 批量删除对无权记录全部跳过：无可删项时抛错且不落盘，原记录保持完整
+  expectThrow(() => store.deleteRecords(sa1Token, [recSa2.id, recSb1.id]), '没有可删除');
+  if (!store.getRecord(sa2Token, recSa2.id)) throw new Error('同店记录被误删');
+  if (!store.getRecord(sb1Token, recSb1.id)) throw new Error('他店记录被误删');
+  store.deleteRecord(sa1Token, recSa1.id);
+});
+
+check('门店变更后历史记录仍归属原门店（快照语义）', () => {
+  const before = store.getRecord(sa2Token, recSa2.id);
+  store.updateUser(adminToken, { id: sa2.id, store: '解放路店' });
+  const after = store.getRecord(adminToken, recSa2.id);
+  if (after.storeName !== before.storeName) throw new Error('历史门店被改写：' + before.storeName + ' -> ' + after.storeName);
+  if (after.storeName !== '人民路店') throw new Error('历史应仍为人民路店，实际 ' + after.storeName);
+  const rec = store.addRecord(sa2Token, { imageData: tinyJpeg, barcode: 'STORE-A2-NEW' });
+  if (rec.storeName !== '解放路店') throw new Error('调店后新记录门店错误：' + rec.storeName);
+  const listB = store.listRecords(sb1Token, { silent: true, pageSize: 100 });
+  if (!listB.items.some((x) => x.barcode === 'STORE-A2-NEW')) throw new Error('调店后未与新同店互见');
+});
+
+check('门店分配仅系统管理员可操作', () => {
+  expectThrow(() => store.updateUser(sa1Token, { id: sa1.id, store: '解放路店' }), '系统管理员');
+  expectThrow(() => store.createUser(sa1Token, { username: 'store_hack', password: 'pass123456', store: '解放路店' }), '系统管理员');
+  const before = store.current(sa1Token).store;
+  store.changePassword(sa1Token, { oldPassword: 'pass123456', newPassword: 'newpass123' });
+  if (store.current(sa1Token).store !== before) throw new Error('改密码意外修改了门店');
+});
+
+check('用户列表返回门店且不泄露密码信息', () => {
+  const users = store.listUsers(adminToken);
+  const m = Object.fromEntries(users.map((u) => [u.username, u]));
+  if (!m['store_a1'] || m['store_a1'].store !== '人民路店') throw new Error('门店字段缺失');
+  if (m['store_a2'].store !== '解放路店') throw new Error('门店变更未生效');
+  if (users.some((u) => u.passwordHash !== undefined || u.salt !== undefined)) throw new Error('泄露了密码哈希或盐值');
+});
+
+check('门店名自动去空格并截断到 40 字符', () => {
+  store.updateUser(adminToken, { id: sb1.id, store: '   ' + 'X'.repeat(60) + '   ' });
+  const u = store.listUsers(adminToken).find((x) => x.username === 'store_b1');
+  if (u.store.length !== 40) throw new Error('未截断到 40：' + u.store.length);
+  if (u.store !== 'X'.repeat(40)) throw new Error('未去除首尾空格');
+});
+
+check('客户端镜像保留门店字段', () => {
+  const clientStore = createStore({
+    dataDir: path.join(tmpDir, 'mirror-data'),
+    defaultPhotoDir: path.join(tmpDir, 'mirror-photos'),
+    updateDir: path.join(tmpDir, 'mirror-updates'),
+    appVersion: '0.1.0',
+    photoScheme: 'xqy-photo'
+  });
+  clientStore.mirrorUser(
+    { id: 'mirror-id', username: 'store_m1', name: '镜像', role: 'client', permissions: { capture: true, query: true }, active: true, store: '人民路店' },
+    'pass123456'
+  );
+  const r = clientStore.login({ username: 'store_m1', password: 'pass123456' });
+  if (r.user.store !== '人民路店') throw new Error('镜像丢失门店：' + JSON.stringify(r.user.store));
+  if (r.user.role !== 'capture') throw new Error('镜像未映射四级角色：' + r.user.role);
+});
+
+console.log('== 四级角色权限体系 ==');
+let smgr, scap, sqry, smgr2;
+let smgrToken, scapToken, sqryToken, smgr2Token;
+
+check('角色清单为四级且标签正确', () => {
+  const opts = store.roleOptions;
+  if (opts.length !== 4) throw new Error('应为 4 种角色，实际 ' + opts.length);
+  const m = Object.fromEntries(opts.map((o) => [o.value, o.label]));
+  if (m.sysadmin !== '系统管理员' || m.storeadmin !== '门店管理员' || m.capture !== '拍照账号' || m.query !== '查询账号') {
+    throw new Error('角色标签错误：' + JSON.stringify(m));
+  }
+});
+
+check('创建四种角色账号，权限由角色派生', () => {
+  smgr = store.createUser(adminToken, { username: 'role_smgr', name: '人民路店长', password: 'pass123456', role: 'storeadmin', store: '人民路店' });
+  scap = store.createUser(adminToken, { username: 'role_cap', name: '人民路拍照员', password: 'pass123456', role: 'capture', store: '人民路店' });
+  sqry = store.createUser(adminToken, { username: 'role_qry', name: '人民路查询员', password: 'pass123456', role: 'query', store: '人民路店' });
+  smgr2 = store.createUser(adminToken, { username: 'role_smgr2', name: '解放路店长', password: 'pass123456', role: 'storeadmin', store: '解放路店' });
+  if (smgr.permissions.capture) throw new Error('门店管理员不应有拍照权限');
+  if (!smgr.permissions.query) throw new Error('门店管理员应有查询权限');
+  if (!scap.permissions.capture || !scap.permissions.query) throw new Error('拍照账号应可拍照+查询');
+  if (sqry.permissions.capture) throw new Error('查询账号不应有拍照权限');
+  smgrToken = store.login({ username: 'role_smgr', password: 'pass123456' }).sessionToken;
+  scapToken = store.login({ username: 'role_cap', password: 'pass123456' }).sessionToken;
+  sqryToken = store.login({ username: 'role_qry', password: 'pass123456' }).sessionToken;
+  smgr2Token = store.login({ username: 'role_smgr2', password: 'pass123456' }).sessionToken;
+});
+
+check('忽略外部传入的 permissions，防止配出与角色矛盾的账号', () => {
+  const u = store.createUser(adminToken, {
+    username: 'role_evil', name: '越权测试', password: 'pass123456',
+    role: 'query', store: '人民路店',
+    permissions: { capture: true, query: true }
+  });
+  if (u.permissions.capture) throw new Error('查询账号被配出了拍照权限');
+  const tk = store.login({ username: 'role_evil', password: 'pass123456' }).sessionToken;
+  expectThrow(() => store.addRecord(tk, { imageData: tinyJpeg, barcode: 'EVIL01' }), '无权限');
+});
+
+check('门店管理员必须分配门店', () => {
+  expectThrow(() => store.createUser(adminToken, { username: 'role_nostore', password: 'pass123456', role: 'storeadmin' }), '必须分配门店');
+  expectThrow(() => store.updateUser(adminToken, { id: smgr2.id, role: 'storeadmin', store: '' }), '必须分配门店');
+});
+
+check('门店管理员只查不拍', () => {
+  expectThrow(() => store.addRecord(smgrToken, { imageData: tinyJpeg, barcode: 'SMGR01' }), '无权限');
+  const list = store.listRecords(smgrToken, { silent: true, pageSize: 100 });
+  if (!list.items.length) throw new Error('门店管理员应能查到本店订单');
+  if (!list.items.every((r) => r.storeName === '人民路店' || r.userId === smgr.id)) {
+    throw new Error('门店管理员看到了他店订单：' + list.items.map((r) => r.storeName).join(','));
+  }
+});
+
+check('查询账号不能拍照，拍照账号可以', () => {
+  expectThrow(() => store.addRecord(sqryToken, { imageData: tinyJpeg, barcode: 'QRY01' }), '无权限');
+  const rec = store.addRecord(scapToken, { imageData: tinyJpeg, barcode: 'CAP01' });
+  if (!rec || rec.storeName !== '人民路店') throw new Error('拍照账号存档异常：' + JSON.stringify(rec && rec.storeName));
+});
+
+check('门店管理员可见本店账号日志', () => {
+  const r = store.listLogs(smgrToken, { silent: true, pageSize: 200 });
+  if (!r.total) throw new Error('门店管理员查不到本店日志');
+  const names = [...new Set(r.items.map((l) => l.username))];
+  if (!names.includes('role_cap')) throw new Error('缺少本店拍照账号日志：' + names.join(','));
+});
+
+check('门店管理员看不到他店与未分配门店账号的日志', () => {
+  const r = store.listLogs(smgrToken, { silent: true, pageSize: 500 });
+  const names = new Set(r.items.map((l) => l.username));
+  if (names.has('role_smgr2')) throw new Error('看到了他店门店管理员的日志');
+  if (names.has('store_b1')) throw new Error('看到了他店账号的日志');
+  if (names.has('admin')) throw new Error('看到了系统管理员的日志（本店账号范围之外）');
+  if (names.has('store_n1') || names.has('store_n2')) throw new Error('看到了未分配门店账号的日志');
+  // 本店账号日志必须完整可见
+  if (!names.has('role_smgr') || !names.has('role_qry')) throw new Error('本店账号日志不完整：' + [...names].join(','));
+});
+
+check('账号调店后其日志随之归属新门店（按当前门店归属收窄）', () => {
+  // sa2 已从人民路店调到解放路店，其历史日志不应再对人民路店门店管理员可见
+  const r = store.listLogs(smgrToken, { silent: true, pageSize: 500 });
+  if (r.items.some((l) => l.username === 'store_a2')) throw new Error('调店账号的日志仍对原门店可见');
+  const r2 = store.listLogs(smgr2Token, { silent: true, pageSize: 500 });
+  if (!r2.items.some((l) => l.username === 'store_a2')) throw new Error('调店账号的日志未归属新门店');
+});
+
+check('日志页账号筛选下拉对门店管理员收窄到本店', () => {
+  const list = store.logFilterUsers(smgrToken);
+  const names = list.map((u) => u.username);
+  if (!names.includes('role_cap') || !names.includes('role_qry')) throw new Error('本店账号缺失：' + names.join(','));
+  if (names.includes('admin') || names.includes('role_smgr2') || names.includes('store_b1')) {
+    throw new Error('下拉泄露了他店/系统账号：' + names.join(','));
+  }
+  const all = store.logFilterUsers(adminToken);
+  if (all.length <= list.length) throw new Error('系统管理员应能看到全部账号');
+  if (all.some((u) => u.passwordHash !== undefined || u.salt !== undefined)) throw new Error('账号列表泄露密码信息');
+});
+
+check('门店管理员未分配门店时日志返回空集而非放开为全部', () => {
+  // 配置异常的兜底：不能因为门店为空就变成「可见全部日志」。
+  // API 路径已拦住清空门店（见上一条用例），这里直接改数据文件模拟遗留/手工编辑产生的异常状态。
+  const usersPath = path.join(tmpDir, 'data', 'users.json');
+  const backup = fs.readFileSync(usersPath, 'utf8');
+  try {
+    const users = JSON.parse(backup);
+    const target = users.find((u) => u.username === 'role_smgr');
+    target.store = '';
+    fs.writeFileSync(usersPath, JSON.stringify(users, null, 2), 'utf8');
+
+    const r = store.listLogs(smgrToken, { silent: true, pageSize: 200 });
+    if (r.total !== 0 || r.items.length) throw new Error('应返回空集，实际 ' + r.total + ' 条');
+    const users2 = store.logFilterUsers(smgrToken);
+    if (users2.length !== 0) throw new Error('账号下拉应为空，实际 ' + users2.length);
+    // 订单查询同样不能因此放开为全部
+    const recs = store.listRecords(smgrToken, { silent: true, pageSize: 200 });
+    if (recs.items.some((x) => x.userId !== smgr.id && x.storeName)) throw new Error('门店为空时订单范围被放开');
+  } finally {
+    fs.writeFileSync(usersPath, backup, 'utf8');
+  }
+  if (!store.listLogs(smgrToken, { silent: true, pageSize: 200 }).total) throw new Error('恢复门店后仍查不到日志');
+});
+
+check('拍照账号与查询账号无权查看操作日志', () => {
+  expectThrow(() => store.listLogs(scapToken, { silent: true }), '无权限');
+  expectThrow(() => store.listLogs(sqryToken, { silent: true }), '无权限');
+  expectThrow(() => store.logFilterUsers(scapToken, { silent: true }), '无权限');
+});
+
+check('门店管理员无权管理账号与系统设置', () => {
+  expectThrow(() => store.listUsers(smgrToken), '系统管理员');
+  expectThrow(() => store.createUser(smgrToken, { username: 'role_x', password: 'pass123456' }), '系统管理员');
+  expectThrow(() => store.updateUser(smgrToken, { id: scap.id, role: 'sysadmin' }), '系统管理员');
+  expectThrow(() => store.deleteUser(smgrToken, scap.id), '系统管理员');
+  expectThrow(() => store.updateSystemSettings(smgrToken, { port: 18099 }), '系统管理员');
+  expectThrow(() => store.resetApiToken(smgrToken), '系统管理员');
+  expectThrow(() => store.overview(smgrToken), '系统管理员');
+  expectThrow(() => store.setForceUpdate(smgrToken, { enabled: true }), '系统管理员');
+});
+
+check('门店管理员不能删除订单（只查不删）', () => {
+  const list = store.listRecords(smgrToken, { silent: true, pageSize: 100 });
+  const target = list.items[0];
+  if (!target) throw new Error('无可用订单做删除测试');
+  expectThrow(() => store.deleteRecord(smgrToken, target.id), '无权限');
+  if (!store.getRecord(adminToken, target.id)) throw new Error('订单被门店管理员误删');
+});
+
+check('系统管理员可见全部门店订单与日志', () => {
+  const recs = store.listRecords(adminToken, { silent: true, pageSize: 500 });
+  const stores = new Set(recs.items.map((r) => r.storeName));
+  if (!stores.has('人民路店') || !stores.has('解放路店')) throw new Error('系统管理员未覆盖全部门店：' + [...stores].join(','));
+  const logs = store.listLogs(adminToken, { silent: true, pageSize: 500 });
+  const names = new Set(logs.items.map((l) => l.username));
+  if (!names.has('role_smgr2') || !names.has('admin')) throw new Error('系统管理员日志范围不完整');
+});
+
+check('数据总览按四级角色统计账号数', () => {
+  const o = store.overview(adminToken);
+  if (!o.roleCount) throw new Error('缺少 roleCount 统计');
+  if (o.roleCount.sysadmin < 1) throw new Error('系统管理员计数错误：' + o.roleCount.sysadmin);
+  if (o.roleCount.storeadmin < 2) throw new Error('门店管理员计数错误：' + o.roleCount.storeadmin);
+  if (o.roleCount.capture < 1 || o.roleCount.query < 1) throw new Error('拍照/查询账号计数错误：' + JSON.stringify(o.roleCount));
+  const sum = Object.values(o.roleCount).reduce((a, b) => a + b, 0);
+  if (sum !== o.userCount) throw new Error('各角色之和应等于账号总数：' + sum + ' vs ' + o.userCount);
+  if (o.adminCount !== o.roleCount.sysadmin) throw new Error('adminCount 与 sysadmin 计数不一致');
+});
+
+check('角色变更时权限自动对齐，不能修改自己的角色', () => {
+  store.updateUser(adminToken, { id: sqry.id, role: 'capture' });
+  const u = store.listUsers(adminToken).find((x) => x.username === 'role_qry');
+  if (u.role !== 'capture' || !u.permissions.capture) throw new Error('角色变更后权限未对齐：' + JSON.stringify(u.permissions));
+  store.updateUser(adminToken, { id: sqry.id, role: 'query' });
+  const back = store.listUsers(adminToken).find((x) => x.username === 'role_qry');
+  if (back.permissions.capture) throw new Error('改回查询账号后拍照权限未收回');
+  expectThrow(() => store.updateUser(adminToken, { id: store.current(adminToken).id, role: 'query' }), '不能修改自己的角色');
+});
+
+check('旧角色账号自动迁移为四级角色', () => {
+  // 构造 v1.0.0 的旧数据：admin/client 二分 + permissions 开关，无 store 字段
+  const migDir = path.join(tmpDir, 'migrate-data');
+  fs.mkdirSync(migDir, { recursive: true });
+  const oldUsers = [
+    { id: 'u-admin', username: 'oldadmin', name: '老管理员', role: 'admin', salt: 's', passwordHash: 'h', permissions: { capture: true, query: true }, active: true, createdAt: '2026-01-01T00:00:00.000Z' },
+    { id: 'u-both', username: 'oldboth', name: '拍照+查询', role: 'client', salt: 's', passwordHash: 'h', permissions: { capture: true, query: true }, active: true, createdAt: '2026-01-02T00:00:00.000Z' },
+    { id: 'u-query', username: 'oldquery', name: '仅查询', role: 'client', salt: 's', passwordHash: 'h', permissions: { capture: false, query: true }, active: true, createdAt: '2026-01-03T00:00:00.000Z' },
+    { id: 'u-cap', username: 'oldcap', name: '仅拍照', role: 'client', salt: 's', passwordHash: 'h', permissions: { capture: true, query: false }, active: true, createdAt: '2026-01-04T00:00:00.000Z' }
+  ];
+  fs.writeFileSync(path.join(migDir, 'users.json'), JSON.stringify(oldUsers, null, 2), 'utf8');
+  const migStore = createStore({
+    dataDir: migDir,
+    defaultPhotoDir: path.join(tmpDir, 'migrate-photos'),
+    updateDir: path.join(tmpDir, 'migrate-updates'),
+    appVersion: '1.1.0',
+    photoScheme: 'xqy-photo'
+  });
+  migStore.ensureSeedData();
+  const after = JSON.parse(fs.readFileSync(path.join(migDir, 'users.json'), 'utf8'));
+  const m = Object.fromEntries(after.map((u) => [u.username, u]));
+  if (m.oldadmin.role !== 'sysadmin') throw new Error('旧 admin 未迁移为 sysadmin：' + m.oldadmin.role);
+  if (m.oldboth.role !== 'capture') throw new Error('拍照+查询未迁移为 capture：' + m.oldboth.role);
+  if (m.oldquery.role !== 'query') throw new Error('仅查询未迁移为 query：' + m.oldquery.role);
+  if (m.oldcap.role !== 'capture') throw new Error('仅拍照未迁移为 capture：' + m.oldcap.role);
+  if (!m.oldquery.permissions.capture === false) throw new Error('迁移后权限未与角色对齐');
+  if (m.oldquery.permissions.capture) throw new Error('查询账号迁移后仍带拍照权限');
+  if (after.some((u) => u.store === undefined)) throw new Error('迁移未补齐 store 字段');
+  // 迁移是幂等的：再跑一次不应改变角色
+  migStore.ensureSeedData();
+  const again = JSON.parse(fs.readFileSync(path.join(migDir, 'users.json'), 'utf8'));
+  const m2 = Object.fromEntries(again.map((u) => [u.username, u]));
+  if (m2.oldadmin.role !== 'sysadmin' || m2.oldquery.role !== 'query') throw new Error('迁移不幂等');
+});
+
+console.log('== 按日期导出（表格按条码汇总） ==');
+check('导出表格每个条码一条、照片仍完整归档', () => {
+  const expDir = path.join(tmpDir, 'export-by-date');
+  const today = new Date().toISOString().slice(0, 10);
+  // 补三个条码形成 3/2/1 张的差异，验证汇总数量正确
+  store.addRecord(scapToken, { imageData: tinyJpeg, barcode: 'EXP-A' });
+  store.addRecord(scapToken, { imageData: tinyJpeg, barcode: 'EXP-A' });
+  store.addRecord(scapToken, { imageData: tinyJpeg, barcode: 'EXP-A' });
+  store.addRecord(scapToken, { imageData: tinyJpeg, barcode: 'EXP-B' });
+  store.addRecord(scapToken, { imageData: tinyJpeg, barcode: 'EXP-B' });
+  store.addRecord(scapToken, { imageData: tinyJpeg, barcode: 'EXP-C' });
+
+  const r = store.exportPhotosByDate(adminToken, { dateFrom: today, dateTo: today, targetDir: expDir });
+  if (!r.exported) throw new Error('未导出任何照片');
+  if (!r.csvPath || !fs.existsSync(r.csvPath)) throw new Error('未生成导出表格');
+
+  const csv = fs.readFileSync(r.csvPath, 'utf8').replace(/^\uFEFF/, '');
+  const lines = csv.split(/\r?\n/).filter(Boolean);
+  if (lines[0] !== '"条码","照片数量","文件位置"') throw new Error('表头不符：' + lines[0]);
+
+  const rows = lines.slice(1);
+  const find = (code) => rows.find((x) => x.includes(code));
+  const rowA = find('EXP-A');
+  const rowB = find('EXP-B');
+  const rowC = find('EXP-C');
+  if (!rowA || !rowA.includes('"3"')) throw new Error('EXP-A 应汇总为 3 张：' + rowA);
+  if (!rowB || !rowB.includes('"2"')) throw new Error('EXP-B 应汇总为 2 张：' + rowB);
+  if (!rowC || !rowC.includes('"1"')) throw new Error('EXP-C 应汇总为 1 张：' + rowC);
+  if (!rowA.includes(path.join(expDir, 'EXP-A'))) throw new Error('文件位置应指向条码文件夹：' + rowA);
+
+  // 关键口径：表格按条码汇总，不能逐张照片罗列
+  const expRows = rows.filter((x) => x.includes('EXP-'));
+  if (expRows.length !== 3) throw new Error('6 张照片应只汇总为 3 行，实际 ' + expRows.length + ' 行');
+
+  // 照片本身仍须全部导出到对应文件夹
+  const cnt = (code) => fs.readdirSync(path.join(expDir, code)).filter((f) => /\.(jpg|jpeg|png)$/i.test(f)).length;
+  if (cnt('EXP-A') !== 3) throw new Error('EXP-A 文件夹照片数应为 3，实际 ' + cnt('EXP-A'));
+  if (cnt('EXP-B') !== 2) throw new Error('EXP-B 文件夹照片数应为 2，实际 ' + cnt('EXP-B'));
+  if (cnt('EXP-C') !== 1) throw new Error('EXP-C 文件夹照片数应为 1，实际 ' + cnt('EXP-C'));
+});
+
+check('门店管理员可导出本店订单、且表格不含他店条码', () => {
+  const expDir = path.join(tmpDir, 'export-smgr');
+  const today = new Date().toISOString().slice(0, 10);
+  const r = store.exportPhotosByDate(smgrToken, { dateFrom: today, dateTo: today, targetDir: expDir });
+  if (!r.exported) throw new Error('门店管理员应能导出本店订单');
+  const csv = fs.readFileSync(r.csvPath, 'utf8').replace(/^\uFEFF/, '');
+  if (csv.includes('STORE-B1-001')) throw new Error('导出表格混入他店条码');
+  if (!csv.includes('EXP-A')) throw new Error('导出表格缺少本店条码');
+});
+
+check('查询账号（无拍照权限）也能导出本店订单', () => {
+  const expDir = path.join(tmpDir, 'export-qry');
+  const today = new Date().toISOString().slice(0, 10);
+  const r = store.exportPhotosByDate(sqryToken, { dateFrom: today, dateTo: today, targetDir: expDir });
+  if (!r.exported) throw new Error('查询账号应能导出本店订单');
 });
 
 console.log('== 版本与更新 ==');
