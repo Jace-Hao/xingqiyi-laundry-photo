@@ -854,9 +854,13 @@ handle('system:setMode', async (mode) => {
   let autoLaunchCleared = false;
   if (data.mode === 'server') {
     await restartServerIfNeeded();
+    // 切换为服务端：数据以本机为准，启用订单自动清理调度
+    scheduleAutoPurge();
   } else {
     // 开机自启仅服务端允许，切到客户端时回收残留登录项，维持该不变量
     autoLaunchCleared = clearAutoLaunchForClient();
+    // 客户端本机存档只是镜像，停止清理调度，避免删掉与服务端不一致的数据
+    stopAutoPurge();
     if (httpServer) {
       await httpServer.close();
       httpServer = null;
@@ -872,6 +876,8 @@ handle('system:setClientConfig', async ({ serverUrl, serverToken } = {}) => {
     // 与 setMode 一致：配置为客户端同样要回收开机自启登录项，
     // 否则服务端改配为客户端后仍会每次开机自启并常驻
     const autoLaunchCleared = clearAutoLaunchForClient();
+    // 已配置为客户端，停止订单自动清理调度
+    stopAutoPurge();
     if (httpServer) {
       await httpServer.close();
       httpServer = null;
@@ -1212,6 +1218,39 @@ handle('system:forceUpdate', async () => {
 handle('system:setForceUpdate', (p, token) => {
   try {
     const data = store.setForceUpdate(token, p || {});
+    return { ok: true, data };
+  } catch (e) {
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
+// ---------- 订单数据保留期与自动清理 ----------
+// 属于服务端本机设置（与照片保存路径同理）：数据以服务端为准，
+// 客户端机器上的存档只是镜像，因此不做远程转发，客户端模式下界面禁用该项。
+handle('system:retention', (_p, token) => {
+  try {
+    return { ok: true, data: store.getRetention(token) };
+  } catch (e) {
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
+handle('system:setRetention', (p, token) => {
+  try {
+    // days 为 null / 空字符串表示取消自动删除；数字则须通过数据层的严格校验
+    const data = store.setRetention(token, p ? p.days : null);
+    return { ok: true, data };
+  } catch (e) {
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
+// 手动执行清理。dryRun=true 时只统计不删除，供管理员在真删前预览影响面。
+// 设置保留期本身不会立即删数据——删除只发生在自动任务或这里的显式操作，
+// 避免管理员改个数字就意外触发不可逆的批量删除。
+handle('system:purgeExpired', (p, token) => {
+  try {
+    const data = store.purgeExpiredRecords({ token, dryRun: !!(p && p.dryRun) });
     return { ok: true, data };
   } catch (e) {
     return { ok: false, message: e.message || String(e) };
@@ -1620,6 +1659,57 @@ function destroyTray() {
   }
 }
 
+// ---------- 订单数据自动清理调度 ----------
+// 仅服务端模式执行；实际删除逻辑与全部安全闸（未配置禁用、非服务端跳过、
+// 全删熔断）都在数据层 purgeExpiredRecords 内，这里只负责「何时触发」。
+let purgeStartupTimer = null;
+let purgeIntervalTimer = null;
+// 启动后延迟 90 秒再首次清理：避开开机与服务启动的高峰，
+// 也给系统时钟留出与时间服务器同步的余地（时钟未同步时全删熔断会兜底）
+const PURGE_STARTUP_DELAY_MS = 90 * 1000;
+// 每 6 小时检查一次：服务端通常长期开机，按小时级轮询即可及时清理，
+// 又不必每分钟空转
+const PURGE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+function runAutoPurge() {
+  try {
+    // 每次执行前重新判断模式：运行中可能已从服务端切到客户端
+    if (store.loadConfig().mode !== 'server') return;
+    // 不带 token 即自动执行：数据层据此启用「全删熔断」，
+    // 时钟异常导致将删光全部订单时会拒绝删除并告警
+    const r = store.purgeExpiredRecords({});
+    if (r && r.deleted > 0) {
+      console.log('[auto-purge] 已清理超期订单 ' + r.deleted + ' 条：' + r.reason);
+    }
+  } catch (e) {
+    // 自动任务绝不能因异常中断主进程或服务
+    console.error('[auto-purge] 自动清理异常：' + (e.message || e));
+  }
+}
+
+// 幂等：重复调用（启动时、运行中切换到服务端时）会先清掉旧定时器再重排，
+// 避免叠加出多个并行定时器导致重复清理
+function scheduleAutoPurge() {
+  if (purgeStartupTimer) clearTimeout(purgeStartupTimer);
+  if (purgeIntervalTimer) clearInterval(purgeIntervalTimer);
+  purgeStartupTimer = setTimeout(() => {
+    purgeStartupTimer = null;
+    runAutoPurge();
+  }, PURGE_STARTUP_DELAY_MS);
+  purgeIntervalTimer = setInterval(runAutoPurge, PURGE_INTERVAL_MS);
+}
+
+function stopAutoPurge() {
+  if (purgeStartupTimer) {
+    clearTimeout(purgeStartupTimer);
+    purgeStartupTimer = null;
+  }
+  if (purgeIntervalTimer) {
+    clearInterval(purgeIntervalTimer);
+    purgeIntervalTimer = null;
+  }
+}
+
 app.whenReady().then(async () => {
   // 第二道单实例守卫：正常情况下未获锁的实例早已 app.exit(0)，不会走到这里。
   // 保留这层判断是防止将来重构时（例如改动退出方式）让重复实例重新初始化，
@@ -1682,6 +1772,9 @@ app.whenReady().then(async () => {
           /* 忽略 */
         }
       }
+      // 服务端以本机数据为准，启用订单自动清理调度
+      // （未配置保留期时数据层会直接跳过，不会删任何数据）
+      scheduleAutoPurge();
     } catch (e) {
       console.error('[server] 启动失败：' + (e.message || e));
     }
@@ -1703,6 +1796,9 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  // 先停掉自动清理定时器：避免退出过程中刚好触发清理，
+  // 与关闭流程并发读写 records.json 和照片文件
+  stopAutoPurge();
   destroyTray();
   if (httpServer) {
     try {

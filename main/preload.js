@@ -139,6 +139,10 @@ contextBridge.exposeInMainWorld('api', {
   // 开机自动启动（服务端模式可用，修改需系统管理员）
   autoLaunch: () => ipcRenderer.invoke('system:autoLaunch'),
   setAutoLaunch: (token, enabled) => ipcRenderer.invoke('system:setAutoLaunch', { enabled: !!enabled }, token),
+  // 订单数据保留期与清理（本机设置，不随客户端转发）
+  retention: (token) => ipcRenderer.invoke('system:retention', undefined, token),
+  setRetention: (token, days) => ipcRenderer.invoke('system:setRetention', { days: days === '' ? null : days }, token),
+  purgeExpired: (token, dryRun) => ipcRenderer.invoke('system:purgeExpired', { dryRun: !!dryRun }, token),
   // 强制推送安装包（服务端设置 / 客户端查询）
   forceUpdate: () => ipcRenderer.invoke('system:forceUpdate'),
   setForceUpdate: (token, enabled, fileName) =>

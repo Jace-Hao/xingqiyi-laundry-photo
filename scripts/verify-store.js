@@ -959,6 +959,195 @@ check('非安装包文件被忽略', () => {
   if (u.latestFile === 'readme.txt') throw new Error('无版本号文件应被忽略');
 });
 
+// ========== 订单数据保留期与自动清理 ==========
+// 这是不可逆的批量删除，用隔离的 store 实例测试，避免影响上面的用例数据。
+console.log('== 订单保留期与自动清理 ==');
+const purDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xqy-purge-'));
+const purStore = createStore({
+  dataDir: path.join(purDir, 'data'),
+  defaultPhotoDir: path.join(purDir, 'photos'),
+  updateDir: path.join(purDir, 'updates'),
+  appVersion: '0.1.0',
+  photoScheme: 'xqy-photo'
+});
+purStore.ensureSeedData();
+// 强制为服务端模式（清理仅服务端执行）
+purStore.setMode('server');
+const purAdmin = purStore.login({ username: 'admin', password: 'admin123' }).sessionToken;
+purStore.createUser(purAdmin, { username: 'clerk', name: '店员', password: 'clerk123', permissions: { capture: true, query: true } });
+const purClerk = purStore.login({ username: 'clerk', password: 'clerk123' }).sessionToken;
+
+/** 直接改写 records.json 的 createdAt，构造指定天数前的历史记录 */
+function backdateRecords(daysAgoById) {
+  const f = path.join(purDir, 'data', 'records.json');
+  const list = JSON.parse(fs.readFileSync(f, 'utf8'));
+  for (const r of list) {
+    const d = daysAgoById[r.barcode];
+    if (d !== undefined) r.createdAt = new Date(Date.now() - d * 86400000).toISOString();
+  }
+  fs.writeFileSync(f, JSON.stringify(list, null, 2), 'utf8');
+}
+
+function countPhotoFiles(dir) {
+  let n = 0;
+  const walk = (d) => {
+    for (const en of fs.readdirSync(d, { withFileTypes: true })) {
+      if (en.isDirectory()) walk(path.join(d, en.name));
+      else n++;
+    }
+  };
+  if (fs.existsSync(dir)) walk(dir);
+  return n;
+}
+
+check('默认未配置保留期：禁用且清理跳过，不删任何数据', () => {
+  purStore.addRecord(purClerk, { imageData: tinyJpeg, barcode: 'D001' });
+  const info = purStore.getRetention(purAdmin);
+  if (info.retentionDays !== null) throw new Error('默认应为 null，实际 ' + info.retentionDays);
+  if (info.enabled !== false) throw new Error('默认应为禁用');
+  if (info.wouldDelete !== 0) throw new Error('默认 should not 预览出待删数量');
+  const r = purStore.purgeExpiredRecords({});
+  if (r.skipped !== true) throw new Error('未配置时应跳过');
+  if (r.deleted !== 0) throw new Error('未配置时不应删除任何数据');
+  if (purStore.listRecords(purAdmin, { silent: true, pageSize: 100 }).total !== 1) throw new Error('数据被误删');
+});
+
+check('保留天数非法值一律拒绝（不做静默兜底）', () => {
+  // 0 天等于清空全部订单，必须显式拒绝
+  expectThrow(() => purStore.setRetention(purAdmin, 0), '不能为 0');
+  expectThrow(() => purStore.setRetention(purAdmin, -5), '不能为负数');
+  expectThrow(() => purStore.setRetention(purAdmin, 1.5), '必须是整数');
+  expectThrow(() => purStore.setRetention(purAdmin, 'abc'), '必须是数字');
+  expectThrow(() => purStore.setRetention(purAdmin, 99999), '过大');
+  // 拒绝后配置应保持未启用
+  if (purStore.getRetention(purAdmin).enabled !== false) throw new Error('非法值竟被接受');
+});
+
+check('设置保留期后不会立即删数据，只给出预览数量', () => {
+  // 造 2 条 400 天前的旧记录 + 保留 1 条今天的
+  purStore.addRecord(purClerk, { imageData: tinyJpeg, barcode: 'D002' });
+  purStore.addRecord(purClerk, { imageData: tinyJpeg, barcode: 'D003' });
+  backdateRecords({ D001: 400, D002: 400 });
+  const info = purStore.setRetention(purAdmin, 365);
+  if (info.retentionDays !== 365) throw new Error('保留期未保存：' + info.retentionDays);
+  if (info.enabled !== true) throw new Error('应标记为已启用');
+  if (info.wouldDelete !== 2) throw new Error('预览应显示 2 条待删，实际 ' + info.wouldDelete);
+  // 关键：设置动作本身不删数据
+  if (purStore.listRecords(purAdmin, { silent: true, pageSize: 100 }).total !== 3) {
+    throw new Error('设置保留期时不应立即删除数据');
+  }
+});
+
+check('dryRun 只统计不删除', () => {
+  const r = purStore.purgeExpiredRecords({ token: purAdmin, dryRun: true });
+  if (r.deleted !== 2) throw new Error('试算应报告 2 条，实际 ' + r.deleted);
+  if (r.dryRun !== true) throw new Error('dryRun 标志未回传');
+  if (purStore.listRecords(purAdmin, { silent: true, pageSize: 100 }).total !== 3) throw new Error('试算竟真的删了数据');
+  if (countPhotoFiles(path.join(purDir, 'photos')) !== 3) throw new Error('试算竟真的删了照片');
+});
+
+check('非系统管理员无权设置或执行清理', () => {
+  expectThrow(() => purStore.setRetention(purClerk, 30), '系统管理员');
+  expectThrow(() => purStore.getRetention(purClerk), '系统管理员');
+  expectThrow(() => purStore.purgeExpiredRecords({ token: purClerk }), '系统管理员');
+});
+
+check('客户端模式不执行清理（数据以服务端为准）', () => {
+  purStore.setClientConfig('192.168.1.10:17521', 'abc123');
+  const r = purStore.purgeExpiredRecords({});
+  if (r.skipped !== true) throw new Error('客户端模式应跳过');
+  if (r.deleted !== 0) throw new Error('客户端模式不应删除数据');
+  if (purStore.listRecords(purAdmin, { silent: true, pageSize: 100 }).total !== 3) throw new Error('客户端模式下数据被误删');
+  purStore.setMode('server'); // 恢复
+});
+
+check('实际清理：删除超期订单与照片，保留未超期的', () => {
+  const before = purStore.listRecords(purAdmin, { silent: true, pageSize: 100 }).total;
+  if (before !== 3) throw new Error('前置数据异常：' + before);
+  const r = purStore.purgeExpiredRecords({ token: purAdmin });
+  if (r.deleted !== 2) throw new Error('应删除 2 条，实际 ' + r.deleted);
+  if (r.photosRemoved !== 2) throw new Error('应删除 2 张照片，实际 ' + r.photosRemoved);
+  if (r.kept !== 1) throw new Error('应保留 1 条，实际 ' + r.kept);
+  const left = purStore.listRecords(purAdmin, { silent: true, pageSize: 100 });
+  if (left.total !== 1) throw new Error('清理后应剩 1 条，实际 ' + left.total);
+  if (left.items[0].barcode !== 'D003') throw new Error('删除的不是超期记录，剩下的是 ' + left.items[0].barcode);
+  if (countPhotoFiles(path.join(purDir, 'photos')) !== 1) throw new Error('照片文件数量不符');
+  // 被删记录的照片文件必须真的从磁盘消失（按文件数判定，不看目录是否还在）
+  const d001dir = path.join(purDir, 'photos', 'D001');
+  if (fs.existsSync(d001dir) && fs.readdirSync(d001dir).length !== 0) {
+    throw new Error('D001 的照片文件未被删除：' + fs.readdirSync(d001dir).join(','));
+  }
+  // 空条码目录刻意保留：删目录属于超出需求范围的额外不可逆操作，
+  // 需求只要求删除订单数据；残留空目录无害，故不验证目录被删除
+});
+
+check('清理具备幂等性：重复执行不会多删', () => {
+  const r = purStore.purgeExpiredRecords({ token: purAdmin });
+  if (r.deleted !== 0) throw new Error('第二次不应再删，实际 ' + r.deleted);
+  if (purStore.listRecords(purAdmin, { silent: true, pageSize: 100 }).total !== 1) throw new Error('幂等执行后数据变了');
+});
+
+check('createdAt 缺失的记录不被清理（无法判断年龄则保留）', () => {
+  const f = path.join(purDir, 'data', 'records.json');
+  const list = JSON.parse(fs.readFileSync(f, 'utf8'));
+  list.push({ id: 'no-date-rec', barcode: 'D-NODATE', seq: 1, userId: 'x', username: 'x', storeName: '', note: '', photoFile: '' });
+  fs.writeFileSync(f, JSON.stringify(list, null, 2), 'utf8');
+  const r = purStore.purgeExpiredRecords({ token: purAdmin });
+  if (r.deleted !== 0) throw new Error('无时间戳的记录不应被删，实际删了 ' + r.deleted);
+  const left = purStore.listRecords(purAdmin, { silent: true, pageSize: 100 });
+  if (!left.items.some((x) => x.barcode === 'D-NODATE')) throw new Error('无时间戳记录被误删');
+});
+
+check('自动执行遇「将删光全部」时熔断，且不删任何数据', () => {
+  // 模拟时钟异常：把保留期设成 1 天，并把仅剩的记录也改到 2 天前，
+  // 使自动清理（无 token）会命中全部记录 —— 这正是时钟跳到未来时的等效后果
+  purStore.setRetention(purAdmin, 1);
+  backdateRecords({ 'D-NODATE': 2, D003: 2 });
+  const beforeCount = purStore.listRecords(purAdmin, { silent: true, pageSize: 100 }).total;
+  const r = purStore.purgeExpiredRecords({}); // 无 token = 自动执行
+  if (r.skipped !== true) throw new Error('自动执行应熔断跳过');
+  if (r.deleted !== 0) throw new Error('熔断后仍删除了 ' + r.deleted + ' 条');
+  if (!/熔断/.test(r.reason)) throw new Error('未给出熔断原因：' + r.reason);
+  if (purStore.listRecords(purAdmin, { silent: true, pageSize: 100 }).total !== beforeCount) {
+    throw new Error('熔断未生效，数据被删');
+  }
+  // 熔断必须留痕，否则管理员不知道自动清理为什么没跑
+  const logs = purStore.listLogs(purAdmin, { silent: true, action: '自动清理过期订单', pageSize: 50 });
+  if (!logs.items.some((l) => /熔断/.test(l.detail))) throw new Error('熔断未记入日志');
+  if (!logs.items.some((l) => l.result === '失败')) throw new Error('熔断日志应标记为失败');
+});
+
+check('手动执行（管理员明确发起）可以清空全部超期订单', () => {
+  // 熔断只拦自动执行；管理员手动执行是知情操作，且界面会先展示预览数量
+  const r = purStore.purgeExpiredRecords({ token: purAdmin });
+  if (r.skipped === true) throw new Error('手动执行不应被熔断拦住：' + r.reason);
+  if (r.deleted < 1) throw new Error('手动执行应删除超期订单，实际 ' + r.deleted);
+  if (purStore.listRecords(purAdmin, { silent: true, pageSize: 100 }).total !== 0) throw new Error('手动执行后应无剩余');
+});
+
+check('取消保留期后恢复为禁用，且不再清理', () => {
+  purStore.addRecord(purAdmin, { imageData: tinyJpeg, barcode: 'E001' });
+  backdateRecords({ E001: 9999 });
+  const info = purStore.setRetention(purAdmin, null);
+  if (info.enabled !== false || info.retentionDays !== null) throw new Error('取消后仍为启用');
+  const r = purStore.purgeExpiredRecords({ token: purAdmin });
+  if (r.skipped !== true || r.deleted !== 0) throw new Error('取消后仍在清理');
+});
+
+check('保留期设置与清理均记入操作日志', () => {
+  const opts = purStore.logActionOptions(purAdmin);
+  for (const a of ['设置订单保留期', '取消订单保留期', '自动清理过期订单']) {
+    if (!opts.includes(a)) throw new Error('筛选清单缺少动作类型：' + a);
+  }
+  const setLogs = purStore.listLogs(purAdmin, { silent: true, action: '设置订单保留期', pageSize: 50 });
+  if (!setLogs.items.length) throw new Error('设置保留期未记日志');
+  if (!/将删除/.test(setLogs.items[0].detail)) throw new Error('设置日志应含预览删除数量：' + setLogs.items[0].detail);
+  const purgeLogs = purStore.listLogs(purAdmin, { silent: true, action: '自动清理过期订单', pageSize: 50 });
+  if (!purgeLogs.items.some((l) => /剩余/.test(l.detail))) throw new Error('清理日志应含剩余条数');
+});
+
+fs.rmSync(purDir, { recursive: true, force: true });
+
 console.log('\n结果：' + passed + ' 通过，' + failed + ' 失败');
 fs.rmSync(tmpDir, { recursive: true, force: true });
 process.exit(failed ? 1 : 0);

@@ -3006,6 +3006,163 @@ const AdminSystemPage = {
       }
     }
 
+    // ---------- 订单数据保留期与自动清理（仅服务端生效） ----------
+    // retentionInfo: { retentionDays, enabled, runnable, mode, recordCount, wouldDelete,
+    //                  cutoffIso, lastAutoPurgeAt }
+    const retentionInfo = Vue.ref(null);
+    const savingRetention = Vue.ref(false);
+    const purging = Vue.ref(false);
+    // 输入框用字符串：空串表示「取消自动删除」，避免用 null 与 0 混淆
+    // （0 会被数据层拒绝——那等于删光全部订单）
+    const retentionInput = Vue.ref('');
+    const purgeResult = Vue.ref(''); // 最近一次试算/清理的结果文案
+
+    async function loadRetention() {
+      try {
+        const r = await window.api.retention(props.token);
+        if (r.ok && r.data) {
+          retentionInfo.value = r.data;
+          // 仅在未编辑时回填，避免覆盖管理员正在输入的值
+          if (!savingRetention.value) {
+            retentionInput.value = r.data.retentionDays === null ? '' : String(r.data.retentionDays);
+          }
+        } else if (r.message) {
+          // 无权限（非系统管理员）或读取失败时不弹错，交给下方提示区说明
+          retentionInfo.value = null;
+        }
+      } catch (e) {
+        retentionInfo.value = null;
+      }
+    }
+
+    // 仅服务端模式可设置与执行：客户端本机存档只是镜像，删了会造成两端不一致
+    const canSetRetention = Vue.computed(() => !!(retentionInfo.value && retentionInfo.value.runnable));
+    const retentionDisabledReason = Vue.computed(() => {
+      const r = retentionInfo.value;
+      if (!r) return '无法读取保留期设置：请确认已用系统管理员账号登录。';
+      if (!r.runnable) return '仅服务端模式可设置订单保留期。客户端本机存档只是服务端的镜像，删除会造成两端不一致；请在服务端电脑上设置。';
+      return '';
+    });
+
+    /** 校验输入，返回数字或 null（取消）；非法时返回 { error } */
+    function parseRetentionInput() {
+      const raw = String(retentionInput.value || '').trim();
+      if (raw === '') return { value: null };
+      if (!/^\d+$/.test(raw)) return { error: '请输入整数天数，或留空表示不自动删除' };
+      const n = Number(raw);
+      if (n === 0) return { error: '保留天数不能为 0（那等于删除全部订单）；如需关闭自动删除请清空后保存' };
+      if (n > 3650) return { error: '保留天数过大（最多 3650 天）' };
+      return { value: n };
+    }
+
+    async function saveRetention() {
+      const parsed = parseRetentionInput();
+      if (parsed.error) {
+        toast(parsed.error, 'error');
+        return;
+      }
+      // 缩短保留期会让更多订单变成「超期」，保存前必须让管理员知道影响面
+      if (parsed.value !== null && retentionInfo.value) {
+        const cur = retentionInfo.value.retentionDays;
+        const shrinking = cur === null || parsed.value < cur;
+        if (shrinking) {
+          const ok = window.confirm(
+            `将订单保留期设为 ${parsed.value} 天后，超过该期限的订单及其照片将被自动删除，且不可恢复。\n\n` +
+              `保存本身不会立即删除数据（自动清理按计划在后台执行），但你也可以点「试算」先看看会影响多少条。\n\n确定保存？`
+          );
+          if (!ok) return;
+        }
+      }
+      savingRetention.value = true;
+      try {
+        const r = await window.api.setRetention(props.token, parsed.value);
+        if (r.ok) {
+          toast(parsed.value === null ? '已取消订单自动删除' : `已设置订单保留期为 ${parsed.value} 天`, 'success');
+          purgeResult.value = '';
+          await loadRetention();
+          retentionInput.value = r.data.retentionDays === null ? '' : String(r.data.retentionDays);
+        } else {
+          toast(r.message || '设置失败', 'error');
+        }
+      } catch (e) {
+        toast('设置失败：' + (e.message || e), 'error');
+      } finally {
+        savingRetention.value = false;
+      }
+    }
+
+    /** 试算：只统计不删除，让管理员在真删之前看到确切影响面 */
+    async function previewPurge() {
+      purging.value = true;
+      try {
+        const r = await window.api.purgeExpired(props.token, true);
+        if (r.ok && r.data) {
+          purgeResult.value = r.data.skipped
+            ? '未执行：' + r.data.reason
+            : `试算结果：将删除 ${r.data.deleted} 条超期订单（截止时间点 ${fmt(r.data.cutoffIso)}），保留 ${r.data.kept} 条。尚未删除任何数据。`;
+        } else {
+          purgeResult.value = '';
+          toast(r.message || '试算失败', 'error');
+        }
+      } catch (e) {
+        toast('试算失败：' + (e.message || e), 'error');
+      } finally {
+        purging.value = false;
+      }
+    }
+
+    /** 立即清理：不可逆，先试算拿确切条数，再二次确认 */
+    async function purgeNow() {
+      purging.value = true;
+      try {
+        // 先取一次真实条数，避免用界面上可能已过期的 wouldDelete 去确认
+        const pre = await window.api.purgeExpired(props.token, true);
+        if (!pre.ok) throw new Error(pre.message || '试算失败');
+        if (pre.data.skipped) {
+          purgeResult.value = '未执行：' + pre.data.reason;
+          toast(pre.data.reason, 'error');
+          return;
+        }
+        const n = pre.data.deleted;
+        if (!n) {
+          purgeResult.value = '没有超过保留期的订单，无需清理。';
+          toast('没有超过保留期的订单', 'success');
+          return;
+        }
+        // 手动清理是刻意绕过「全删熔断」的（熔断只防无人值守的自动误删），
+        // 因此当本次会清空全部订单时，单独给出更醒目的警示，避免管理员误点。
+        const wipingAll = pre.data.kept === 0;
+        const ok = window.confirm(
+          (wipingAll
+            ? '⚠️ 警告：本次清理将删除【全部】订单数据，清理后系统将没有任何订单记录！\n\n'
+            : '') +
+            `即将永久删除 ${n} 条超期订单及其照片文件，此操作不可恢复。\n\n` +
+            `保留期：${pre.data.retentionDays} 天\n截止时间点：${fmt(pre.data.cutoffIso)}\n删除后剩余：${pre.data.kept} 条\n\n` +
+            (wipingAll ? '请先确认保留期设置正确，并务必先导出备份。' : '建议先导出备份。') +
+            '\n确定立即删除？'
+        );
+        if (!ok) {
+          purgeResult.value = '已取消，未删除任何数据。';
+          return;
+        }
+        const r = await window.api.purgeExpired(props.token, false);
+        if (r.ok && r.data) {
+          purgeResult.value =
+            `已删除 ${r.data.deleted} 条超期订单，删除照片 ${r.data.photosRemoved} 张` +
+            (r.data.photosMissing ? `（照片文件缺失 ${r.data.photosMissing} 张）` : '') +
+            `，剩余 ${r.data.kept} 条。`;
+          toast('清理完成：' + purgeResult.value, 'success');
+          await loadRetention();
+        } else {
+          toast(r.message || '清理失败', 'error');
+        }
+      } catch (e) {
+        toast('清理失败：' + (e.message || e), 'error');
+      } finally {
+        purging.value = false;
+      }
+    }
+
     async function loadForceUpdate() {
       const r = await window.api.forceUpdate();
       if (r.ok && r.data) {
@@ -3151,6 +3308,7 @@ const AdminSystemPage = {
       checkUpdate(false);
       loadForceUpdate();
       loadAutoLaunch();
+      loadRetention();
     }
 
     async function savePort() {
@@ -3225,7 +3383,11 @@ const AdminSystemPage = {
       downloading, downloadUpdateNow, cancelUpdateDownload, canAutoDownload, progressPercent, progressText, fmtSize,
       forceInfo, forceFile, savingForce, setForceUpdate, loadForceUpdate,
       autoLaunchInfo, savingAutoLaunch, toggleAutoLaunch,
-      loadAutoLaunch, canSetAutoLaunch, autoLaunchDisabledReason
+      loadAutoLaunch, canSetAutoLaunch, autoLaunchDisabledReason,
+      // 订单保留期与自动清理
+      retentionInfo, retentionInput, savingRetention, purging, purgeResult,
+      loadRetention, saveRetention, previewPurge, purgeNow,
+      canSetRetention, retentionDisabledReason, fmt
     };
   },
   template: `
@@ -3322,6 +3484,76 @@ const AdminSystemPage = {
           持续为各客户端提供照片服务，避免门店断电重启后服务没起来。
           需要操作界面时点托盘图标即可打开。仅服务端电脑需要开启。
         </p>
+      </div>
+
+      <div v-if="info" class="card" style="margin-top:18px">
+        <div class="card-title">🗑️ 订单数据保留期</div>
+
+        <div class="info-row">
+          <span>当前设置</span>
+          <b v-if="!retentionInfo">未知（无权限或读取失败）</b>
+          <b v-else-if="retentionInfo.enabled" style="color:#d97706">
+            保留 {{ retentionInfo.retentionDays }} 天（超期订单及照片自动删除）
+          </b>
+          <b v-else>未启用（订单永久保留，不会自动删除）</b>
+        </div>
+        <div v-if="retentionInfo" class="info-row"><span>当前订单总数</span><b>{{ retentionInfo.recordCount }} 条</b></div>
+        <div v-if="retentionInfo && retentionInfo.lastAutoPurgeAt" class="info-row">
+          <span>上次清理</span><b>{{ fmt(retentionInfo.lastAutoPurgeAt) }}</b>
+        </div>
+        <div v-if="retentionInfo && retentionInfo.enabled" class="info-row">
+          <span>按当前时间试算</span>
+          <b :style="retentionInfo.wouldDelete ? 'color:#dc2626' : ''">
+            {{ retentionInfo.wouldDelete ? '将删除 ' + retentionInfo.wouldDelete + ' 条' : '暂无超期订单' }}
+          </b>
+        </div>
+
+        <label style="margin-top:16px">保留天数（留空表示不自动删除）</label>
+        <div style="display:flex;gap:10px;align-items:center">
+          <input
+            v-model="retentionInput"
+            type="number"
+            min="1"
+            max="3650"
+            step="1"
+            style="max-width:160px"
+            placeholder="如 365"
+            :disabled="!canSetRetention || savingRetention"
+          />
+          <span class="setup-desc" style="margin:0">天</span>
+          <button class="btn btn-primary" :disabled="!canSetRetention || savingRetention" @click="saveRetention">
+            {{ savingRetention ? '保存中…' : '保存' }}
+          </button>
+          <button class="btn btn-ghost btn-sm" :disabled="savingRetention" @click="loadRetention">刷新</button>
+        </div>
+
+        <p v-if="!canSetRetention" class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#fef9ec;border:1px solid #f5e0b0;border-radius:8px">
+          ⚠️ {{ retentionDisabledReason }}
+        </p>
+
+        <template v-else>
+          <p class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#fef2f2;border:1px solid #f5c2c2;border-radius:8px">
+            ⚠️ <b>删除不可恢复。</b>超过保留期的订单记录与照片文件会被一并永久删除。
+            设置保留期后<b>不会立即删除</b>数据——自动清理在服务端启动 90 秒后执行一次，此后每 6 小时检查一次。
+            建议首次设置前先用下方「试算」查看影响范围，并定期导出备份。
+          </p>
+
+          <div style="display:flex;gap:10px;margin-top:12px;align-items:center">
+            <button class="btn btn-ghost" :disabled="purging || !retentionInfo || !retentionInfo.enabled" @click="previewPurge">
+              {{ purging ? '处理中…' : '试算（不删除）' }}
+            </button>
+            <button class="btn btn-danger" :disabled="purging || !retentionInfo || !retentionInfo.enabled" @click="purgeNow">
+              {{ purging ? '处理中…' : '立即清理超期订单' }}
+            </button>
+            <span v-if="!retentionInfo || !retentionInfo.enabled" class="setup-desc" style="margin:0">
+              需先设置并保存保留天数
+            </span>
+          </div>
+
+          <p v-if="purgeResult" class="setup-desc" style="margin-top:12px;padding:10px 12px;background:#f6f8fa;border:1px solid #e3e9f4;border-radius:8px">
+            {{ purgeResult }}
+          </p>
+        </template>
       </div>
 
       <div v-if="info" class="card" style="margin-top:18px">

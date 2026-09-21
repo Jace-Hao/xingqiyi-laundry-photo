@@ -95,7 +95,13 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     trialStartedAt: '',
     activation: null,
     // 强制推送安装包：{ enabled, version, fileName, at, by }
-    forceUpdate: null
+    forceUpdate: null,
+    // 订单数据保留天数：null = 未配置/禁用（默认，永不自动删除）。
+    // 刻意不用 0 作默认值——0 会被理解为「保留 0 天」从而清空全部数据，
+    // 这是最危险的误解。仅当明确设为正整数时才会触发自动清理。
+    retentionDays: null,
+    // 上次自动清理的执行时间，用于避免重复清理与排查问题
+    lastAutoPurgeAt: null
   });
 
   function loadConfig() {
@@ -1055,6 +1061,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     '新增用户', '修改用户', '删除用户',
     '查询日志', '修改端口', '重置连接码', '修改照片路径',
     '开启开机自启', '取消开机自启',
+    '设置订单保留期', '取消订单保留期', '自动清理过期订单',
     '强制推送安装包', '取消强制推送', '初始化'
   ];
 
@@ -1448,6 +1455,229 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     return getForceUpdate();
   }
 
+  // ---------- 订单数据保留期与自动清理 ----------
+  // 这是不可逆的批量删除，因此刻意做了多重保护：
+  // 1) 默认 retentionDays = null 表示禁用，未配置时任何情况下都不会删数据；
+  // 2) 最小 1 天，显式拒绝 0——「保留 0 天」等于清空全部订单，太容易被误设；
+  // 3) 提供 dryRun 预览，管理员可先看到「将删除多少条」再决定是否开启；
+  // 4) 仅服务端模式执行：客户端本机的存档只是镜像，真正的数据在服务端，
+  //    在客户端删除镜像既无意义又会造成两端不一致；
+  // 5) 每次执行都写操作日志（含删除条数与保留天数），便于事后追溯。
+
+  /** 保留期上限：10 年。超过视为配置异常，拒绝设置 */
+  const RETENTION_MAX_DAYS = 3650;
+
+  /**
+   * 校验并规范化保留天数。
+   * 返回 null 表示「禁用自动清理」；返回正整数表示保留天数。
+   * 其余输入（0、负数、小数、超大值、非数字）一律抛错，不做静默兜底——
+   * 静默把非法值当成某个默认天数，恰恰是最危险的（可能变成全删或永不删）。
+   */
+  function normalizeRetentionDays(v) {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    if (!Number.isFinite(n)) throw new Error('保留天数必须是数字，或留空表示不自动删除');
+    if (!Number.isInteger(n)) throw new Error('保留天数必须是整数天');
+    if (n === 0) throw new Error('保留天数不能为 0（那等于删除全部订单）；如需关闭自动删除请留空');
+    if (n < 0) throw new Error('保留天数不能为负数');
+    if (n > RETENTION_MAX_DAYS) throw new Error('保留天数过大（最多 ' + RETENTION_MAX_DAYS + ' 天）');
+    return n;
+  }
+
+  /**
+   * 计算清理的截止时间点。
+   * 采用「从现在往前推 N 天」的滚动窗口（绝对时间），不依赖时区与日历日，
+   * 避免因时区差异导致多删或少删一天的记录。
+   */
+  function retentionCutoffIso(days, atMs) {
+    const base = typeof atMs === 'number' ? atMs : Date.now();
+    return new Date(base - days * 24 * 60 * 60 * 1000).toISOString();
+  }
+
+  /** 读取当前保留期配置与「若立即执行将删除多少条」的预览 */
+  function getRetention(token) {
+    requireSystemSettings(token);
+    const c = loadConfig();
+    const days = normalizeRetentionDays(c.retentionDays);
+    const records = loadRecords();
+    const out = {
+      retentionDays: days,
+      enabled: days !== null,
+      lastAutoPurgeAt: c.lastAutoPurgeAt || null,
+      mode: c.mode,
+      // 客户端模式下不执行清理，界面据此禁用开关并说明原因
+      runnable: c.mode === 'server',
+      recordCount: records.length,
+      cutoffIso: days ? retentionCutoffIso(days) : null
+    };
+    if (days) {
+      // 预览：按当前时间试算将命中的条数，让管理员在开启前就能预判影响面
+      const cutoff = out.cutoffIso;
+      out.wouldDelete = records.filter((r) => String(r.createdAt || '') && r.createdAt < cutoff).length;
+    } else {
+      out.wouldDelete = 0;
+    }
+    return out;
+  }
+
+  /**
+   * 设置（或取消）订单保留期。
+   * @param {string} token 会话令牌（需系统管理员权限）
+   * @param {number|null} days 保留天数；null 表示取消自动删除
+   */
+  function setRetention(token, days) {
+    const me = requireSystemSettings(token);
+    const next = normalizeRetentionDays(days);
+    const c = loadConfig();
+    const prev = normalizeRetentionDays(c.retentionDays);
+    if (next === prev) return getRetention(token);
+
+    c.retentionDays = next;
+    saveConfig(c);
+
+    if (next === null) {
+      appendLog({
+        ...logBase(me),
+        module: '系统设置',
+        action: '取消订单保留期',
+        detail: prev ? `取消订单自动删除（原保留 ${prev} 天）；此后订单不再被自动清理` : '取消订单自动删除',
+        result: '成功'
+      });
+    } else {
+      // 设置时就把「将删除多少条」写进日志，管理员事后可核对是否与预期一致
+      const cutoff = retentionCutoffIso(next);
+      const wouldDelete = loadRecords().filter((r) => String(r.createdAt || '') && r.createdAt < cutoff).length;
+      appendLog({
+        ...logBase(me),
+        module: '系统设置',
+        action: '设置订单保留期',
+        detail:
+          `设置订单保留期为 ${next} 天（超期订单及照片将自动删除）；` +
+          `按当前时间试算，将删除 ${wouldDelete} 条已有记录`,
+        result: '成功'
+      });
+    }
+    return getRetention(token);
+  }
+
+  /**
+   * 执行过期订单清理。
+   *
+   * @param {object} opts
+   *   - token: 手动执行时传入（需系统管理员权限）；自动执行时不传
+   *   - dryRun: true 时只统计不删除，供界面预览影响面
+   *   - force: true 时跳过「仅服务端模式」限制（仅用于测试/特殊场景）
+   * @returns {{deleted:number, photosRemoved:number, photosMissing:number, kept:number,
+   *            dryRun:boolean, skipped:boolean, reason:string, cutoffIso:string, retentionDays:number|null}}
+   */
+  function purgeExpiredRecords(opts = {}) {
+    const dryRun = !!opts.dryRun;
+    const c = loadConfig();
+    const days = normalizeRetentionDays(c.retentionDays);
+
+    const base = {
+      deleted: 0, photosRemoved: 0, photosMissing: 0, kept: 0,
+      dryRun, skipped: false, reason: '', cutoffIso: '', retentionDays: days
+    };
+
+    // 未配置保留期：直接返回，绝不删除任何数据（这是最重要的一道闸）
+    if (days === null) return { ...base, skipped: true, reason: '未设置订单保留期，已跳过自动清理' };
+
+    // 仅服务端模式执行：客户端本机存档只是镜像，删了会造成两端不一致
+    if (!opts.force && c.mode !== 'server') {
+      return { ...base, skipped: true, reason: '当前非服务端模式，不执行自动清理（数据以服务端为准）' };
+    }
+
+    // 鉴权：手动执行必须是系统管理员；自动执行（无 token）由调用方负责，
+    // 因为启动时还没有任何登录会话
+    let actor = null;
+    if (opts.token !== undefined && opts.token !== null && opts.token !== '') {
+      actor = requireSystemSettings(opts.token);
+    }
+
+    const cutoff = retentionCutoffIso(days);
+    const photoDir = getPhotoDir();
+    const records = loadRecords();
+    const kept = [];
+    const expired = [];
+    for (const r of records) {
+      // createdAt 缺失的记录不清理：无法判断年龄，宁可保留也不误删
+      if (!r || !r.createdAt) {
+        kept.push(r);
+        continue;
+      }
+      if (String(r.createdAt) < cutoff) expired.push(r);
+      else kept.push(r);
+    }
+
+    base.kept = kept.length;
+    base.deleted = expired.length;
+    base.cutoffIso = cutoff;
+    if (!expired.length) {
+      return { ...base, skipped: false, reason: '没有超过保留期的订单' };
+    }
+
+    // 熔断：自动执行（无操作者）时，如果这一轮会把全部订单删光，几乎不可能是
+    // 正常到期，而更像是系统时钟异常跳到未来——那样 cutoff = now - N 天 会落到
+    // 未来，导致所有记录都被判为「超期」。此时拒绝删除并告警，宁可不清理，
+    // 也绝不在无人值守时误删整库。手动执行（有系统管理员操作者）不受此限制，
+    // 因为那是管理员明确发起的、能看到预览数量的操作。
+    const isAutoRun = !actor;
+    if (isAutoRun && kept.length === 0) {
+      appendLog({
+        userId: null,
+        username: 'system',
+        role: 'sysadmin',
+        module: '数据管理',
+        action: '自动清理过期订单',
+        detail:
+          `自动清理已熔断：按保留期 ${days} 天试算将删除全部 ${expired.length} 条订单（无剩余）。` +
+          `这通常意味着系统时钟异常（当前时间 ${now()}，截止点 ${cutoff}）。已跳过本次清理，未删除任何数据；` +
+          `请核对服务器时间后重试，或在「系统设置 → 订单数据保留」中手动执行。`,
+        result: '失败'
+      });
+      return { ...base, deleted: 0, skipped: true, reason: '已熔断：本轮将删除全部订单，疑似系统时钟异常，未执行删除' };
+    }
+
+    if (dryRun) return { ...base, reason: `试算：将删除 ${expired.length} 条超期订单` };
+
+    // 真删：先删照片文件，再落盘记录。
+    // 顺序很重要——若先删记录再删照片，中途失败会留下无主的孤儿照片文件。
+    for (const r of expired) {
+      const rel = String(r.photoFile || '');
+      if (!rel) continue;
+      const abs = path.join(photoDir, rel);
+      try {
+        fs.unlinkSync(abs);
+        base.photosRemoved++;
+      } catch (e) {
+        base.photosMissing++;
+      }
+    }
+    saveRecords(kept);
+
+    // 刻意不清理「变空的条码目录」：删目录属于额外的不可逆操作，超出本需求范围
+    // （需求只要求按保留期删除订单数据）。残留空目录无害，
+    // 需要时可由管理员手动整理照片目录，不在自动任务里替用户做删除决定。
+
+    c.lastAutoPurgeAt = now();
+    saveConfig(c);
+
+    const barcodes = new Set(expired.map((r) => String(r.barcode || '')).filter(Boolean));
+    appendLog({
+      ...(actor ? logBase(actor) : { userId: null, username: 'system', role: 'sysadmin' }),
+      module: '数据管理',
+      action: '自动清理过期订单',
+      detail:
+        `按保留期 ${days} 天自动清理订单：删除 ${expired.length} 条（涉及 ${barcodes.size} 个条码），` +
+        `删除照片 ${base.photosRemoved} 张${base.photosMissing ? `，照片文件缺失 ${base.photosMissing} 张` : ''}，` +
+        `截止时间点 ${cutoff}，剩余 ${kept.length} 条`,
+      result: '成功'
+    });
+
+    return { ...base, reason: `已删除 ${expired.length} 条超期订单` };
+  }
+
   // 供服务端 HTTP 接口解析安装包绝对路径（已做路径穿越防护）
   function resolveUpdateFile(fileName) {
     const name = safeUpdateFileName(fileName);
@@ -1730,6 +1960,10 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     // 角色定义：前端渲染四级角色下拉与能力提示，避免与后端能力矩阵不一致
     roleOptions: ROLE_LABELS,
     roleDefs: ROLES,
+    // 订单数据保留期与自动清理
+    getRetention,
+    setRetention,
+    purgeExpiredRecords,
     overview,
     systemInfo,
     licenseStatus,
