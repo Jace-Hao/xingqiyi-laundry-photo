@@ -91,6 +91,8 @@ header{position:fixed;inset:0 0 auto 0;z-index:50;backdrop-filter:blur(14px);bac
 .tool-card h3{font-size:19px;margin-bottom:6px}
 .tool-card p{font-size:13.5px;color:var(--ink3);line-height:1.7}
 .pill{display:inline-flex;align-items:center;gap:7px;margin-top:14px;padding:8px 16px;border-radius:999px;border:1px solid var(--line);background:#12211566;color:var(--gold);font-size:13px;font-weight:700}
+.tool-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:14px}
+.tool-actions .pill{margin-top:0}
 /* SECTION: footer */
 .foot-cta{padding:90px 0;text-align:center;background:radial-gradient(700px 340px at 50% 120%,#1c3a1f80,transparent)}
 .foot-cta h2{margin-bottom:14px}
@@ -259,7 +261,10 @@ footer a{color:var(--gold)}
       <div>
         <h3>激活码生成工具</h3>
         <p>激活码生成工具（含机器码算法与密钥）不随软件公开分发，由项目维护者私下提供给管理员使用。客户端需要激活时，请把「设置」页显示的机器码发给管理员换取激活码。该工具页面设有管理员访问密码，未通过验证无法进入。</p>
-        <span class="pill">🔒 需向管理员索取</span>
+        <div class="tool-actions">
+          <a class="btn btn-gold" href="http://xqy.xqyxy.xyz/" target="_blank" rel="noopener">打开激活工具页 ↗</a>
+          <span class="pill">🔒 需向管理员索取</span>
+        </div>
       </div>
     </div>
   </div>
