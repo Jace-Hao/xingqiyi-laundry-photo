@@ -3841,34 +3841,35 @@ const Shell = {
       manual: ManualPage
     };
 
+    // 菜单图标为内联 SVG 常量（经 v-html 渲染；均为代码内固定字符串，无注入面）
     const pages = (() => {
       let list;
       if (isAdmin) {
         list = [
-          { key: 'overview', icon: '📊', label: '数据总览' },
-          { key: 'users', icon: '👥', label: '用户与权限' },
-          { key: 'logs', icon: '📋', label: '操作日志' },
-          { key: 'data', icon: '🗂️', label: '数据查看' },
-          { key: 'system', icon: '🛠️', label: '系统设置' }
+          { key: 'overview', icon: '<svg viewBox="0 0 24 24"><path d="M5 20v-7M11 20V5M17 20v-4.5"/><path d="M3.8 20h16.4"/></svg>', label: '数据总览' },
+          { key: 'users', icon: '<svg viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>', label: '用户与权限' },
+          { key: 'logs', icon: '<svg viewBox="0 0 24 24"><path d="M8 6.5h12M8 12h12M8 17.5h12"/><path d="M3.8 6.5h.01M3.8 12h.01M3.8 17.5h.01"/></svg>', label: '操作日志' },
+          { key: 'data', icon: '<svg viewBox="0 0 24 24"><path d="M3.8 7a2 2 0 0 1 2-2h3.4l1.9 2.3h7.1a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5.8a2 2 0 0 1-2-2Z"/></svg>', label: '数据查看' },
+          { key: 'system', icon: '<svg viewBox="0 0 24 24"><path d="M4 7.2h9.2M18.2 7.2H20M4 12h2.2M11 12h9M4 16.8h9.2M18.2 16.8H20"/><circle cx="15.6" cy="7.2" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.6" cy="16.8" r="2"/></svg>', label: '系统设置' }
         ];
       } else if (isStoreAdmin) {
         list = [
-          { key: 'home', icon: '🏠', label: '首页' },
-          { key: 'logs', icon: '📋', label: '本店日志' },
-          { key: 'query', icon: '🗂️', label: '本店订单' },
-          { key: 'settings', icon: '⚙️', label: '设置' }
+          { key: 'home', icon: '<svg viewBox="0 0 24 24"><path d="M4.6 10.8 12 4.6l7.4 6.2V19a1.6 1.6 0 0 1-1.6 1.6h-3.6v-5.4h-4.4v5.4H6.2A1.6 1.6 0 0 1 4.6 19Z"/></svg>', label: '首页' },
+          { key: 'logs', icon: '<svg viewBox="0 0 24 24"><path d="M8 6.5h12M8 12h12M8 17.5h12"/><path d="M3.8 6.5h.01M3.8 12h.01M3.8 17.5h.01"/></svg>', label: '本店日志' },
+          { key: 'query', icon: '<svg viewBox="0 0 24 24"><path d="M3.8 7a2 2 0 0 1 2-2h3.4l1.9 2.3h7.1a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5.8a2 2 0 0 1-2-2Z"/></svg>', label: '本店订单' },
+          { key: 'settings', icon: '<svg viewBox="0 0 24 24"><path d="M4 7.2h9.2M18.2 7.2H20M4 12h2.2M11 12h9M4 16.8h9.2M18.2 16.8H20"/><circle cx="15.6" cy="7.2" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.6" cy="16.8" r="2"/></svg>', label: '设置' }
         ];
       } else {
-        list = [{ key: 'home', icon: '🏠', label: '首页' }];
+        list = [{ key: 'home', icon: '<svg viewBox="0 0 24 24"><path d="M4.6 10.8 12 4.6l7.4 6.2V19a1.6 1.6 0 0 1-1.6 1.6h-3.6v-5.4h-4.4v5.4H6.2A1.6 1.6 0 0 1 4.6 19Z"/></svg>', label: '首页' }];
         // 拍照能力由角色派生，查询账号不显示拍照入口
-        if (canCapture) list.push({ key: 'capture', icon: '📷', label: '衣物拍照' });
-        list.push({ key: 'query', icon: '🔍', label: '记录查询' });
-        list.push({ key: 'settings', icon: '⚙️', label: '设置' });
+        if (canCapture) list.push({ key: 'capture', icon: '<svg viewBox="0 0 24 24"><path d="M14.5 5h-5L7.8 7.6H4.6A1.6 1.6 0 0 0 3 9.2v8.2a1.6 1.6 0 0 0 1.6 1.6h14.8a1.6 1.6 0 0 0 1.6-1.6V9.2a1.6 1.6 0 0 0-1.6-1.6h-3.2Z"/><circle cx="12" cy="13.2" r="3.1"/></svg>', label: '衣物拍照' });
+        list.push({ key: 'query', icon: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.4"/><path d="m19.8 19.8-3.2-3.2"/></svg>', label: '记录查询' });
+        list.push({ key: 'settings', icon: '<svg viewBox="0 0 24 24"><path d="M4 7.2h9.2M18.2 7.2H20M4 12h2.2M11 12h9M4 16.8h9.2M18.2 16.8H20"/><circle cx="15.6" cy="7.2" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.6" cy="16.8" r="2"/></svg>', label: '设置' });
       }
       // 操作手册对所有角色可见，统一在末尾追加：
       // 放在这里而不是三个分支各写一次，避免将来新增角色时漏加手册入口。
       // 手册内部已按角色裁剪章节，因此同一入口对不同角色显示不同内容。
-      list.push({ key: 'manual', icon: '📖', label: '操作手册' });
+      list.push({ key: 'manual', icon: '<svg viewBox="0 0 24 24"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg>', label: '操作手册' });
       return list;
     })();
 
@@ -3905,7 +3906,7 @@ const Shell = {
             :class="{ active: active === p.key }"
             @click="active = p.key"
           >
-            <span class="nav-icon">{{ p.icon }}</span>{{ p.label }}
+            <span class="nav-icon" v-html="p.icon"></span>{{ p.label }}
           </div>
         </nav>
         <div class="sidebar-foot">

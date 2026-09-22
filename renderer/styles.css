@@ -1,4 +1,8 @@
-/* ============ 星期衣精致洗衣衣物照片系统 · 全局样式 ============ */
+/* ============ 星期衣精致洗衣衣物照片系统 · 全局样式（v2 品牌化精修） ============ */
+/* 设计体系：墨绿 × 黄铜 × 纸白。
+   圆角规则：卡片 14 / 控件（按钮·输入）10 / 小控件 8 / 徽标 pill / 大容器（登录卡）18。
+   动效规则：统一过渡曲线 var(--ease)，170ms；尊重 prefers-reduced-motion。 */
+
 * {
   margin: 0;
   padding: 0;
@@ -6,19 +10,57 @@
 }
 
 :root {
-  --primary: #2563eb;
-  --primary-dark: #1d4ed8;
-  --danger: #dc2626;
-  --success: #16a34a;
-  --warning: #d97706;
-  --bg: #f2f6fc;
+  /* 品牌绿阶（logo / 发布页同源） */
+  --brand-50: #f2f8ea;
+  --brand-100: #e6f2d8;
+  --brand-200: #cde5b4;
+  --brand-300: #a8d37f;
+  --brand-400: #7cbb4d;
+  --brand-500: #4e9d1f;
+  --brand-600: #2f8f00;
+  --brand-700: #266f06;
+  --brand-800: #1d5607;
+  --brand-900: #133c0a;
+
+  /* 语义色（保留既有含义：红=错误/危险，琥珀=警示，绿=成功） */
+  --primary: #2b7a0b;
+  --primary-dark: #1f5e05;
+  --primary-soft: #eef6e4;
+  --primary-softer: #f5faf0;
+  --primary-ring: rgba(43, 122, 11, 0.16);
+  --danger: #cf3222;
+  --danger-dark: #ae2919;
+  --danger-soft: #fdeceb;
+  --success: #16883e;
+  --success-soft: #e9f7ee;
+  --warning: #b45309;
+  --warning-soft: #fef4e4;
+  --gold: #d8a92c;
+  --gold-deep: #8a6a1a;
+
+  /* 中性（纸白 · 绿灰） */
+  --bg: #f3f6ef;
   --card: #ffffff;
-  --border: #e3e9f4;
-  --text: #1e293b;
-  --text-sub: #64748b;
-  --sidebar: #152347;
-  --sidebar-hover: rgba(255, 255, 255, 0.08);
-  --sidebar-active: rgba(59, 130, 246, 0.28);
+  --border: #e2e8da;
+  --border-strong: #cfd9c6;
+  --text: #1c2317;
+  --text-sub: #5d6a54;
+  --text-faint: #8b9681;
+
+  /* 侧栏（深墨绿） */
+  --sidebar: #0f2314;
+  --sidebar-deep: #0b1a0e;
+  --sidebar-ink: #cfe0c6;
+  --sidebar-dim: #8aa383;
+  --sidebar-line: rgba(255, 255, 255, 0.07);
+  --sidebar-hover: rgba(255, 255, 255, 0.07);
+  --sidebar-active: rgba(124, 187, 77, 0.18);
+
+  --shadow-1: 0 1px 2px rgba(16, 38, 20, 0.05);
+  --shadow-2: 0 6px 18px rgba(16, 38, 20, 0.09);
+  --shadow-3: 0 24px 64px rgba(8, 22, 12, 0.28);
+
+  --ease: cubic-bezier(0.22, 0.8, 0.3, 1);
 }
 
 html,
@@ -38,20 +80,58 @@ body {
   height: 100%;
 }
 
+::selection {
+  background: rgba(47, 143, 0, 0.18);
+}
+
+/* 滚动条：与纸白主题一致 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c9d4be;
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #aebda0;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
 /* ---------- 通用 ---------- */
 .card {
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 14px;
   padding: 20px;
-  box-shadow: 0 1px 3px rgba(15, 34, 74, 0.05);
+  box-shadow: var(--shadow-1);
 }
 
 .card-title {
-  font-size: 16px;
+  font-size: 15.5px;
+  font-weight: 600;
   margin-bottom: 14px;
   padding-bottom: 10px;
   border-bottom: 1px solid var(--border);
+  color: var(--text);
 }
 
 .btn {
@@ -60,12 +140,23 @@ body {
   justify-content: center;
   gap: 4px;
   border: 1px solid transparent;
-  border-radius: 8px;
-  padding: 8px 16px;
+  border-radius: 10px;
+  padding: 9px 16px;
   font-size: 14px;
+  font-family: inherit;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: background 0.17s var(--ease), border-color 0.17s var(--ease),
+    color 0.17s var(--ease), box-shadow 0.17s var(--ease), transform 0.12s var(--ease);
   white-space: nowrap;
+}
+
+.btn:active:not(:disabled) {
+  transform: translateY(1px) scale(0.985);
+}
+
+.btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--primary-ring);
 }
 
 .btn:disabled {
@@ -76,21 +167,24 @@ body {
 .btn-primary {
   background: var(--primary);
   color: #fff;
+  box-shadow: 0 1px 2px rgba(20, 60, 10, 0.18);
 }
 
 .btn-primary:hover:not(:disabled) {
   background: var(--primary-dark);
+  box-shadow: 0 3px 10px rgba(31, 94, 5, 0.22);
 }
 
 .btn-ghost {
   background: #fff;
-  border-color: var(--border);
+  border-color: var(--border-strong);
   color: var(--text);
 }
 
 .btn-ghost:hover:not(:disabled) {
   border-color: var(--primary);
-  color: var(--primary);
+  color: var(--primary-dark);
+  background: var(--primary-softer);
 }
 
 .btn-danger {
@@ -99,7 +193,7 @@ body {
 }
 
 .btn-danger:hover:not(:disabled) {
-  background: #b91c1c;
+  background: var(--danger-dark);
 }
 
 .btn-block {
@@ -107,8 +201,9 @@ body {
 }
 
 .btn-sm {
-  padding: 4px 12px;
   font-size: 13px;
+  padding: 5px 12px;
+  border-radius: 8px;
 }
 
 label {
@@ -123,21 +218,26 @@ select,
 textarea {
   width: 100%;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 10px;
   padding: 9px 12px;
   font-size: 14px;
   font-family: inherit;
   color: var(--text);
   background: #fff;
   outline: none;
-  transition: border-color 0.15s;
+  transition: border-color 0.17s var(--ease), box-shadow 0.17s var(--ease);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-faint);
 }
 
 input:focus,
 select:focus,
 textarea:focus {
   border-color: var(--primary);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+  box-shadow: 0 0 0 3px var(--primary-ring);
 }
 
 textarea {
@@ -149,33 +249,33 @@ textarea {
   font-size: 12px;
   border-radius: 999px;
   padding: 2px 10px;
-  background: #eef4ff;
-  color: var(--primary);
+  background: var(--primary-soft);
+  color: var(--primary-dark);
 }
 
 .tag-green {
-  background: #ecfdf3;
+  background: var(--success-soft);
   color: var(--success);
 }
 
 .tag-gray {
-  background: #f1f5f9;
+  background: #f1f4ec;
   color: var(--text-sub);
 }
 
 .tag-red {
-  background: #fef2f2;
+  background: var(--danger-soft);
   color: var(--danger);
 }
 
 .tag-orange {
-  background: #fff7ed;
+  background: var(--warning-soft);
   color: var(--warning);
 }
 
 .tag-owner {
-  background: #f5f3ff;
-  color: #7c3aed;
+  background: #e8f4f2;
+  color: #0e6f64;
 }
 
 /* ---------- Toast ---------- */
@@ -185,14 +285,14 @@ textarea {
   left: 50%;
   transform: translate(-50%, -16px);
   padding: 10px 22px;
-  border-radius: 8px;
+  border-radius: 10px;
   color: #fff;
-  font-size: 14px;
+  font-size: 13.5px;
   opacity: 0;
   pointer-events: none;
-  transition: all 0.25s;
+  transition: opacity 0.25s var(--ease), transform 0.25s var(--ease);
   z-index: 999;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+  box-shadow: 0 10px 28px rgba(8, 22, 12, 0.25);
 }
 
 .toast.show {
@@ -214,15 +314,18 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, #152347 0%, #1d4ed8 100%);
+  background:
+    radial-gradient(720px 380px at 82% 8%, rgba(216, 169, 44, 0.14), transparent 62%),
+    radial-gradient(860px 520px at 12% 92%, rgba(47, 143, 0, 0.2), transparent 66%),
+    linear-gradient(142deg, #0c1e10 0%, #123018 52%, #0c2513 100%);
 }
 
 .login-card {
   width: 400px;
   background: #fff;
-  border-radius: 16px;
+  border-radius: 18px;
   padding: 40px 36px 30px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+  box-shadow: var(--shadow-3);
   text-align: center;
 }
 
@@ -231,7 +334,7 @@ textarea {
   height: 64px;
   margin: 0 auto 12px;
   border-radius: 18px;
-  background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+  background: linear-gradient(135deg, var(--brand-500), var(--brand-700));
   display: flex;
   align-items: center;
   justify-content: center;
@@ -249,11 +352,14 @@ textarea {
 
 .login-card h1 {
   font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
 }
 
 .login-sub {
   color: var(--text-sub);
-  margin: 4px 0 22px;
+  margin: 6px 0 22px;
+  font-size: 13.5px;
 }
 
 .login-card form {
@@ -279,9 +385,9 @@ textarea {
   right: 0;
   z-index: 30;
   background: #fff;
-  border: 1px solid var(--border, #e3e8ef);
-  border-radius: 10px;
-  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.16);
+  border: 1px solid var(--border, #e2e8da);
+  border-radius: 12px;
+  box-shadow: var(--shadow-2);
   max-height: 260px;
   overflow-y: auto;
   text-align: left;
@@ -293,11 +399,11 @@ textarea {
   gap: 8px;
   padding: 9px 10px;
   cursor: pointer;
-  border-bottom: 1px solid var(--border, #eef1f5);
+  border-bottom: 1px solid #eef2e8;
 }
 
 .login-user-item:hover {
-  background: #f4f8ff;
+  background: var(--primary-softer);
 }
 
 .login-user-item:last-of-type {
@@ -356,13 +462,13 @@ textarea {
 }
 
 .lui-del:hover {
-  background: #fde8e8;
+  background: var(--danger-soft);
   color: var(--danger);
 }
 
 .login-user-foot {
   padding: 6px 8px;
-  border-top: 1px solid var(--border, #eef1f5);
+  border-top: 1px solid #eef2e8;
   display: flex;
   justify-content: flex-end;
 }
@@ -392,10 +498,10 @@ textarea {
 
 /* 风险与不可用提示：用琥珀色引起注意，但不用红色——红色在本系统表示错误/失败 */
 .login-cred-tip.warn {
-  color: #92600a;
-  background: #fef9ec;
-  border: 1px solid #f5e0b0;
-  border-radius: 8px;
+  color: var(--gold-deep);
+  background: #fdf8ec;
+  border: 1px solid #efdfb4;
+  border-radius: 10px;
   padding: 8px 10px;
 }
 
@@ -405,11 +511,11 @@ textarea {
 .login-revoked {
   margin-top: 14px;
   padding: 11px 13px;
-  border: 1px solid #c7d7f5;
-  border-left: 4px solid #2563eb;
-  border-radius: 8px;
-  background: #eef4ff;
-  color: #1e3a8a;
+  border: 1px solid var(--brand-200);
+  border-left: 4px solid var(--brand-600);
+  border-radius: 10px;
+  background: var(--brand-50);
+  color: #23520b;
   font-size: 13px;
   line-height: 1.6;
   text-align: left;
@@ -439,10 +545,10 @@ textarea {
 .manual-version-warn {
   margin-bottom: 14px;
   padding: 10px 14px;
-  border: 1px solid #f5e0b0;
-  border-radius: 8px;
-  background: #fef9ec;
-  color: #92600a;
+  border: 1px solid #efdfb4;
+  border-radius: 10px;
+  background: #fdf8ec;
+  color: var(--gold-deep);
   font-size: 13px;
   line-height: 1.6;
 }
@@ -461,9 +567,10 @@ textarea {
   max-height: calc(100vh - 140px);
   overflow-y: auto;
   background: #fff;
-  border: 1px solid var(--border, #e3e9f4);
-  border-radius: 12px;
+  border: 1px solid var(--border, #e2e8da);
+  border-radius: 14px;
   padding: 12px 8px;
+  box-shadow: var(--shadow-1);
 }
 
 .manual-toc-title {
@@ -482,21 +589,22 @@ textarea {
 
 .manual-toc-item {
   padding: 6px 10px;
-  border-radius: 7px;
+  border-radius: 8px;
   font-size: 13px;
   line-height: 1.5;
   color: var(--text);
   cursor: pointer;
   word-break: break-word;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
 }
 
 .manual-toc-item:hover {
-  background: #f2f6fc;
+  background: var(--bg);
 }
 
 .manual-toc-item.active {
-  background: #eaf1ff;
-  color: var(--primary, #1d4ed8);
+  background: var(--primary-soft);
+  color: var(--primary-dark);
   font-weight: 600;
 }
 
@@ -508,7 +616,7 @@ textarea {
 }
 
 .manual-toc-item.sub.active {
-  color: var(--primary, #1d4ed8);
+  color: var(--primary-dark);
 }
 
 .manual-toc-empty {
@@ -566,20 +674,20 @@ textarea {
   font-size: 21px;
   margin: 0 0 16px;
   padding-bottom: 10px;
-  border-bottom: 2px solid var(--border, #e3e9f4);
+  border-bottom: 2px solid var(--border, #e2e8da);
 }
 
 .markdown h2 {
   font-size: 17px;
   margin: 26px 0 10px;
   padding-left: 10px;
-  border-left: 3px solid var(--primary, #1d4ed8);
+  border-left: 3px solid var(--brand-500);
 }
 
 .markdown h3 {
   font-size: 15px;
   margin: 20px 0 8px;
-  color: #1f3a5f;
+  color: #2c4320;
 }
 
 .markdown h4 {
@@ -603,7 +711,7 @@ textarea {
 
 .markdown strong {
   font-weight: 600;
-  color: #14213d;
+  color: #16240f;
 }
 
 .markdown .md-preamble {
@@ -620,21 +728,21 @@ textarea {
 
 .markdown table.md-table th,
 .markdown table.md-table td {
-  border: 1px solid var(--border, #e3e9f4);
+  border: 1px solid var(--border, #e2e8da);
   padding: 7px 10px;
   text-align: left;
   vertical-align: top;
 }
 
 .markdown table.md-table th {
-  background: #f4f7fc;
+  background: #f4f7ee;
   font-weight: 600;
-  color: #1f3a5f;
+  color: #2c4320;
   white-space: nowrap;
 }
 
 .markdown table.md-table tbody tr:nth-child(even) {
-  background: #fafbfd;
+  background: #fafcf7;
 }
 
 /* ---------- 整体布局 ---------- */
@@ -646,8 +754,8 @@ textarea {
 .sidebar {
   width: 230px;
   flex-shrink: 0;
-  background: var(--sidebar);
-  color: #dbe4f5;
+  background: linear-gradient(180deg, var(--sidebar) 0%, var(--sidebar-deep) 100%);
+  color: var(--sidebar-ink);
   display: flex;
   flex-direction: column;
 }
@@ -657,14 +765,14 @@ textarea {
   gap: 10px;
   align-items: center;
   padding: 20px 18px 16px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--sidebar-line);
 }
 
 .brand-logo {
   width: 42px;
   height: 42px;
   border-radius: 12px;
-  background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+  background: linear-gradient(135deg, var(--brand-500), var(--brand-700));
   display: flex;
   align-items: center;
   justify-content: center;
@@ -678,17 +786,19 @@ textarea {
   border-radius: 10px;
   object-fit: cover;
   flex-shrink: 0;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12);
 }
 
 .brand-name {
   font-size: 15px;
   font-weight: 700;
   color: #fff;
+  letter-spacing: 0.3px;
 }
 
 .brand-sub {
   font-size: 11px;
-  color: #8fa3c8;
+  color: var(--sidebar-dim);
   margin-top: 2px;
 }
 
@@ -699,35 +809,77 @@ textarea {
 }
 
 .nav-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 11px 14px;
-  border-radius: 9px;
+  border-radius: 10px;
   cursor: pointer;
   font-size: 14px;
   margin-bottom: 4px;
   user-select: none;
-  transition: background 0.15s;
+  color: var(--sidebar-ink);
+  transition: background 0.17s var(--ease), color 0.17s var(--ease);
 }
 
 .nav-item:hover {
   background: var(--sidebar-hover);
+  color: #fff;
+}
+
+.nav-item:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: -2px;
 }
 
 .nav-item.active {
   background: var(--sidebar-active);
   color: #fff;
   font-weight: 600;
+  box-shadow: inset 0 0 0 1px rgba(168, 211, 127, 0.16);
+}
+
+.nav-item.active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 9px;
+  bottom: 9px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--gold);
 }
 
 .nav-icon {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--sidebar-dim);
   font-size: 16px;
+}
+
+.nav-icon svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.nav-item:hover .nav-icon,
+.nav-item.active .nav-icon {
+  color: var(--brand-300);
 }
 
 .sidebar-foot {
   padding: 14px;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-top: 1px solid var(--sidebar-line);
 }
 
 .user-chip {
@@ -741,7 +893,7 @@ textarea {
   width: 38px;
   height: 38px;
   border-radius: 50%;
-  background: #3b82f6;
+  background: linear-gradient(135deg, var(--brand-500), var(--brand-700));
   color: #fff;
   display: flex;
   align-items: center;
@@ -759,18 +911,19 @@ textarea {
 
 .user-role {
   font-size: 12px;
-  color: #8fa3c8;
+  color: var(--sidebar-dim);
 }
 
 .sidebar-foot .btn-ghost {
   background: transparent;
-  border-color: rgba(255, 255, 255, 0.25);
-  color: #dbe4f5;
+  border-color: rgba(255, 255, 255, 0.22);
+  color: var(--sidebar-ink);
 }
 
 .sidebar-foot .btn-ghost:hover {
-  border-color: #fff;
+  border-color: var(--brand-300);
   color: #fff;
+  background: var(--sidebar-hover);
 }
 
 .main {
@@ -785,24 +938,28 @@ textarea {
 }
 
 .page-head h2 {
-  font-size: 21px;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
 }
 
 .page-head p {
   color: var(--text-sub);
-  margin-top: 5px;
+  margin-top: 6px;
   font-size: 13px;
 }
 
 .section-title {
   font-size: 15px;
+  font-weight: 600;
   margin: 22px 0 12px;
 }
 
 .empty {
   text-align: center;
   color: var(--text-sub);
-  padding: 40px 0;
+  padding: 48px 0;
+  font-size: 13.5px;
 }
 
 /* ---------- 客户端首页 ---------- */
@@ -815,8 +972,9 @@ textarea {
 .stat-card {
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 14px;
   padding: 18px 20px;
+  box-shadow: var(--shadow-1);
 }
 
 .stat-card .num {
@@ -824,6 +982,8 @@ textarea {
   font-weight: 700;
   color: var(--primary);
   margin-top: 4px;
+  letter-spacing: -0.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 .stat-card .lbl {
@@ -839,19 +999,22 @@ textarea {
 }
 
 .quick-card {
-  border: 1px dashed #bcd0f5;
-  background: #f8fbff;
-  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: linear-gradient(160deg, #fbfdf7 0%, var(--primary-softer) 100%);
+  border-radius: 14px;
   padding: 22px;
   text-align: left;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: border-color 0.17s var(--ease), background 0.17s var(--ease),
+    transform 0.17s var(--ease), box-shadow 0.17s var(--ease);
   font-family: inherit;
 }
 
 .quick-card:hover {
-  border-color: var(--primary);
-  background: #eef4ff;
+  border-color: var(--brand-300);
+  background: linear-gradient(160deg, #f7fbf1 0%, #eef6e4 100%);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-2);
 }
 
 .quick-card .t {
@@ -875,8 +1038,8 @@ textarea {
 }
 
 .camera-box {
-  background: #0f172a;
-  border-radius: 10px;
+  background: #0c1a10;
+  border-radius: 12px;
   overflow: hidden;
   aspect-ratio: 4 / 3;
   display: flex;
@@ -891,13 +1054,13 @@ textarea {
 }
 
 .camera-tip {
-  color: #94a3b8;
+  color: #94a89a;
   text-align: center;
   padding: 20px;
 }
 
 .camera-tip.error {
-  color: #fca5a5;
+  color: #f2a49b;
 }
 
 .camera-tip .btn {
@@ -915,7 +1078,7 @@ textarea {
 }
 
 .shot-preview {
-  border-radius: 10px;
+  border-radius: 12px;
   overflow: hidden;
   border: 1px solid var(--border);
   margin-bottom: 10px;
@@ -930,9 +1093,10 @@ textarea {
   color: var(--text-sub);
   text-align: center;
   padding: 60px 20px;
-  border: 1px dashed var(--border);
-  border-radius: 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 12px;
   line-height: 1.8;
+  background: #fbfdf8;
 }
 
 /* ---------- 记录网格 ---------- */
@@ -945,20 +1109,22 @@ textarea {
 .record-card {
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
   overflow: hidden;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: border-color 0.17s var(--ease), box-shadow 0.17s var(--ease),
+    transform 0.17s var(--ease);
 }
 
 .record-card:hover {
-  box-shadow: 0 6px 16px rgba(37, 99, 235, 0.14);
+  border-color: var(--brand-200);
+  box-shadow: 0 10px 24px rgba(43, 122, 11, 0.13);
   transform: translateY(-2px);
 }
 
 .record-photo {
   aspect-ratio: 4 / 3;
-  background: #eef2f9;
+  background: #eef2e8;
 }
 
 .record-photo img {
@@ -990,6 +1156,7 @@ textarea {
 .record-time {
   font-size: 12px;
   color: var(--text-sub);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---------- 筛选栏 ---------- */
@@ -1036,7 +1203,9 @@ textarea {
 .modal-mask {
   position: fixed;
   inset: 0;
-  background: rgba(10, 20, 45, 0.55);
+  background: rgba(8, 20, 12, 0.52);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1045,13 +1214,14 @@ textarea {
 
 .modal {
   background: #fff;
-  border-radius: 14px;
+  border-radius: 16px;
   width: 720px;
   max-width: 92vw;
   max-height: 88vh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  box-shadow: var(--shadow-3);
 }
 
 .modal-sm {
@@ -1068,6 +1238,7 @@ textarea {
 
 .modal-head h3 {
   font-size: 16px;
+  font-weight: 700;
 }
 
 .modal-close {
@@ -1076,6 +1247,15 @@ textarea {
   font-size: 16px;
   cursor: pointer;
   color: var(--text-sub);
+  border-radius: 8px;
+  width: 30px;
+  height: 30px;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+}
+
+.modal-close:hover {
+  background: var(--bg);
+  color: var(--text);
 }
 
 .modal-body {
@@ -1087,8 +1267,8 @@ textarea {
   width: 100%;
   max-height: 420px;
   object-fit: contain;
-  background: #0f172a;
-  border-radius: 10px;
+  background: #0c1a10;
+  border-radius: 12px;
   margin-bottom: 16px;
 }
 
@@ -1126,7 +1306,7 @@ textarea {
 .lightbox {
   position: fixed;
   inset: 0;
-  background: rgba(6, 12, 26, 0.92);
+  background: rgba(5, 14, 8, 0.94);
   z-index: 200;
   display: flex;
   flex-direction: column;
@@ -1162,15 +1342,15 @@ textarea {
 .lightbox-seq {
   padding: 2px 8px;
   border-radius: 10px;
-  background: rgba(245, 158, 11, 0.22);
-  color: #fbbf24;
+  background: rgba(216, 169, 44, 0.22);
+  color: #ecc457;
 }
 
 .lightbox-owner {
   padding: 2px 8px;
   border-radius: 10px;
-  background: rgba(59, 130, 246, 0.22);
-  color: #93c5fd;
+  background: rgba(124, 187, 77, 0.2);
+  color: #c4e59d;
 }
 
 .lightbox-note {
@@ -1178,14 +1358,14 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: #cbd5e1;
+  color: #cbd5c0;
 }
 
 .lightbox-time,
 .lightbox-dim,
 .lightbox-zoom,
 .lightbox-pos {
-  color: #94a3b8;
+  color: #9db39a;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1201,12 +1381,12 @@ textarea {
   width: 34px;
   height: 34px;
   border: none;
-  border-radius: 8px;
+  border-radius: 10px;
   background: rgba(255, 255, 255, 0.12);
   color: #fff;
   font-size: 16px;
   cursor: pointer;
-  transition: background 0.15s;
+  transition: background 0.15s var(--ease);
 }
 
 .lightbox-close:hover {
@@ -1230,7 +1410,7 @@ textarea {
   object-fit: contain;
   cursor: grab;
   opacity: 0;
-  transition: opacity 0.15s;
+  transition: opacity 0.15s var(--ease);
   will-change: transform;
 }
 
@@ -1256,7 +1436,7 @@ textarea {
   line-height: 1;
   cursor: pointer;
   z-index: 2;
-  transition: background 0.15s;
+  transition: background 0.15s var(--ease);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1296,12 +1476,12 @@ textarea {
   height: 34px;
   padding: 0 12px;
   border: none;
-  border-radius: 8px;
+  border-radius: 10px;
   background: rgba(255, 255, 255, 0.12);
   color: #fff;
   font-size: 14px;
   cursor: pointer;
-  transition: background 0.15s;
+  transition: background 0.15s var(--ease);
 }
 
 .lightbox-btn:hover {
@@ -1310,15 +1490,15 @@ textarea {
 
 .lightbox-danger {
   margin-left: auto;
-  background: rgba(220, 38, 38, 0.75);
+  background: rgba(207, 50, 34, 0.75);
 }
 
 .lightbox-danger:hover {
-  background: rgba(220, 38, 38, 0.95);
+  background: rgba(207, 50, 34, 0.95);
 }
 
 .lightbox-hint {
-  color: #94a3b8;
+  color: #9db39a;
   font-size: 12px;
 }
 
@@ -1330,6 +1510,10 @@ textarea {
 /* ---------- 表格 ---------- */
 .table-wrap {
   overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: var(--shadow-1);
 }
 
 table {
@@ -1341,15 +1525,19 @@ table {
 th,
 td {
   text-align: left;
-  padding: 11px 12px;
+  padding: 11px 14px;
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
+}
+
+table tr:last-child td {
+  border-bottom: none;
 }
 
 th {
   color: var(--text-sub);
   font-weight: 600;
-  background: #f8fafd;
+  background: #f6f8f1;
 }
 
 td.wrap,
@@ -1366,8 +1554,12 @@ td.ip-cell {
   letter-spacing: 0.2px;
 }
 
+td {
+  font-variant-numeric: tabular-nums;
+}
+
 tr:hover td {
-  background: #f8fbff;
+  background: #f7faf0;
 }
 
 .td-actions {
@@ -1388,6 +1580,7 @@ tr:hover td {
 .pager-info {
   color: var(--text-sub);
   font-size: 13px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---------- 设置页 ---------- */
@@ -1457,7 +1650,10 @@ tr:hover td {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, #152347 0%, #1d4ed8 100%);
+  background:
+    radial-gradient(720px 380px at 82% 8%, rgba(216, 169, 44, 0.14), transparent 62%),
+    radial-gradient(860px 520px at 12% 92%, rgba(47, 143, 0, 0.2), transparent 66%),
+    linear-gradient(142deg, #0c1e10 0%, #123018 52%, #0c2513 100%);
   overflow-y: auto;
 }
 
@@ -1465,14 +1661,15 @@ tr:hover td {
   width: 560px;
   max-width: 94vw;
   background: #fff;
-  border-radius: 16px;
+  border-radius: 18px;
   padding: 34px 40px 26px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+  box-shadow: var(--shadow-3);
   text-align: center;
 }
 
 .setup-card h1 {
   font-size: 21px;
+  font-weight: 700;
 }
 
 .setup-card .login-sub {
@@ -1488,19 +1685,19 @@ tr:hover td {
 .setup-tab {
   flex: 1;
   padding: 12px;
-  border-radius: 10px;
+  border-radius: 12px;
   border: 1px solid var(--border);
   cursor: pointer;
   font-size: 14px;
   font-weight: 600;
   color: var(--text-sub);
-  transition: all 0.15s;
+  transition: all 0.17s var(--ease);
 }
 
 .setup-tab.active {
   border-color: var(--primary);
-  background: #eef4ff;
-  color: var(--primary);
+  background: var(--primary-soft);
+  color: var(--primary-dark);
 }
 
 .setup-body {
@@ -1515,9 +1712,9 @@ tr:hover td {
 }
 
 .setup-info {
-  background: #f8fafd;
+  background: #f8faf3;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 8px 14px;
   margin-bottom: 16px;
 }
@@ -1539,16 +1736,22 @@ tr:hover td {
 .code {
   font-family: Consolas, "Courier New", monospace;
   letter-spacing: 1px;
-  color: var(--primary);
+  color: var(--primary-dark);
+  font-variant-numeric: tabular-nums;
 }
 
 .barcode-count {
   font-size: 12px;
   color: var(--warning);
-  background: #fff7ed;
-  border-radius: 6px;
+  background: var(--warning-soft);
+  border-radius: 8px;
   padding: 6px 10px;
   margin-top: 6px;
+}
+
+.barcode-count.ok {
+  color: var(--success);
+  background: var(--success-soft);
 }
 
 /* ---------- 登录页服务器设置 ---------- */
@@ -1559,19 +1762,20 @@ tr:hover td {
   cursor: pointer;
   user-select: none;
   text-align: center;
+  transition: color 0.15s var(--ease);
 }
 
 .login-server-toggle:hover {
-  color: var(--primary);
+  color: var(--primary-dark);
 }
 
 .login-server-panel {
   text-align: left;
   margin-top: 12px;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 14px;
-  background: #f8fafd;
+  background: #f8faf3;
 }
 
 /* ---------- 拍照缩略图队列 ---------- */
@@ -1591,7 +1795,7 @@ tr:hover td {
   width: 108px;
   height: 81px;
   object-fit: cover;
-  border-radius: 8px;
+  border-radius: 9px;
   border: 1px solid var(--border);
   display: block;
 }
@@ -1602,6 +1806,7 @@ tr:hover td {
   font-size: 12px;
   color: var(--text-sub);
   margin-top: 3px;
+  font-variant-numeric: tabular-nums;
 }
 
 .shot-remove {
@@ -1617,6 +1822,7 @@ tr:hover td {
   font-size: 11px;
   line-height: 1;
   cursor: pointer;
+  box-shadow: 0 2px 6px rgba(120, 20, 10, 0.35);
 }
 
 /* ---------- 批量删除 ---------- */
@@ -1626,9 +1832,9 @@ tr:hover td {
   gap: 14px;
   margin-bottom: 14px;
   padding: 10px 14px;
-  background: #f8fafd;
+  background: #f8faf3;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
 }
 
 .batch-check {
@@ -1655,14 +1861,14 @@ tr:hover td {
   left: 8px;
   width: 22px;
   height: 22px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.85);
-  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.88);
+  border: 1px solid var(--border-strong);
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: all 0.15s var(--ease);
 }
 
 .card-check.on {
@@ -1683,9 +1889,9 @@ tr:hover td {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  background: #fff7ed;
-  border-bottom: 1px solid #fbd9a8;
-  color: #9a3412;
+  background: var(--warning-soft);
+  border-bottom: 1px solid #f3ddb4;
+  color: #8a4a0a;
   font-size: 13.5px;
   padding: 9px 18px;
 }
@@ -1697,7 +1903,7 @@ tr:hover td {
 .update-banner-close {
   border: none;
   background: none;
-  color: #9a3412;
+  color: #8a4a0a;
   cursor: pointer;
   font-size: 13px;
 }
@@ -1706,12 +1912,12 @@ tr:hover td {
 .release-notes {
   margin: 8px 0 0;
   padding: 12px 14px;
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
-  border-radius: 10px;
+  background: #f8faf3;
+  border: 1px solid var(--border);
+  border-radius: 12px;
   font-size: 13px;
   line-height: 1.7;
-  color: #334155;
+  color: #37452e;
   white-space: pre-wrap;
   word-break: break-word;
   max-height: 320px;
@@ -1722,23 +1928,24 @@ tr:hover td {
 .update-progress {
   width: 100%;
   height: 10px;
-  background: #e2e8f0;
+  background: #e6ecdd;
   border-radius: 6px;
   overflow: hidden;
 }
 
 .update-progress-bar {
   height: 100%;
-  background: linear-gradient(90deg, #3b82f6, #1d4ed8);
+  background: linear-gradient(90deg, var(--brand-500), var(--brand-700));
   border-radius: 6px;
-  transition: width 0.3s;
+  transition: width 0.3s var(--ease);
 }
 
 .sidebar-version {
   margin-top: 10px;
   text-align: center;
   font-size: 11px;
-  color: #8fa3c8;
+  color: var(--sidebar-dim);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---------- 离线状态条 ---------- */
@@ -1747,19 +1954,19 @@ tr:hover td {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  background: #fefce8;
-  border: 1px solid #fde68a;
-  border-radius: 10px;
-  color: #854d0e;
+  background: #fdf9e8;
+  border: 1px solid #f0e1a8;
+  border-radius: 12px;
+  color: #7c5a0e;
   font-size: 13.5px;
   padding: 9px 14px;
   margin-bottom: 14px;
 }
 
 .offline-banner.off {
-  background: #fef2f2;
-  border-color: #fecaca;
-  color: #991b1b;
+  background: var(--danger-soft);
+  border-color: #f3c9c3;
+  color: #9c2317;
 }
 
 /* ---------- 登录页激活提示 ---------- */
@@ -1775,7 +1982,7 @@ tr:hover td {
 }
 
 .license-tip a {
-  color: var(--primary);
+  color: var(--primary-dark);
   margin-left: 8px;
   text-decoration: none;
 }
@@ -1818,7 +2025,7 @@ tr:hover td {
   width: 96px;
   height: 6px;
   border-radius: 3px;
-  background: #e8eef7;
+  background: #e6ecdd;
   overflow: hidden;
 }
 
@@ -1827,5 +2034,5 @@ tr:hover td {
   height: 100%;
   background: var(--primary);
   border-radius: 3px;
-  transition: width 0.2s;
+  transition: width 0.2s var(--ease);
 }
