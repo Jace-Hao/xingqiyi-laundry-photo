@@ -1227,6 +1227,19 @@ const CapturePage = {
     const videoEl = Vue.ref(null);
     const barcodeEl = Vue.ref(null);
     const ready = Vue.ref(false); // 条码已就绪、处于可拍摄状态
+    // 摄像头按需占用：空闲自动休眠释放设备，扫码/按键/点击时唤醒。
+    // 默认空闲 3 分钟释放；测试可通过 window.__xqyCamIdleMs 覆盖时长。
+    const sleeping = Vue.ref(false); // 摄像头已休眠（已释放占用）
+    const CAM_IDLE_DEFAULT_MS = 180000;
+
+    function camIdleMs() {
+      const v = Number(window.__xqyCamIdleMs);
+      return v >= 1000 ? v : CAM_IDLE_DEFAULT_MS;
+    }
+
+    let idleTimer = null;
+    let waking = false; // 唤醒进行中，防重复触发
+    let wasRunningWhenHidden = false; // 因窗口隐藏而释放时，回到前台自动恢复
 
     async function loadDevices() {
       try {
@@ -1297,8 +1310,55 @@ const CapturePage = {
       }
     }
 
+    function clearIdleTimer() {
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    }
+
+    // 空闲计时：超时且未休眠时释放摄像头；有操作时重新计时
+    function scheduleIdleSleep() {
+      clearIdleTimer();
+      if (!captureAlive || sleeping.value || !stream.value) return;
+      idleTimer = setTimeout(() => {
+        if (captureAlive && stream.value && !document.hidden) sleepCamera('idle');
+      }, camIdleMs());
+    }
+
+    function bumpActivity() {
+      if (!captureAlive || sleeping.value) return;
+      scheduleIdleSleep();
+    }
+
+    // 释放摄像头：停止取流并进入休眠态（空闲超时 / 窗口隐藏 / 手动释放）
+    function sleepCamera(reason) {
+      if (!captureAlive || sleeping.value || !stream.value) return;
+      stopCamera();
+      sleeping.value = true;
+      clearIdleTimer();
+      if (reason === 'idle') toast('摄像头空闲超时，已释放占用；扫码或按空格即可继续拍', 'info');
+    }
+
+    // 窗口最小化/隐藏时释放，回到前台自动恢复
+    function onVisibilityChange() {
+      if (!captureAlive) return;
+      if (document.hidden) {
+        if (stream.value) {
+          wasRunningWhenHidden = true;
+          sleepCamera('hidden');
+        }
+      } else if (wasRunningWhenHidden && sleeping.value) {
+        wasRunningWhenHidden = false;
+        wakeCamera();
+      } else {
+        wasRunningWhenHidden = false;
+      }
+    }
+
     async function startCamera(id) {
       cameraError.value = '';
+      sleeping.value = false;
       if (stream.value) {
         stream.value.getTracks().forEach((t) => t.stop());
         stream.value = null;
@@ -1332,10 +1392,27 @@ const CapturePage = {
       } catch (e) {
         cameraError.value = '无法打开摄像头：' + (e.message || e.name);
       }
+      // 取流成功后重新开始空闲计时
+      if (stream.value) scheduleIdleSleep();
+    }
+
+    async function wakeCamera() {
+      if (waking || !sleeping.value) return;
+      waking = true;
+      try {
+        await startCamera(deviceId.value || '');
+      } finally {
+        waking = false;
+      }
     }
 
     function capture() {
       if (saving.value) return;
+      if (sleeping.value) {
+        wakeCamera();
+        toast('摄像头已休眠，正在唤醒，请稍候再按空格拍摄', 'info');
+        return;
+      }
       const v = videoEl.value;
       if (!v || !v.videoWidth) {
         toast('摄像头画面未就绪', 'error');
@@ -1476,6 +1553,9 @@ const CapturePage = {
       if (!String(v || '').trim()) {
         ready.value = false;
         barcodeCount.value = null;
+      } else if (sleeping.value) {
+        // 扫码/输入条码代表马上要拍：静默唤醒摄像头
+        wakeCamera();
       }
     });
 
@@ -1490,6 +1570,8 @@ const CapturePage = {
     Vue.onMounted(() => {
       captureAlive = true;
       window.addEventListener('keydown', onKeydown);
+      window.addEventListener('pointerdown', bumpActivity, true);
+      document.addEventListener('visibilitychange', onVisibilityChange);
       focusBarcode();
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
         loadDevices().then(() => startCamera(''));
@@ -1501,13 +1583,16 @@ const CapturePage = {
     Vue.onUnmounted(() => {
       captureAlive = false;
       window.removeEventListener('keydown', onKeydown);
+      window.removeEventListener('pointerdown', bumpActivity, true);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      clearIdleTimer();
       stopCamera();
     });
 
     return {
       stream, devices, deviceId, cameraError, resolution, shots,
       barcode, note, saving, barcodeCount, videoEl, barcodeEl, ready,
-      startCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone
+      sleeping, startCamera, wakeCamera, sleepCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone
     };
   },
   template: `
@@ -1521,10 +1606,16 @@ const CapturePage = {
         <div class="card">
           <div class="card-title">
             📷 摄像头取景
-            <span v-if="resolution" class="tag tag-green" style="margin-left:8px">分辨率 {{ resolution }}</span>
+            <span v-if="resolution && !sleeping" class="tag tag-green" style="margin-left:8px">分辨率 {{ resolution }}</span>
           </div>
           <div class="camera-box">
             <video v-if="stream" ref="videoEl" autoplay playsinline muted></video>
+            <div v-else-if="sleeping" class="camera-tip camera-sleep">
+              <div class="camera-sleep-title">摄像头已休眠（已释放占用）</div>
+              <div class="camera-sleep-sub">空闲超时或窗口最小化时自动释放设备</div>
+              <button class="btn btn-primary" @click="wakeCamera">唤醒拍摄</button>
+              <div class="camera-sleep-sub">扫码或按空格键也会自动唤醒</div>
+            </div>
             <div v-else class="camera-tip" :class="{ error: !!cameraError }">
               {{ cameraError || '摄像头准备中…' }}
               <div v-if="cameraError">
@@ -1539,6 +1630,7 @@ const CapturePage = {
               </option>
             </select>
             <button class="btn btn-primary" :disabled="!stream" @click="capture">📸 拍照（空格）</button>
+            <button v-if="stream" class="btn btn-ghost" @click="sleepCamera('manual')">释放摄像头</button>
           </div>
         </div>
 
@@ -3635,7 +3727,7 @@ const AdminSystemPage = {
         </div>
 
         <p class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#f0f7ff;border:1px solid #cfe2f7;border-radius:8px">
-          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.2.exe）放入软件安装目录下的「软件更新」文件夹 →
+          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.3.exe）放入软件安装目录下的「软件更新」文件夹 →
           在上方列表选中它 → 点「开启强制推送」。客户端下次登录时会自动从服务器下载该安装包，
           下载完成后弹窗提示店员双击安装；版本号不高于客户端当前版本的不会触发。
         </p>
