@@ -9,6 +9,7 @@ const { createStore, SESSION_REVOKED_CODE } = require('./store');
 const { startServer } = require('./server');
 const { createCredentialStore } = require('./credentials');
 const { createThumbService, normalizeThumbSize } = require('./thumb');
+const { downloadWithFallback } = require('./update-download');
 
 app.setName('星期衣精致洗衣衣物照片系统');
 
@@ -87,6 +88,29 @@ const THUMBS_DIR = path.join(app.getPath('userData'), 'thumbs');
 // 仓库地址须与 package.json 的 repository 保持一致。
 const GITHUB_REPO = 'Jace-Hao/xingqiyi-laundry-photo';
 const GITHUB_RELEASES_PAGE = 'https://github.com/' + GITHUB_REPO + '/releases/latest';
+
+// 国内加速通道：GitHub 直连不稳定时自动改用（下载安装包 / 检查更新共用）。
+// 如某个镜像失效，调整此列表即可（列表内保留至少一个可用镜像）。
+const GH_ACCEL = [
+  'https://gh-proxy.com/',
+  'https://ghproxy.net/',
+  'https://gh.ddlc.top/'
+];
+// 检查更新接口的加速前缀（仅使用已验证可代理 api.github.com 的镜像）
+const GH_ACCEL_API = ['https://gh-proxy.com/'];
+
+// 生成下载候选地址：GitHub 链接 → [直连, 加速1, 加速2, …]；其他链接（内网服务端推送）→ [直连]
+function buildDownloadCandidates(rawUrl) {
+  const u = String(rawUrl || '');
+  if (!/^https?:\/\//i.test(u)) return [];
+  const isGh = /^https?:\/\/(github\.com|objects\.githubusercontent\.com|codeload\.github\.com)\//i.test(u);
+  const already = GH_ACCEL.some((p) => u.startsWith(p));
+  const list = [{ url: u, channel: isGh ? 'direct' : 'lan' }];
+  if (isGh && !already) {
+    for (const p of GH_ACCEL) list.push({ url: p + u, channel: 'accel' });
+  }
+  return list;
+}
 
 const store = createStore({
   dataDir: DATA_DIR,
@@ -1070,16 +1094,39 @@ handle('system:version', () => {
 // 使用 Electron 的 net 模块（走 Windows 系统证书库），
 // 在代理/企业证书环境下也能正常访问，避免 Node 内置模块的证书验证失败。
 function checkGitHubRelease() {
+  const apiPath = 'https://api.github.com/repos/' + GITHUB_REPO + '/releases?per_page=20';
+  // 直连超时/失败后，经国内加速镜像重试（镜像转发 api.github.com 的 JSON）
+  const apiCandidates = [apiPath].concat(GH_ACCEL_API.map((p) => p + apiPath));
+  const fetchOnce = async (url, timeoutMs) => {
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(), timeoutMs);
+    try {
+      return await net.fetch(url, {
+        signal: c.signal,
+        headers: {
+          'User-Agent': 'xingqiyi-laundry-photo',
+          Accept: 'application/vnd.github+json'
+        }
+      });
+    } finally {
+      clearTimeout(t);
+    }
+  };
   const fetchAll = async () => {
-    const resp = await net.fetch('https://api.github.com/repos/' + GITHUB_REPO + '/releases?per_page=20', {
-      headers: {
-        'User-Agent': 'xingqiyi-laundry-photo',
-        Accept: 'application/vnd.github+json'
+    let lastMessage = '无法连接 GitHub';
+    let list = null;
+    for (const url of apiCandidates) {
+      try {
+        const resp = await fetchOnce(url, 10000);
+        if (!resp.ok) { lastMessage = 'GitHub 返回状态 ' + resp.status; continue; }
+        const data = await resp.json();
+        if (Array.isArray(data)) { list = data; break; }
+        lastMessage = 'GitHub 返回数据异常';
+      } catch (e) {
+        lastMessage = '无法连接 GitHub：' + (e.message || e.code);
       }
-    });
-    if (!resp.ok) return { ok: false, message: 'GitHub 返回状态 ' + resp.status };
-    const list = await resp.json();
-    if (!Array.isArray(list)) return { ok: false, message: 'GitHub 返回数据异常' };
+    }
+    if (!list) return { ok: false, message: lastMessage };
     // 遍历全部正式发布，按版本号取最高者，
     // 不依赖 GitHub「latest」的排序（其按发布时间排序，标签格式或发布顺序异常时会取错）
     let best = null;
@@ -1103,10 +1150,10 @@ function checkGitHubRelease() {
       releasePage: best.rel.html_url || GITHUB_RELEASES_PAGE
     };
   };
-  // 超时兜底：避免网络异常时界面长时间卡在「检查中」
+  // 超时兜底：避免网络异常时界面长时间卡在「检查中」（已含一次加速重试，整体放宽到 24 秒）
   return Promise.race([
     fetchAll().catch((e) => ({ ok: false, message: '无法连接 GitHub：' + (e.message || e.code) })),
-    new Promise((resolve) => setTimeout(() => resolve({ ok: false, message: '连接 GitHub 超时' }), 15000))
+    new Promise((resolve) => setTimeout(() => resolve({ ok: false, message: '连接 GitHub 超时' }), 24000))
   ]);
 }
 
@@ -1154,14 +1201,16 @@ handle('system:openUpdatePage', () => {
 
 // ---------- 自动下载更新安装包 ----------
 // 从 GitHub Releases 或服务端强制推送地址下载安装包到统一的「软件更新」文件夹（安装目录下），
-// 边下边报进度，完成后自动打开文件夹定位文件。手动下载与强制推送自动下载共用此实现。
+// GitHub 直连不稳定时自动降级到国内加速通道重试；边下边报进度，完成后自动打开文件夹定位文件。
+// 手动下载与强制推送自动下载共用此实现。
 let activeDownload = null;
 
 async function downloadInstaller(url, name, opts = {}) {
   const fs = require('fs');
   const openFolder = opts.openFolder !== false;
   if (activeDownload) return { ok: false, message: '正在下载中，请稍候…' };
-  if (!url || !/^https?:\/\//i.test(String(url))) return { ok: false, message: '下载地址无效' };
+  const candidates = buildDownloadCandidates(url);
+  if (!candidates.length) return { ok: false, message: '下载地址无效' };
   if (!mainWindow) return { ok: false, message: '窗口未就绪' };
 
   const dir = UPDATE_DIR;
@@ -1181,41 +1230,36 @@ async function downloadInstaller(url, name, opts = {}) {
   };
 
   const controller = new AbortController();
-  // 无响应看门狗：连续 30 秒收不到任何数据即中止下载，
-  // 避免网络请求永久挂起导致下载状态无法解除、界面被全屏弹窗锁死
-  const IDLE_TIMEOUT_MS = 30000;
-  let timedOut = false;
-  let idleTimer = null;
-  const resetIdleTimer = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, IDLE_TIMEOUT_MS);
-  };
-  resetIdleTimer();
   activeDownload = { url: String(url), cancel: () => controller.abort() };
+  let lastSent = 0;
   try {
-    const resp = await net.fetch(String(url), {
+    // 多地址自动降级：GitHub 直连不稳定时依次切换国内加速通道（实现见 update-download.js）
+    const res = await downloadWithFallback({
+      candidates,
+      destPart: tmp,
+      fetchImpl: (u, o) => net.fetch(u, o),
       signal: controller.signal,
-      headers: { 'User-Agent': 'xingqiyi-laundry-photo' }
-    });
-    if (!resp.ok || !resp.body) throw new Error('服务器返回状态 ' + resp.status);
-    const total = Number(resp.headers.get('content-length')) || 0;
-    let received = 0;
-    let lastSent = 0;
-    const out = fs.createWriteStream(tmp);
-    for await (const chunk of resp.body) {
-      resetIdleTimer();
-      out.write(chunk);
-      received += chunk.length;
-      const t = Date.now();
-      if (t - lastSent >= 400) {
-        lastSent = t;
-        send('update:download-progress', { received, total });
+      onAttempt: (index, count, cand) => {
+        lastSent = 0;
+        // 尝试开始先推一条进度（0%），让界面及时显示当前通道
+        send('update:download-progress', { received: 0, total: 0, channel: cand.channel });
+      },
+      onProgress: (received, total, channel) => {
+        const t = Date.now();
+        if (t - lastSent >= 400 || (total > 0 && received >= total)) {
+          lastSent = t;
+          send('update:download-progress', { received, total, channel });
+        }
       }
+    });
+    if (!res.ok) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch (e) {
+        /* 忽略 */
+      }
+      return { ok: false, canceled: !!res.canceled, message: res.message || (res.canceled ? '已取消下载' : '下载失败') };
     }
-    await new Promise((resolve, reject) => out.end((e) => (e ? reject(e) : resolve())));
 
     // 已存在同名安装包时先移除；移除失败则换带时间戳的文件名落位
     let finalTarget = target;
@@ -1236,18 +1280,16 @@ async function downloadInstaller(url, name, opts = {}) {
       // 资源管理器窗口会抢走前台焦点，稍后夺回，避免返回软件后输入框点不动
       setTimeout(() => ensureWindowFocus(), 600);
     }
-    return { ok: true, data: { file: finalTarget, size: received } };
+    return { ok: true, data: { file: finalTarget, size: res.bytes, channel: res.channel } };
   } catch (e) {
     try {
       fs.unlinkSync(tmp);
     } catch (_) {
       /* 忽略 */
     }
-    if (timedOut) return { ok: false, message: '下载超时：网络连接不稳定，请稍后重试' };
     if (controller.signal.aborted) return { ok: false, canceled: true, message: '已取消下载' };
     return { ok: false, message: '下载失败：' + (e.message || String(e)) };
   } finally {
-    if (idleTimer) clearTimeout(idleTimer);
     activeDownload = null;
   }
 }

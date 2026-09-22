@@ -380,8 +380,9 @@ function useUpdater() {
   });
   const progressText = Vue.computed(() => {
     const { received, total } = dlProgress.value || {};
-    if (total > 0) return fmtSize(received) + ' / ' + fmtSize(total) + '（' + progressPercent.value + '%）';
-    return fmtSize(received);
+    const base = total > 0 ? fmtSize(received) + ' / ' + fmtSize(total) + '（' + progressPercent.value + '%）' : fmtSize(received);
+    const ch = dlProgress.value && dlProgress.value.channel;
+    return base + (ch === 'accel' ? ' · 国内加速' : ch === 'direct' ? ' · 直连' : '');
   });
 
   // 组件销毁时必须注销进度监听，否则反复进出页面会累积回调
@@ -419,7 +420,7 @@ function useUpdater() {
     try {
       const r = await window.api.downloadUpdate(info.downloadUrl, info.assetName);
       if (r.ok) {
-        toast('安装包下载完成，已打开文件夹，双击安装即可覆盖升级', 'success');
+        toast('安装包下载完成' + (r.data && r.data.channel === 'accel' ? '（经国内加速通道）' : '') + '，已打开文件夹，双击安装即可覆盖升级', 'success');
       } else if (!r.canceled) {
         toast(r.message || '下载失败', 'error');
       } else {
@@ -3341,8 +3342,9 @@ const AdminSystemPage = {
     });
     const progressText = Vue.computed(() => {
       const { received, total } = dlProgress.value || {};
-      if (total > 0) return fmtSize(received) + ' / ' + fmtSize(total) + '（' + progressPercent.value + '%）';
-      return fmtSize(received);
+      const base = total > 0 ? fmtSize(received) + ' / ' + fmtSize(total) + '（' + progressPercent.value + '%）' : fmtSize(received);
+      const ch = dlProgress.value && dlProgress.value.channel;
+      return base + (ch === 'accel' ? ' · 国内加速' : ch === 'direct' ? ' · 直连' : '');
     });
 
     async function downloadUpdateNow() {
@@ -3356,7 +3358,7 @@ const AdminSystemPage = {
       try {
         const r = await window.api.downloadUpdate(info.downloadUrl, info.assetName);
         if (r.ok) {
-          toast('安装包下载完成，已打开文件夹，双击安装即可覆盖升级', 'success');
+          toast('安装包下载完成' + (r.data && r.data.channel === 'accel' ? '（经国内加速通道）' : '') + '，已打开文件夹，双击安装即可覆盖升级', 'success');
         } else if (!r.canceled) {
           toast(r.message || '下载失败', 'error');
         } else {
@@ -3663,7 +3665,7 @@ const AdminSystemPage = {
         </div>
         <div class="info-row">
           <span>更新方式</span>
-          <b>新版本通过 GitHub Releases 发布：启动或点击「检查更新」自动检测，发现新版本后点「一键下载更新」自动下载安装包到本机，双击安装即可覆盖升级</b>
+          <b>新版本通过 GitHub Releases 发布：启动或点击「检查更新」自动检测，发现新版本后点「一键下载更新」自动下载安装包到本机（GitHub 直连不稳定时自动切换国内加速通道），双击安装即可覆盖升级</b>
         </div>
         <div v-if="downloading" style="margin-top:12px">
           <div class="update-progress">
@@ -3727,7 +3729,7 @@ const AdminSystemPage = {
         </div>
 
         <p class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#f0f7ff;border:1px solid #cfe2f7;border-radius:8px">
-          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.3.exe）放入软件安装目录下的「软件更新」文件夹 →
+          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.4.exe）放入软件安装目录下的「软件更新」文件夹 →
           在上方列表选中它 → 点「开启强制推送」。客户端下次登录时会自动从服务器下载该安装包，
           下载完成后弹窗提示店员双击安装；版本号不高于客户端当前版本的不会触发。
         </p>
@@ -4076,8 +4078,9 @@ const app = createApp({
     });
     const progressText = Vue.computed(() => {
       const { received, total } = dlProgress.value || {};
-      if (total > 0) return fmtSize(received) + ' / ' + fmtSize(total) + '（' + progressPercent.value + '%）';
-      return fmtSize(received);
+      const base = total > 0 ? fmtSize(received) + ' / ' + fmtSize(total) + '（' + progressPercent.value + '%）' : fmtSize(received);
+      const ch = dlProgress.value && dlProgress.value.channel;
+      return base + (ch === 'accel' ? ' · 国内加速' : ch === 'direct' ? ' · 直连' : '');
     });
 
     function openUpdateModal() {
@@ -4104,7 +4107,7 @@ const app = createApp({
       try {
         const r = await window.api.downloadUpdate(info.downloadUrl, info.assetName);
         if (r.ok) {
-          toast('安装包下载完成，已打开文件夹，双击安装即可覆盖升级', 'success');
+          toast('安装包下载完成' + (r.data && r.data.channel === 'accel' ? '（经国内加速通道）' : '') + '，已打开文件夹，双击安装即可覆盖升级', 'success');
           updateModal.value = null;
           updateNotice.value = null;
         } else if (!r.canceled) {
