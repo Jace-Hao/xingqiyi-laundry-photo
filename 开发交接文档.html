@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>星期衣精致洗衣衣物照片系统 · 开发交接文档</title>
+<style>
+:root{
+  --paper:#f7f7f3;
+  --ink:#171a16;
+  --ink-2:#565c55;
+  --ink-3:#6d736b;
+  --rule:#e1e2d9;
+  --rule-strong:#c9cbbf;
+  --accent:#7a5c14;
+  --accent-soft:rgba(122,92,20,.10);
+  --sans:"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans CJK SC","Segoe UI",sans-serif;
+  --mono:ui-monospace,"Cascadia Mono","Consolas","SFMono-Regular",monospace;
+  --nav-w:clamp(210px,17vw,252px);
+  --measure:52em;
+}
+*{box-sizing:border-box}
+html{background:var(--paper)}
+body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.75 var(--sans);-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:underline;text-decoration-color:rgba(133,101,26,.45);text-underline-offset:3px}
+::selection{background:var(--accent-soft)}
+.layout{display:grid;grid-template-columns:var(--nav-w) minmax(0,1fr);min-height:100vh}
+.sidebar{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;border-right:1px solid var(--rule);padding:34px 22px 26px;display:flex;flex-direction:column}
+.brand-name{font-size:13.5px;font-weight:600;line-height:1.55;letter-spacing:.01em}
+.brand-sub{margin-top:7px;font:11px/1.6 var(--mono);letter-spacing:.07em;color:var(--ink-3);text-transform:uppercase}
+.side-divider{margin:22px 0 16px;border-top:1px solid var(--rule-strong);width:38px}
+nav{display:flex;flex-direction:column;gap:2px}
+nav a{display:flex;gap:10px;align-items:baseline;padding:5px 0;font-size:13.5px;color:var(--ink-2);text-decoration:none}
+nav a .no{font:11px/1 var(--mono);color:var(--ink-3);letter-spacing:.06em}
+.side-foot{margin-top:auto;padding-top:22px;font:11px/1.75 var(--mono);color:var(--ink-3);letter-spacing:.05em}
+.main{padding:0 clamp(26px,4.5vw,64px) 96px}
+.main-inner{max-width:1100px;margin:0 auto}
+.masthead{padding:64px 0 30px;border-bottom:1px solid var(--rule-strong)}
+.kicker{font:11px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--accent)}
+h1{margin:18px 0 0;font-size:clamp(30px,3.6vw,44px);line-height:1.16;font-weight:600;letter-spacing:-.012em}
+.lede{margin:20px 0 0;max-width:var(--measure);font-size:16.5px;line-height:1.78;color:var(--ink-2)}
+.meta-strip{display:flex;flex-wrap:wrap;gap:26px 44px;align-items:flex-end;justify-content:space-between;padding:26px 0 0}
+.barcode-block{display:flex;flex-direction:column;gap:9px}
+.barcode{color:var(--ink);opacity:.85}
+.barcode-cap{font:11px/1 var(--mono);letter-spacing:.09em;color:var(--ink-3)}
+.meta-dl{display:flex;flex-wrap:wrap;gap:10px 38px;margin:0}
+.meta-dl div{display:flex;gap:10px;align-items:baseline}
+.meta-dl dt{font:11px/1.6 var(--mono);letter-spacing:.07em;color:var(--ink-3)}
+.meta-dl dd{margin:0;font-size:13.5px;color:var(--ink-2)}
+section{margin-top:64px}
+.sec-head{display:flex;align-items:baseline;gap:14px;padding-bottom:12px;border-bottom:1px solid var(--rule-strong)}
+.sec-no{font:11.5px/1 var(--mono);letter-spacing:.08em;color:var(--ink-3)}
+h2{margin:0;font-size:22px;font-weight:600;letter-spacing:-.005em}
+h3{margin:30px 0 0;font-size:15px;font-weight:600}
+h4{margin:22px 0 0;font-size:14px;font-weight:600}
+p{margin:16px 0 0;max-width:var(--measure)}
+a.t-mono,h4+.table-wrap{margin-top:14px}
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;margin:22px 0 0;font-size:13.5px}
+th{font:11px/1.6 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3);text-align:left;padding:0 16px 9px 0;border-bottom:1px solid var(--rule-strong);font-weight:500;white-space:nowrap}
+td{padding:11px 16px 11px 0;border-bottom:1px solid var(--rule);vertical-align:top;line-height:1.68}
+th:last-child,td:last-child{padding-right:0}
+.t-mono{font:12.5px/1.7 var(--mono)}
+ul.doc,ol.doc{margin:16px 0 0;padding-left:22px;max-width:var(--measure)}
+ul.doc li,ol.doc li{margin:7px 0;line-height:1.72}
+pre.code{margin:18px 0 0;padding:14px 18px;background:#fbfbf7;border:1px solid var(--rule);border-radius:3px;overflow-x:auto;max-width:var(--measure)}
+pre.code code{font:12.5px/1.75 var(--mono);color:#2c332a;white-space:pre}
+code.t-mono{background:#f1f1ea;padding:1px 5px;border-radius:2px}
+blockquote.callout{margin:18px 0 0;padding:10px 16px;border-left:2px solid var(--accent);background:var(--accent-soft);max-width:var(--measure);font-size:14px;color:var(--ink-2)}
+.colophon{margin-top:88px;padding-top:20px;border-top:1px solid var(--rule-strong);max-width:var(--measure);font-size:12.5px;line-height:1.85;color:var(--ink-3)}
+@media (max-width:980px){
+  .layout{grid-template-columns:1fr}
+  .sidebar{position:static;height:auto;border-right:0;border-bottom:1px solid var(--rule);flex-direction:row;flex-wrap:wrap;align-items:center;gap:12px 26px;padding:20px 26px}
+  .side-divider{display:none}
+  nav{flex-direction:row;flex-wrap:wrap;gap:2px 16px}
+  .side-foot{margin:0;padding:0}
+}
+@media print{
+  .layout{display:block}
+  .sidebar{display:none}
+  .main{padding:0}
+  section{break-inside:avoid-page}
+  a{color:inherit;text-decoration:none}
+}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <div>
+    <div class="brand-name">星期衣精致洗衣衣物照片系统</div>
+    <div class="brand-sub">Developer Handover · 开发交接</div>
+  </div>
+  <div class="side-divider"></div>
+  <nav>
+<a href="#s01"><span class="no">01</span>项目速览</a>
+    <a href="#s02"><span class="no">02</span>快速上手</a>
+    <a href="#s03"><span class="no">03</span>目录结构</a>
+    <a href="#s04"><span class="no">04</span>核心机制</a>
+    <a href="#s05"><span class="no">05</span>版本历史</a>
+    <a href="#s06"><span class="no">06</span>构建与发布流程</a>
+    <a href="#s07"><span class="no">07</span>验证与开发工具</a>
+    <a href="#s08"><span class="no">08</span>私有不入库清单</a>
+    <a href="#s09"><span class="no">09</span>本机环境与注意事项</a>
+    <a href="#s10"><span class="no">10</span>本次整理记录</a>
+    <a href="#s11"><span class="no">11</span>交接清单</a>
+  </nav>
+  <div class="side-foot">GENERATED 2026-09-22 · md2doc</div>
+</aside>
+
+<main class="main">
+<div class="main-inner">
+
+  <header class="masthead">
+    <div class="kicker">Developer Handover · 开发交接文档</div>
+    <h1>星期衣精致洗衣衣物照片系统 · 开发交接文档</h1>
+    <p class="lede">适用版本 v1.1.4 · 文档日期 2026-09-22 · 项目路径 E:\软件开发\星期衣精致洗衣衣物照片系统</p>
+    <div class="meta-strip">
+      <div class="barcode-block">
+        <svg class="barcode" width="131" height="20" viewBox="0 0 131 20" aria-hidden="true">
+          <path fill="currentColor" d="M0 0h2v20H0z M4 0h1v20H4z M7 0h3v20H7z M12 0h2v20h-2z M16 0h1v20h-1z M19 0h4v20h-4z M25 0h2v20h-2z M29 0h1v20h-1z M32 0h3v20h-3z M37 0h2v20h-2z M41 0h1v20h-1z M44 0h2v20h-2z M48 0h4v20h-4z M54 0h1v20h-1z M57 0h3v20h-3z M62 0h2v20h-2z M66 0h1v20h-1z M69 0h2v20h-2z M73 0h3v20h-3z M78 0h1v20h-1z M81 0h4v20h-4z M87 0h2v20h-2z M91 0h1v20h-1z M94 0h3v20h-3z M99 0h2v20h-2z M103 0h1v20h-1z M106 0h2v20h-2z M110 0h4v20h-4z M116 0h1v20h-1z M119 0h3v20h-3z M124 0h2v20h-2z M128 0h1v20h-1z"/>
+        </svg>
+        <span class="barcode-cap">XQY-LAUNDRY-PHOTO · v1.1.4 · HANDOVER</span>
+      </div>
+      <dl class="meta-dl">
+        <div><dt>仓库</dt><dd><a href="https://github.com/Jace-Hao/xingqiyi-laundry-photo">Jace-Hao/xingqiyi-laundry-photo</a></dd></div>
+        <div><dt>适用版本</dt><dd>v1.1.4（2026-09-22）</dd></div>
+        <div><dt>文档日期</dt><dd>2026-09-22</dd></div>
+      </dl>
+    </div>
+  </header>
+
+<section id="s01"><div class="sec-head"><span class="sec-no">01</span><h2>项目速览</h2></div>
+
+<ul class="doc"><li>定位：洗衣门店「衣物拍照存档」桌面系统 —— 扫码建档、最大分辨率拍照、拍摄时间水印烧录、多机联网协同、照片查询与导出。</li><li>技术栈：Electron 33 + Vue 3（渲染层为单文件应用），运行时零第三方依赖；打包 NSIS（Windows x64）。</li><li>仓库与发布：https://github.com/Jace-Hao/xingqiyi-laundry-photo —— 对外发布走 GitHub Releases；下载页为 docs/index.html（发布页）。</li><li>当前版本：v1.1.4（2026-09-22）。本机 dist 目录仅保留 1.1.3 / 1.1.4 安装包；历史版本见 GitHub Releases（v0.1.8 起）。</li><li>质量基线：npm run verify 共 9 个脚本、384 项断言全绿；界面截图流水线与行为测试见第七章。</li></ul>
+
+</section>
+
+<section id="s02"><div class="sec-head"><span class="sec-no">02</span><h2>快速上手</h2></div>
+
+<div class="table-wrap"><table><thead><tr><th>命令</th><th>说明</th></tr></thead><tbody><tr><td><code class="t-mono">npm install</code></td><td>首次安装依赖（postinstall 会自动复制 Vue 运行时到 renderer/assets）</td></tr><tr><td><code class="t-mono">npm start</code></td><td>以开发模式启动应用</td></tr><tr><td><code class="t-mono">npm run verify</code></td><td>全量无头校验（提交前必跑，当前 384 项）</td></tr><tr><td><code class="t-mono">npm run build</code></td><td>打包 Windows 安装包到 dist\（网络受限时见第六章镜像说明）</td></tr><tr><td><code class="t-mono">npm run sync-manual</code></td><td>同步操作手册（build / verify 会自动执行，无需手动跑）</td></tr></tbody></table></div>
+
+</section>
+
+<section id="s03"><div class="sec-head"><span class="sec-no">03</span><h2>目录结构</h2></div>
+
+<div class="table-wrap"><table><thead><tr><th>目录</th><th>说明</th></tr></thead><tbody><tr><td>main/</td><td>主进程与数据层：main.js（入口与 IPC）、store.js（数据与业务）、server.js（局域网 HTTP 服务）、preload.js（渲染层桥）、credentials.js（凭据）、thumb.js（缩略图）、license.js（激活）、update-download.js（更新下载核心：多地址自动降级）</td></tr><tr><td>renderer/</td><td>界面层：renderer.js（Vue 单文件应用）、styles.css（「墨绿 × 黄铜 × 纸白」设计体系）、assets/（logo、内置手册、Vue 运行时）</td></tr><tr><td>scripts/</td><td>校验与构建辅助：9 个 verify / sync 脚本、copy-vue.js</td></tr><tr><td>docs/</td><td>发布页（index.html）、操作手册源文件（manual.md）、预览图与 logo；activate.html 为私有激活页（不入库）</td></tr><tr><td>dist/</td><td>打包产物（当前保留 1.1.3 / 1.1.4 安装包 + win-unpacked + 构建缓存）</td></tr><tr><td>开发工具/</td><td>本机开发工具（不入库）：截图与自检、行为测试、发布与补丁脚本 —— 见第七章</td></tr><tr><td>web/</td><td>网页版适配层（未定稿，不入库）</td></tr><tr><td>license-tools/、license-tool-gui/</td><td>激活码工具（私有，严禁入库 / 外发）</td></tr><tr><td>node_modules/</td><td>依赖（不入库）</td></tr></tbody></table></div>
+
+<p>本机其他相关位置（非仓库）：</p>
+
+<ul class="doc"><li><code class="t-mono">E:\autoclaw\deliverables\</code> —— 项目总览页 + 本交接文档的 HTML 副本；</li><li>软件安装目录下的「软件更新」文件夹 —— 更新安装包统一存放处（见第四章）；</li><li>回收站 —— 2026-09-22 整理移入的旧安装包与过期文件（可恢复，见第十章）。</li></ul>
+
+<p>根文件：README.md（使用说明）、CHANGELOG.md（版本日志）、待修复及增加功能.md（需求台账）、本交接文档。</p>
+
+</section>
+
+<section id="s04"><div class="sec-head"><span class="sec-no">04</span><h2>核心机制（维护向）</h2></div>
+
+<p>双模式运行、数据位置、拍照水印、缩略图缓存、离线补传、四级权限等基础机制详见 README 与项目总览页；以下是维护者最需要知道的重点。</p>
+
+<h3>更新链路（v1.1.4 起）</h3>
+
+<ol class="doc"><li>检查更新：api.github.com 直连失败/超时后，自动经 <code class="t-mono">gh-proxy.com</code> 镜像重试（整体 24 秒超时兜底）。</li><li>下载安装包（main/update-download.js）：候选链为「直连 → 三个国内加速通道（gh-proxy.com / ghproxy.net / gh.ddlc.top）」。连接失败、15 秒断流、首段速度过慢均自动切换下一通道；下载进度会标注当前通道（直连 / 国内加速），完成提示注明是否走了加速；取消立即生效且不会继续切换通道。</li><li>备用与内网分发：统一使用软件安装目录下的「软件更新」文件夹（历史位置：系统下载目录、%APPDATA%\updates，应用启动时会自动搬迁）；启动与「检查更新」会扫描该文件夹并提示。</li><li>强制推送：服务端管理员选包开启后，客户端下次登录静默下载（内网地址直连下载，不走加速）。</li><li>维护：加速镜像失效时改 main/main.js 顶部的 <code class="t-mono">GH_ACCEL</code> 列表即可；接口加速前缀为 <code class="t-mono">GH_ACCEL_API</code>（当前仅 gh-proxy.com 支持代理 api.github.com）。</li></ol>
+
+<h3>摄像头按需占用（v1.1.3 起）</h3>
+
+<ul class="doc"><li>拍照页空闲 3 分钟自动休眠并释放摄像头；窗口最小化/隐藏立即释放；回到前台自动恢复；</li><li>唤醒方式：扫码、按空格、点击「唤醒拍摄」按钮；另有「释放摄像头」手动按钮；</li><li>实现位于 renderer.js 的 CapturePage 组件（常量 CAM_IDLE_DEFAULT_MS 可调，测试可用 window.__xqyCamIdleMs 覆盖）。</li></ul>
+
+<h3>图标与快捷方式</h3>
+
+<ul class="doc"><li>安装包与桌面快捷方式图标同源：win.icon = renderer/assets/logo.png（500×500，源文件 logo.svg）；</li><li>换图标后如系统仍显示旧图标：重启「Windows 资源管理器」或运行 <code class="t-mono">ie4uinit.exe -show</code>；任务栏钉住的需取消后重新钉。</li></ul>
+
+</section>
+
+<section id="s05"><div class="sec-head"><span class="sec-no">05</span><h2>版本历史</h2></div>
+
+<div class="table-wrap"><table><thead><tr><th>版本</th><th>日期</th><th>主题</th></tr></thead><tbody><tr><td>v1.1.4</td><td>2026-09-22</td><td>更新下载自动加速（国内镜像多路降级 + 接口加速兜底）</td></tr><tr><td>v1.1.3</td><td>2026-09-22</td><td>拍照页摄像头按需占用（空闲释放 / 最小化释放 / 多路唤醒）</td></tr><tr><td>v1.1.2</td><td>2026-09-22</td><td>软件图标更换（衬衫+相机）＋ 更新文件夹统一到安装目录「软件更新」</td></tr><tr><td>v1.1.1</td><td>2026-09-22</td><td>界面品牌化精修（墨绿 × 黄铜 × 纸白）+ 线性图标体系</td></tr><tr><td>v1.1.0</td><td>2026-09-20 起</td><td>门店分组、四级角色、时间水印、导出汇总、唯一登录、保留期、缩略图缓存（多批）</td></tr><tr><td>v1.0.0</td><td>2026-09-13</td><td>更换激活密钥并整改授权机制泄露风险</td></tr><tr><td>v0.1.9</td><td>2026-09-12</td><td>完成所有待修复及增加功能（台账清空）</td></tr><tr><td>v0.1.7 ~ v0.1.8</td><td>2026-09-08</td><td>激活码体系、离线冗余、导出、强制推送、内置手册等</td></tr><tr><td>v0.1.0 ~ v0.1.6</td><td>2026-09-02 ~ 09-04</td><td>立项初版至早期迭代</td></tr></tbody></table></div>
+
+<p>详细逐版本变更见 CHANGELOG.md；发布资产见 GitHub Releases。</p>
+
+</section>
+
+<section id="s06"><div class="sec-head"><span class="sec-no">06</span><h2>构建与发布流程</h2></div>
+
+<ol class="doc"><li>升版本号：package.json → README（3 处）→ docs/manual.md（4 处）→ CHANGELOG（新段）→ renderer.js 中的示例文件名；发布页版本串在第 3 步统一改。</li><li>构建（可能遇到 GitHub 网络抖动，需下载 Electron 运行时）。推荐带镜像：</li></ol>
+
+<pre class="code"><code>$env:ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/'
+$env:ELECTRON_BUILDER_BINARIES_MIRROR = 'https://npmmirror.com/mirrors/electron-builder-binaries/'
+npm run build</code></pre>
+
+<ol class="doc"><li>发布页同步：以 <code class="t-mono">开发工具\发布与补丁\patch-docs-114.js</code> 为模板（从构建产物实读大小/SHA 回填，带命中数断言与残留检查）。</li><li>提交与推送：git add 指定文件 → commit → push（GitHub 直连不稳，建议脚本化重试）→ 打 tag 并推送。</li><li>发布 Release：以 <code class="t-mono">开发工具\发布与补丁\github-release-114.ps1</code> 为模板（改顶部 tag / 文件名即可）。脚本自动：组装发布说明（CHANGELOG 段 + SHA256）→ 建草稿 → 上传 blockmap + exe → 转正式 → 带凭据与匿名双路复核。</li><li>终检：匿名访问 releases/latest 应指向新版本；直链与三个加速通道抽查（HTTP 200/206）。</li></ol>
+
+<p>注意：不要修改已发布版本的资产；一切新内容走「版本号升级 + 新 Release」。</p>
+
+</section>
+
+<section id="s07"><div class="sec-head"><span class="sec-no">07</span><h2>验证与开发工具</h2></div>
+
+<ul class="doc"><li>无头校验：<code class="t-mono">npm run verify</code> —— 9 个脚本、384 项断言（store 105 / server 35 / templates 12 / watermark 48 / thumb 31 / credentials 61 / manual-sync 17 / manual-render 75）。</li><li>界面截图流水线（<code class="t-mono">开发工具\截图与自检\</code>）：</li></ul>
+
+<p>- capture.js：真实渲染层 + 假桥接 + 假摄像头，截取 8 个页面（登录 / 总览 / 数据 / 首页 / 拍照 / 查询 / 设置 / 手册）到 out\； - page-check.js：发布页自检（版本串、下载按钮、预览图断言 + 桌面与移动截图）； - admin-check.js：发布页「管理员工具」入口自检； - 运行：<code class="t-mono">node_modules\electron\dist\electron.exe 开发工具\截图与自检\capture.js</code>（其余同理）。</p>
+
+<ul class="doc"><li>行为测试（<code class="t-mono">开发工具\测试\</code>）：</li></ul>
+
+<p>- cam-test.js：摄像头按需占用 8 项（取流 / 不休眠 / 空闲释放 / 空格唤醒 / 隐藏释放 / 前台恢复 / 手动释放 / 离开页面释放）； - dl-test.js：下载自动降级 11 项（候选生成 / 正常下载 / 拒连切换 / 卡死切换 / 龟速切换 / 500 切换 / 取消 / 全失败提示 / 进度）； - 运行同上（换文件名即可），退出码 0 = 全过；日志写同目录。</p>
+
+<ul class="doc"><li>常用场景对照：改界面 → capture + page-check 复核；改更新逻辑 → dl-test 必须全过；改拍照页 → cam-test 复跑；任何提交前 → npm run verify。</li></ul>
+
+</section>
+
+<section id="s08"><div class="sec-head"><span class="sec-no">08</span><h2>私有不入库清单（严禁提交 / 外发）</h2></div>
+
+<p>以下文件（.gitignore 已配置）禁止进入公开仓库或对外发送：源代码加密方案.md、license-tools/、license-tool-gui/、scripts/license-tool.js、main/license-secret.json、docs/activate.html、web/、开发工具/、credentials.json。</p>
+
+<p>原因：激活算法与密钥一旦泄露，等于授权体系被绕过；上传前务必 <code class="t-mono">git status</code> 逐一确认。</p>
+
+</section>
+
+<section id="s09"><div class="sec-head"><span class="sec-no">09</span><h2>本机环境与注意事项（踩坑清单）</h2></div>
+
+<ul class="doc"><li>换行符：部分文件在历史 rebase 后为 CRLF —— 编写补丁脚本要用「行尾自适应」（按文件实际 CRLF/LF 匹配与回写），否则会命中失败或产生整文件 diff。</li><li>临时区易失：<code class="t-mono">.openclaw\tmp</code>（E:\软件开发 与 E:\autoclaw 两处）会被外部清理（2026-09-22 已发生）——重要产物及时落进项目内或提交入库，不要长期放临时区。</li><li>GitHub 网络：push、构建、发布都可能需要重试；构建用 npmmirror 镜像最稳；git 凭据经 git credential fill 读取（不落盘）。</li><li>更新文件夹：位于软件安装目录下「软件更新」，卸载软件会连同清理——需要长期留存的安装包请另存。</li><li>端口：服务端默认 17521，被占用时在设置中修改。</li><li>本机可能同时承担门店日常使用（有常驻业务软件）——涉及系统级操作（重启资源管理器、安装/覆盖软件）请避开营业时段。</li><li>文档习惯：中文、全角标点；提交信息沿用 <code class="t-mono">feat / fix / chore / release: ...</code> 前缀风格。</li></ul>
+
+</section>
+
+<section id="s10"><div class="sec-head"><span class="sec-no">10</span><h2>本次整理记录（2026-09-22）</h2></div>
+
+<p>已移入回收站（可恢复）：</p>
+
+<ul class="doc"><li>dist 旧安装包：v0.1.0 ~ v1.1.2 共 12 个版本（24 个文件，约 918 MB）——现仅保留 1.1.3、1.1.4；如需更早版本（0.1.0 ~ 0.1.7 未发布到 GitHub），可在回收站恢复；</li><li>临时区 7 个目录（xqy-shots / xqy-apply / xqy-page / xqy-ui ×2 / xqy-backup / xqy-dist-backup）与 dirs.txt（约 180 MB）；</li><li>过期文件：操作手册 v0.1.8.docx、两个旧压缩包（交付包 / 源码包）、废弃脚本 scripts\tmp-create-release.ps1（已从 git 移除）。</li></ul>
+
+<p>已归档进项目「开发工具\」（不入库）：截图流水线全套（含 mock 素材）、重建的 cam-test.js 与 dl-test.js、发布 / 补丁脚本模板、工具说明 README。</p>
+
+<p>结果：dist 体积 1341.5 MB → 422.4 MB；E:\autoclaw\.openclaw\tmp 已清空；全量校验 384 项全绿；三项工具在新位置冒烟全过（下载降级 11/11、摄像头 8/8、截图 8 页）。</p>
+
+<p>备注：<code class="t-mono">E:\autoclaw\deliverables\xqy-xygj-bridge</code> 为早期「照片同步桥接」实验代码（未启用、未纳入本项目），保持原位未动。</p>
+
+</section>
+
+<section id="s11"><div class="sec-head"><span class="sec-no">11</span><h2>交接清单（接手必读）</h2></div>
+
+<ol class="doc"><li>读完 README.md 与本交接文档，浏览 CHANGELOG.md 与「待修复及增加功能.md」（需求台账）。</li><li><code class="t-mono">npm install &amp;&amp; npm start</code> 把应用跑起来，管理端与客户端各过一遍主流程。</li><li>跑 <code class="t-mono">npm run verify</code> 确认基线全绿；再各跑一次 cam-test / dl-test 熟悉工具。</li><li>出下一版：按第六章流程走（脚本模板都在 开发工具\发布与补丁\）。</li><li>改动私密文件（激活相关）前先读第八章；任何提交前 <code class="t-mono">git status</code> + verify 双检查。</li><li>现场配置以客户现场实际为准（开发机与门店机可能分开部署）。</li></ol>
+
+</section>
+
+  <div class="colophon">
+    <p>本文件由「开发工具发布与补丁md2doc.js」从《开发交接文档.md》生成 —— 修改内容请改 Markdown 源文件后重新生成，保持两份同步。</p>
+  </div>
+
+</div>
+</main>
+</div>
+</body>
+</html>
