@@ -50,24 +50,21 @@ header{position:fixed;inset:0 0 auto 0;z-index:50;backdrop-filter:blur(14px);bac
 .stats{display:flex;gap:38px;margin-top:44px;flex-wrap:wrap}
 .stats b{display:block;font-size:30px;color:var(--ink);font-weight:900}
 .stats span{font-size:13px;color:var(--ink3)}
-/* SECTION: workbench mock */
+/* SECTION: workbench shot（真实截图窗口） */
 .mock{border:1px solid var(--line);border-radius:var(--radius);background:var(--bg2);overflow:hidden;box-shadow:0 30px 80px #00000066}
 .mock-top{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--line);font-size:12px;color:var(--ink3)}
 .mock-top .dot{width:9px;height:9px;border-radius:50%;background:#2c4631}
 .mock-top .rec{margin-left:auto;display:flex;align-items:center;gap:7px;color:#ff6b6b;font-weight:700}
 .mock-top .rec i{width:8px;height:8px;border-radius:50%;background:#ff5252;animation:blink 1.1s infinite}
 @keyframes blink{50%{opacity:.15}}
-.mock-body{position:relative;aspect-ratio:16/10;background:linear-gradient(140deg,#16301a,#0c1a10);display:flex;align-items:center;justify-content:center;color:var(--ink3);font-size:14px}
-.scan{position:absolute;left:6%;right:6%;height:2px;background:linear-gradient(90deg,transparent,var(--green2),transparent);box-shadow:0 0 18px var(--green2);animation:scan 3.2s ease-in-out infinite}
-@keyframes scan{0%,100%{top:12%}50%{top:84%}}
-.mock-tag{position:absolute;top:12px;left:12px;background:#000000a8;border:1px solid #2f8f0066;color:var(--green2);font-size:12px;padding:5px 10px;border-radius:8px;letter-spacing:.08em}
-.mock-clock{position:absolute;top:12px;right:12px;background:#000000a8;color:var(--ink2);font-size:12px;padding:5px 10px;border-radius:8px;font-variant-numeric:tabular-nums}
-.mock-bottom{display:flex;gap:12px;padding:14px 16px;align-items:center;border-top:1px solid var(--line)}
-.thumbs{display:flex;gap:8px;flex:1;min-width:0}
-.thumb{width:56px;height:56px;border-radius:9px;flex:none;border:1px solid var(--line);background:linear-gradient(140deg,#25512b,#14301a);position:relative}
-.thumb span{position:absolute;right:4px;bottom:2px;font-size:10px;color:var(--gold);font-weight:700}
-.mock-meta{font-size:12px;color:var(--ink3);text-align:right;flex:none}
-.mock-meta b{color:var(--green2)}
+.mock-shot{background:#07110a;line-height:0}
+.mock-shot img{width:100%;display:block}
+/* SECTION: preview gallery */
+.shot-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:18px;margin-top:38px}
+.shot{border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:var(--bg2);margin:0}
+.shot a{display:block}
+.shot img{width:100%;display:block}
+.shot figcaption{padding:12px 16px;font-size:13px;color:var(--ink3);border-top:1px solid var(--line)}
 /* SECTION: download */
 .dl-card{border:1px solid var(--line);border-radius:var(--radius);background:var(--card);padding:30px;display:grid;grid-template-columns:1fr auto;gap:24px;align-items:center}
 .dl-card .meta{font-size:13.5px;color:var(--ink3);margin-top:12px;line-height:1.9}
@@ -76,11 +73,7 @@ header{position:fixed;inset:0 0 auto 0;z-index:50;backdrop-filter:blur(14px);bac
 .dl-head h3{font-size:22px;font-weight:800}
 .ver-tag{background:linear-gradient(120deg,var(--gold),var(--gold2));color:#20301a;padding:5px 14px;border-radius:999px;font-size:13px;font-weight:800}
 .dl-actions{display:flex;flex-direction:column;gap:10px;align-items:stretch}
-.loading{color:var(--ink3);font-size:14px}
-.loading::after{content:'…';animation:dots 1.4s steps(4,end) infinite}
-@keyframes dots{0%,20%{content:''}40%{content:'.'}60%{content:'..'}80%,100%{content:'…'}}
-.error{background:#241010;border:1px solid #5a2222;color:#f0b3b3;padding:18px;border-radius:12px;font-size:14px;line-height:1.7}
-.error a{color:var(--gold);text-decoration:underline}
+.dl-tip{margin-top:14px;font-size:12.5px;color:var(--ink3);line-height:1.9}
 .install{margin-top:18px;padding:20px 22px;border-radius:12px;background:#0a130b;border-left:3px solid var(--green)}
 .install h4{font-size:15px;margin-bottom:10px;color:var(--ink2)}
 .install ol{margin-left:18px;font-size:13.5px;color:var(--ink3);line-height:1.9}
@@ -109,6 +102,7 @@ footer a{color:var(--gold)}
 @media (max-width:960px){
   .hero-grid{grid-template-columns:1fr}
   .feat-grid{grid-template-columns:repeat(2,1fr)}
+  .shot-grid{grid-template-columns:1fr}
   .nav-links{display:none}
   section{padding:64px 0}
   .hero{padding-top:110px}
@@ -118,7 +112,6 @@ footer a{color:var(--gold)}
 @media (max-width:600px){
   .feat-grid{grid-template-columns:1fr}
   .stats{gap:24px}
-  .mock-meta{display:none}
 }
 </style>
 </head>
@@ -130,10 +123,11 @@ footer a{color:var(--gold)}
     <div class="brand"><img class="brand-logo" src="assets/logo.png" alt="星期衣 logo" onerror="this.outerHTML='<span class=&quot;mark&quot;>衣</span>'">星期衣 · 精致洗衣</div>
     <nav class="nav-links" id="navLinks">
       <a href="#download">下载</a>
+      <a href="#preview">界面预览</a>
       <a href="#features">核心功能</a>
       <a href="#admin">管理员工具</a>
     </nav>
-    <a class="btn btn-gold" href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/releases/latest" target="_blank" rel="noopener">下载 <span data-ver>最新版</span></a>
+    <a class="btn btn-gold" href="#download">下载 <span data-ver>v1.1.0</span></a>
   </div>
 </header>
 
@@ -154,28 +148,43 @@ footer a{color:var(--gold)}
         <div><b>多机联网</b><span>局域网 / 异地组网</span></div>
       </div>
     </div>
-    <!-- SECTION: workbench mock -->
-    <div class="mock" aria-label="拍照工作台模拟画面">
+    <!-- SECTION: workbench shot（真实界面截图） -->
+    <div class="mock" aria-label="衣物拍照工作台界面（真实截图）">
       <div class="mock-top">
         <span class="dot"></span><span class="dot"></span><span class="dot"></span>
         &nbsp;衣物拍照 · 工作台
         <span class="rec"><i></i>REC</span>
       </div>
-      <div class="mock-body">
-        📷 取景框 · 摄像头最大分辨率
-        <div class="scan"></div>
-        <div class="mock-tag">条码 XQY-20260905-018</div>
-        <div class="mock-clock" id="mockClock">18:42:06</div>
+      <div class="mock-shot">
+        <img src="assets/preview/capture.png" alt="衣物拍照界面：扫码进入拍摄状态，取景、连拍与缩略图队列" />
       </div>
-      <div class="mock-bottom">
-        <div class="thumbs">
-          <div class="thumb"><span>#1</span></div>
-          <div class="thumb"><span>#2</span></div>
-          <div class="thumb"><span>#3</span></div>
-          <div class="thumb"><span>#4</span></div>
-        </div>
-        <div class="mock-meta">空格 = 拍照 · 回车 = 保存<br>已拍 <b>4</b> 张 · 待保存</div>
-      </div>
+    </div>
+  </div>
+</section>
+
+<!-- SECTION: preview -->
+<section id="preview" class="matrix">
+  <div class="wrap">
+    <div class="eyebrow">INTERFACE PREVIEW</div>
+    <h2>界面预览</h2>
+    <p class="lead">以下均为软件真实界面截图：从拍照留档、订单查询到管理端汇总。</p>
+    <div class="shot-grid">
+      <figure class="shot">
+        <a href="assets/preview/home.png" target="_blank" rel="noopener"><img src="assets/preview/home.png" alt="首页：存档统计与最近存档（真实界面截图）" loading="lazy" decoding="async" /></a>
+        <figcaption>首页 · 今日统计、快捷入口与最近存档</figcaption>
+      </figure>
+      <figure class="shot">
+        <a href="assets/preview/query.png" target="_blank" rel="noopener"><img src="assets/preview/query.png" alt="记录查询：按条码与日期筛选照片（真实界面截图）" loading="lazy" decoding="async" /></a>
+        <figcaption>记录查询 · 按条码 / 日期筛选，照片即刻可查</figcaption>
+      </figure>
+      <figure class="shot">
+        <a href="assets/preview/data.png" target="_blank" rel="noopener"><img src="assets/preview/data.png" alt="数据查看：管理端全部门店存档网格（真实界面截图）" loading="lazy" decoding="async" /></a>
+        <figcaption>数据查看 · 管理端跨门店汇总与批量导出</figcaption>
+      </figure>
+      <figure class="shot">
+        <a href="assets/preview/overview.png" target="_blank" rel="noopener"><img src="assets/preview/overview.png" alt="数据总览：账号构成、存档统计与操作日志（真实界面截图）" loading="lazy" decoding="async" /></a>
+        <figcaption>数据总览 · 账号构成、存档统计与操作日志</figcaption>
+      </figure>
     </div>
   </div>
 </section>
@@ -185,10 +194,38 @@ footer a{color:var(--gold)}
   <div class="wrap">
     <div class="eyebrow">DOWNLOAD</div>
     <h2>下载与安装</h2>
-    <p class="lead">一键安装包，内置全部运行环境，终端电脑零依赖。版本信息自动从 GitHub Releases 获取。</p>
+    <p class="lead">一键安装包，内置全部运行环境，终端电脑零依赖；版本信息经加速通道获取，网络受限时也能下载。</p>
     <div style="margin-top:34px">
       <div id="downloadContent">
-        <div class="loading">正在获取最新版本信息</div>
+        <div class="dl-card">
+          <div>
+            <div class="dl-head">
+              <h3>Windows 安装包</h3>
+              <span class="ver-tag">v1.1.0</span>
+            </div>
+            <div class="meta">
+              <div><b>文件名：</b>xingqiyi-laundry-photo-setup-1.1.0.exe</div>
+              <div><b>文件大小：</b>76.57 MB</div>
+              <div><b>发布日期：</b>2026/9/22</div>
+              <div><b>系统要求：</b>Windows 10/11 64 位</div>
+            </div>
+          </div>
+          <div class="dl-actions">
+            <a href="https://gh-proxy.com/https://github.com/Jace-Hao/xingqiyi-laundry-photo/releases/download/v1.1.0/xingqiyi-laundry-photo-setup-1.1.0.exe" class="btn btn-gold" target="_blank" rel="noopener">⬇️ 加速下载安装包</a>
+            <a href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/releases/download/v1.1.0/xingqiyi-laundry-photo-setup-1.1.0.exe" class="btn btn-ghost" target="_blank" rel="noopener">官网直链 ↗</a>
+            <a href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/releases" target="_blank" rel="noopener" style="text-align:center;font-size:12.5px;color:var(--ink3);padding:4px 0">全部版本 ↗</a>
+          </div>
+        </div>
+        <div class="install">
+          <h4>📝 安装说明</h4>
+          <ol>
+            <li>下载安装包后双击运行</li>
+            <li>按照向导完成安装</li>
+            <li>首次启动需要选择运行模式（服务端 / 客户端）</li>
+            <li>默认管理员账号：admin / admin123（请及时修改密码）</li>
+          </ol>
+        </div>
+        <p class="dl-tip">网络提示：国内直连 GitHub 可能较慢，建议使用「加速下载」；两处提供的文件完全一致（SHA256: FC56F966B564672CCC462F3FF4D21092899E09E8F97532FBB01FE3E2B49315ED）。</p>
       </div>
     </div>
   </div>
@@ -235,7 +272,7 @@ footer a{color:var(--gold)}
     <h2>现在，把每一件衣物都留档。</h2>
     <p class="lead" style="margin:0 auto">安装后即可开始更完整的衣物拍照存档与多店管理体验。</p>
     <div class="hero-cta" style="justify-content:center;margin-top:28px">
-      <a class="btn btn-gold" href="https://github.com/Jace-Hao/xingqiyi-laundry-photo/releases" target="_blank" rel="noopener">前往 Releases 下载</a>
+      <a class="btn btn-gold" href="#download">下载最新版安装包</a>
     </div>
     <div class="note">Windows 10/11 · 安装包直接安装 · 持续更新</div>
   </div>
@@ -249,13 +286,6 @@ footer a{color:var(--gold)}
 </footer>
 
 <script>
-/* SECTION: clock */
-(function(){
-  var el=document.getElementById("mockClock"); if(!el)return;
-  function pad(n){return n<10?"0"+n:""+n}
-  function tick(){var d=new Date();el.textContent=pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds());}
-  tick(); setInterval(tick,1000);
-})();
 /* SECTION: nav scrollspy */
 (function(){
   var links=[].slice.call(document.querySelectorAll("#navLinks a"));
@@ -267,80 +297,96 @@ footer a{color:var(--gold)}
   }
   window.addEventListener("scroll",onScroll,{passive:true}); onScroll();
 })();
-/* SECTION: latest release */
-const GITHUB_REPO='Jace-Hao/xingqiyi-laundry-photo';
-const GITHUB_API=`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
+/* SECTION: latest release（经加速通道获取；失败时使用页面内置兜底信息，保证按钮与下载始终可用） */
+var GITHUB_REPO='Jace-Hao/xingqiyi-laundry-photo';
+/* 加速前缀：网络受限（无法直连 GitHub）时经此镜像访问。若该服务失效，可替换为同类镜像服务。 */
+var ACCEL='https://gh-proxy.com/';
+/* 兜底信息：发新版本时请随页面一起更新，确保离线 / 网络受限时仍显示正确版本与下载链路 */
+var FALLBACK={version:'1.1.0',asset:'xingqiyi-laundry-photo-setup-1.1.0.exe',sizeMB:76.57,date:'2026/9/22',sha:'FC56F966B564672CCC462F3FF4D21092899E09E8F97532FBB01FE3E2B49315ED'};
 
 function setVer(text){document.querySelectorAll('[data-ver]').forEach(function(el){el.textContent=text;});}
 
-async function fetchLatestRelease(){
-  const response=await fetch(GITHUB_API);
-  if(!response.ok) throw new Error('获取版本信息失败');
-  const release=await response.json();
+function fetchJsonWithTimeout(url,ms){
+  return new Promise(function(resolve,reject){
+    var timer=setTimeout(function(){reject(new Error('请求超时'));},ms);
+    fetch(url,{headers:{'Accept':'application/vnd.github+json'}})
+      .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
+      .then(function(j){clearTimeout(timer);resolve(j);})
+      .catch(function(e){clearTimeout(timer);reject(e);});
+  });
+}
+
+function normalizeRelease(rel){
+  if(!rel||!rel.tag_name)return null;
+  var assets=Array.isArray(rel.assets)?rel.assets:[];
+  var exe=assets.find(function(a){return /\.exe$/i.test(String(a.name||''))&&/setup/i.test(String(a.name||''))})||
+          assets.find(function(a){return /\.exe$/i.test(String(a.name||''))})||null;
+  var version=String(rel.tag_name).replace(/^v/,'');
   return {
-    version:release.tag_name.replace(/^v/,''),
-    assets:release.assets,
-    publishedAt:new Date(release.published_at).toLocaleDateString('zh-CN')
+    version:version,
+    asset:(exe&&exe.name)||('xingqiyi-laundry-photo-setup-'+version+'.exe'),
+    sizeMB:exe&&exe.size?(exe.size/1048576):null,
+    date:rel.published_at?new Date(rel.published_at).toLocaleDateString('zh-CN'):'—'
   };
 }
 
-function renderDownloadSection(release){
-  setVer('v'+release.version);
-  const downloadContent=document.getElementById('downloadContent');
-  const windowsAsset=release.assets.find(asset=>
-    asset.name.toLowerCase().includes('setup')&&asset.name.toLowerCase().endsWith('.exe')
-  );
-  if(windowsAsset){
-    downloadContent.innerHTML=`
-      <div class="dl-card">
-        <div>
-          <div class="dl-head">
-            <h3>Windows 安装包</h3>
-            <span class="ver-tag">v${release.version}</span>
-          </div>
-          <div class="meta">
-            <div><b>文件名：</b>${windowsAsset.name}</div>
-            <div><b>文件大小：</b>${(windowsAsset.size/1024/1024).toFixed(2)} MB</div>
-            <div><b>发布日期：</b>${release.publishedAt}</div>
-            <div><b>系统要求：</b>Windows 10/11 64 位</div>
-          </div>
-        </div>
-        <div class="dl-actions">
-          <a href="${windowsAsset.browser_download_url}" class="btn btn-gold" target="_blank" rel="noopener">⬇️ 下载安装包</a>
-          <a href="https://github.com/${GITHUB_REPO}/releases" class="btn btn-ghost" target="_blank" rel="noopener">全部版本 ↗</a>
-        </div>
-      </div>
-      <div class="install">
-        <h4>📝 安装说明</h4>
-        <ol>
-          <li>下载安装包后双击运行</li>
-          <li>按照向导完成安装</li>
-          <li>首次启动需要选择运行模式（服务端 / 客户端）</li>
-          <li>默认管理员账号：admin / admin123（请及时修改密码）</li>
-        </ol>
-      </div>`;
-  }else{
-    downloadContent.innerHTML=`
-      <div class="error">未找到 Windows 安装包，请访问 <a href="https://github.com/${GITHUB_REPO}/releases" target="_blank" rel="noopener">GitHub Releases</a> 页面下载。</div>`;
-  }
+function fetchLatestRelease(){
+  var api='https://api.github.com/repos/'+GITHUB_REPO+'/releases/latest';
+  /* 顺序：先加速通道、后官方直连，任一路径成功即可 */
+  var urls=[ACCEL+api,api];
+  return urls.reduce(function(chain,u){
+    return chain.catch(function(){
+      return fetchJsonWithTimeout(u,9000).then(function(j){
+        var info=normalizeRelease(j);
+        if(!info)throw new Error('返回数据异常');
+        return info;
+      });
+    });
+  },Promise.reject(new Error('start')));
 }
 
-fetchLatestRelease()
-  .then(renderDownloadSection)
-  .catch(function(){
-    setVer('V0.1.8');
-    document.getElementById('downloadContent').innerHTML=`
-      <div class="error">获取版本信息失败（可能是网络限制或 API 速率限制）。请访问 <a href="https://github.com/${GITHUB_REPO}/releases" target="_blank" rel="noopener">GitHub Releases</a> 页面下载最新版本。</div>
-      <div class="install">
-        <h4>📝 安装说明</h4>
-        <ol>
-          <li>下载安装包后双击运行</li>
-          <li>按照向导完成安装</li>
-          <li>首次启动需要选择运行模式（服务端 / 客户端）</li>
-          <li>默认管理员账号：admin / admin123（请及时修改密码）</li>
-        </ol>
-      </div>`;
-  });
+function renderDownloadSection(info,note){
+  var v=String(info.version||'');
+  var asset=String(info.asset||('xingqiyi-laundry-photo-setup-'+v+'.exe'));
+  var direct='https://github.com/'+GITHUB_REPO+'/releases/download/v'+v+'/'+asset;
+  var fast=ACCEL+direct;
+  var size=info.sizeMB?Number(info.sizeMB).toFixed(2)+' MB':'以实际文件为准';
+  var date=info.date||'—';
+  setVer('v'+v);
+  document.getElementById('downloadContent').innerHTML=
+    '<div class="dl-card">'+
+      '<div>'+
+        '<div class="dl-head"><h3>Windows 安装包</h3><span class="ver-tag">v'+v+'</span></div>'+
+        '<div class="meta">'+
+          '<div><b>文件名：</b>'+asset+'</div>'+
+          '<div><b>文件大小：</b>'+size+'</div>'+
+          '<div><b>发布日期：</b>'+date+'</div>'+
+          '<div><b>系统要求：</b>Windows 10/11 64 位</div>'+
+        '</div>'+
+      '</div>'+
+      '<div class="dl-actions">'+
+        '<a href="'+fast+'" class="btn btn-gold" target="_blank" rel="noopener">⬇️ 加速下载安装包</a>'+
+        '<a href="'+direct+'" class="btn btn-ghost" target="_blank" rel="noopener">官网直链 ↗</a>'+
+        '<a href="https://github.com/'+GITHUB_REPO+'/releases" target="_blank" rel="noopener" style="text-align:center;font-size:12.5px;color:var(--ink3);padding:4px 0">全部版本 ↗</a>'+
+      '</div>'+
+    '</div>'+
+    '<div class="install"><h4>📝 安装说明</h4><ol>'+
+      '<li>下载安装包后双击运行</li>'+
+      '<li>按照向导完成安装</li>'+
+      '<li>首次启动需要选择运行模式（服务端 / 客户端）</li>'+
+      '<li>默认管理员账号：admin / admin123（请及时修改密码）</li>'+
+    '</ol></div>'+
+    '<p class="dl-tip">'+note+'</p>';
+}
+
+(function initRelease(){
+  /* 页面静态内容已按兜底信息渲染；联网后若存在更新版本，再刷新为最新信息 */
+  fetchLatestRelease().then(function(info){
+    if(!info||!info.version)return;
+    if(info.version===FALLBACK.version)return;
+    renderDownloadSection(info,'网络提示：国内直连 GitHub 可能较慢，建议使用「加速下载」。');
+  }).catch(function(){ /* 获取失败：保留页面内置兜底信息，不影响下载 */ });
+})();
 </script>
 </body>
 </html>
