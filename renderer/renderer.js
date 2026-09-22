@@ -1182,7 +1182,7 @@ const HomePage = {
       </div>
       <div v-else class="record-grid">
         <div v-for="r in recent" :key="r.id" class="record-card" @click="openDetail(r)">
-          <div class="record-photo"><img :src="r.photoUrl" loading="lazy" decoding="async" /></div>
+          <div class="record-photo"><img :src="r.thumbUrl || r.photoUrl" loading="lazy" decoding="async" /></div>
           <div class="record-meta">
             <div class="record-customer">{{ r.barcode }}</div>
             <div class="record-tags">
@@ -2133,7 +2133,7 @@ const QueryPage = {
           <div v-else-if="!items.length" class="empty">暂无符合条件的存档记录</div>
           <div v-else class="record-grid">
             <div v-for="r in items" :key="r.id" class="record-card" @click="openDetail(r)">
-              <div class="record-photo"><img :src="r.photoUrl" loading="lazy" decoding="async" /></div>
+              <div class="record-photo"><img :src="r.thumbUrl || r.photoUrl" loading="lazy" decoding="async" /></div>
               <div class="record-meta">
                 <div class="record-customer">{{ r.barcode }}</div>
                 <div class="record-tags">
@@ -2405,7 +2405,7 @@ const AdminOverviewPage = {
         <div v-if="o && !o.recentRecords.length" class="empty">暂无存档记录</div>
         <div v-else-if="o" class="record-grid">
           <div v-for="r in o.recentRecords" :key="r.id" class="record-card" style="cursor:default">
-            <div class="record-photo"><img :src="r.photoUrl" loading="lazy" decoding="async" /></div>
+            <div class="record-photo"><img :src="r.thumbUrl || r.photoUrl" loading="lazy" decoding="async" /></div>
             <div class="record-meta">
               <div class="record-customer">{{ r.barcode }}</div>
               <div class="record-tags">

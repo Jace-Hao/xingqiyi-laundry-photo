@@ -12,6 +12,10 @@ const path = require('path');
 const crypto = require('crypto');
 const { AsyncLocalStorage } = require('async_hooks');
 const license = require('./license');
+// 取默认宽度常量用于派生缩略图 URL；createThumbService 用于照片删除时清理缓存
+// （removeFor 为纯文件操作，无需注入 nativeImage）。
+// thumb.js 只依赖 fs/path/crypto，不 require store.js，因此无循环引用。
+const { createThumbService, DEFAULT_THUMB_WIDTH } = require('./thumb');
 
 // 请求来源上下文：服务端收到网络请求时把客户端 IP 存入这里，
 // 写日志时自动读取，无需层层修改业务函数签名。
@@ -51,7 +55,7 @@ function currentRequestIp() {
   return normalizeIp(ctx && ctx.ip);
 }
 
-function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0', photoScheme = 'xqy-photo' }) {
+function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0', photoScheme = 'xqy-photo', thumbsDir = '' }) {
   const CONFIG_FILE = path.join(dataDir, 'config.json');
   const USERS_FILE = path.join(dataDir, 'users.json');
   const RECORDS_FILE = path.join(dataDir, 'records.json');
@@ -119,6 +123,41 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
   // 照片 URL：photoFile 形如「条码目录/文件名.jpg」，整体编码后放入标准路径段。
   // 注意：不能放进 host 段——WHATWG URL 会把含子目录的 host 判为非法，导致解析为空、图片加载失败。
   const encodePhotoUrl = (file) => `${photoScheme}://photo/${encodeURIComponent(file)}`;
+
+  /**
+   * 缩略图 URL：在原图 URL 上附加 ?w=<宽度>。
+   * 由数据层统一派生，避免前端多处各自拼接、日后改宽度时漏改。
+   *
+   * 协议处理器（main.js）与服务端 /photo（server.js）都会读取该参数：
+   * 命中则返回缓存的缩略图，生成失败时回退原图。
+   *
+   * 注意：宽度取值必须与 main/thumb.js 的 DEFAULT_THUMB_WIDTH 一致，
+   * 否则 removeFor() 清理缓存时会算出不同的缓存键而漏删。
+   */
+  const encodePhotoThumbUrl = (file) => encodePhotoUrl(file) + '?w=' + DEFAULT_THUMB_WIDTH;
+
+  /**
+   * 为记录补上派生的照片 URL：原图（photoUrl，供灯箱预览与下载用）
+   * 与缩略图（thumbUrl，供网格展示用；协议侧命中缓存则返回缓存文件）。
+   * 所有对外返回记录的地方统一走这里，避免漏加缩略图字段。
+   */
+  const withPhotoUrls = (r) => ({
+    ...r,
+    photoUrl: encodePhotoUrl(r.photoFile),
+    thumbUrl: encodePhotoThumbUrl(r.photoFile)
+  });
+
+  // 缩略图缓存清理：照片被删除时同步清掉缓存文件，避免 userData/thumbs 无限累积。
+  // 未配置 thumbsDir（如无头验证脚本）时静默跳过。
+  const thumbCleanup = thumbsDir ? createThumbService({ thumbsDir }) : null;
+  function removeThumbCache(relPath) {
+    if (!thumbCleanup || !relPath) return;
+    try {
+      thumbCleanup.removeFor(relPath);
+    } catch (e) {
+      /* 缓存清理失败不影响照片删除主流程；残留缓存会在下次生成时被覆盖 */
+    }
+  }
 
   // 把「条码目录/文件名」安全解析为照片根目录下的绝对路径（防穿越）
   function resolvePhotoFile(fileName) {
@@ -651,7 +690,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       detail: `新增存档照片：条码「${barcode}」第 ${seq} 张`,
       result: '成功'
     });
-    return { ...record, photoUrl: encodePhotoUrl(record.photoFile) };
+    return withPhotoUrls(record);
   }
 
   function listRecords(token, p = {}) {
@@ -685,7 +724,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     const pageSize = Math.min(100, Math.max(1, Number(p.pageSize) || 12));
     const items = list
       .slice((page - 1) * pageSize, page * pageSize)
-      .map((r) => ({ ...r, photoUrl: encodePhotoUrl(r.photoFile) }));
+      .map(withPhotoUrls);
 
     if (!p.silent) {
       appendLog({
@@ -712,7 +751,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       detail: `查看存档详情：条码「${r.barcode}」第 ${r.seq} 张（所属账号 ${r.username}）`,
       result: '成功'
     });
-    return { ...r, photoUrl: encodePhotoUrl(r.photoFile) };
+    return withPhotoUrls(r);
   }
 
   function deleteRecord(token, id) {
@@ -729,6 +768,8 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     } catch (e) {
       /* 照片文件缺失不影响记录删除 */
     }
+    // 照片被删后其缩略图缓存不再有任何引用，同步清理
+    removeThumbCache(r.photoFile);
     appendLog({
       ...logBase(me),
       module: isSysAdmin(me) ? '数据管理' : '衣物查询',
@@ -763,6 +804,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       } catch (e) {
         /* 照片文件缺失不影响记录删除 */
       }
+      removeThumbCache(r.photoFile);
       deleted++;
     }
     if (!deleted) throw new Error('没有可删除的记录（不存在或无权限）');
@@ -1111,7 +1153,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     const recentRecords = [...records]
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, 6)
-      .map((r) => ({ ...r, photoUrl: encodePhotoUrl(r.photoFile) }));
+      .map(withPhotoUrls);
     const recentLogs = [...logs].sort((a, b) => b.time.localeCompare(a.time)).slice(0, 8);
     return {
       userCount: users.length,
@@ -1315,6 +1357,8 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       }
       moved++;
     }
+    // 缩略图缓存不做迁移清理：缓存键基于相对路径，照片内容未变则缓存依然有效；
+    // 跨盘复制导致 mtime 变新的照片，会在下次请求时按「mtime 不新于原图」规则自动重建。
     const c = loadConfig();
     c.photoDir = target;
     saveConfig(c);
@@ -1653,6 +1697,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       } catch (e) {
         base.photosMissing++;
       }
+      removeThumbCache(rel);
     }
     saveRecords(kept);
 
@@ -1731,7 +1776,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     for (const it of items) {
       if (!it || !it.id) continue;
       const exist = index.get(it.id);
-      const { photoUrl, ...plain } = it;
+      const { photoUrl, thumbUrl, ...plain } = it;
       if (exist) {
         // 已同步成功的记录直接更新；待同步记录保留 pendingSync 标记
         index.set(it.id, { ...exist, ...plain, pendingSync: exist.pendingSync || false });
@@ -1803,7 +1848,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       detail: `服务器失联，离线存档：条码「${barcode}」第 ${seq} 张（待同步）`,
       result: '成功'
     });
-    return { ...record, photoUrl: encodePhotoUrl(record.photoFile) };
+    return withPhotoUrls(record);
   }
 
   // 同步成功后用服务端返回的记录替换本机离线副本
@@ -1811,7 +1856,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     const records = loadRecords();
     const idx = records.findIndex((r) => r.id === localId);
     if (idx === -1) return false;
-    const { photoUrl, ...plain } = serverRecord || {};
+    const { photoUrl, thumbUrl, ...plain } = serverRecord || {};
     records[idx] = { ...records[idx], ...plain, pendingSync: false };
     saveRecords(records);
     return true;

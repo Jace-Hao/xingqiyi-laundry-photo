@@ -242,10 +242,11 @@ node scripts/license-tool.js --verify <机器码> <激活码>  # 校验激活码
     ├── copy-vue.js              postinstall 自动复制 Vue 运行时
     ├── sync-manual.js           同步操作手册到 renderer/assets，并校验版本一致性与语法覆盖
     ├── license-tool.js          激活码计算工具（不入库，见 .gitignore）
-    ├── verify-store.js          数据层无头验证（92 项用例）
+    ├── verify-store.js          数据层无头验证（105 项用例）
     ├── verify-server.js         HTTP 服务无头验证（35 项用例）
     ├── verify-templates.js      Vue 模板编译校验 + 模板变量注册完整性（12 个组件）
     ├── verify-watermark.js      照片时间水印几何与样式校验（48 项用例）
+    ├── verify-thumb.js          缩略图生成 / 缓存 / 清理与 /photo 接口校验（31 项用例）
     ├── verify-credentials.js    登录凭据安全属性校验（61 项用例）
     ├── verify-manual-sync.js    手册同步脚本的校验有效性（17 项用例）
     └── verify-manual-render.js  手册渲染器与角色裁剪校验（75 项用例）
@@ -254,7 +255,7 @@ node scripts/license-tool.js --verify <机器码> <激活码>  # 校验激活码
 ## 七、验证命令
 
 ```bash
-npm run verify    # 一次跑完全部 7 个校验脚本，共 340 项断言
+npm run verify    # 一次跑完全部 8 个校验脚本，共 384 项断言
 ```
 
 也可单独运行任一脚本，例如：
@@ -263,6 +264,7 @@ npm run verify    # 一次跑完全部 7 个校验脚本，共 340 项断言
 node scripts/verify-store.js          # 数据层（门店可见性、四级角色、日志、导出）
 node scripts/verify-credentials.js    # 凭据安全属性（密码不明文落盘等）
 node scripts/verify-manual-render.js  # 手册渲染与角色裁剪
+node scripts/verify-thumb.js          # 缩略图生成 / 缓存 / 清理与照片接口
 ```
 
 打包前会自动执行 `prebuild`（复制 Vue 运行时 + 同步操作手册）。若手册版本号与

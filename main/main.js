@@ -8,6 +8,7 @@ const { pathToFileURL } = require('url');
 const { createStore, SESSION_REVOKED_CODE } = require('./store');
 const { startServer } = require('./server');
 const { createCredentialStore } = require('./credentials');
+const { createThumbService, normalizeThumbSize } = require('./thumb');
 
 app.setName('星期衣精致洗衣衣物照片系统');
 
@@ -27,6 +28,9 @@ const RENDERER_DIR = path.join(__dirname, '..', 'renderer');
 
 const APP_VERSION = require('../package.json').version;
 const UPDATE_DIR = path.join(app.getPath('userData'), 'updates');
+// 缩略图缓存目录：放在 userData 下而非照片目录内。
+// 照片目录是用户数据，往里写生成文件会扩大备份范围，也可能被同步盘反复上传。
+const THUMBS_DIR = path.join(app.getPath('userData'), 'thumbs');
 
 // 更新分发：通过 GitHub Releases 发布安装包，应用从这里检查最新版本。
 // 仓库地址须与 package.json 的 repository 保持一致。
@@ -38,8 +42,15 @@ const store = createStore({
   defaultPhotoDir: DEFAULT_PHOTO_DIR,
   updateDir: UPDATE_DIR,
   appVersion: APP_VERSION,
-  photoScheme: PHOTO_SCHEME
+  photoScheme: PHOTO_SCHEME,
+  // 照片删除 / 批量删除 / 保留期清理时同步清理缩略图缓存
+  thumbsDir: THUMBS_DIR
 });
+
+// 缩略图缓存服务：网格图片以 ?w=<宽度> 请求缩略图，生成一次后缓存复用，
+// 避免每次为约 180px 的显示区加载数 MB 的原图。nativeImage 由 Electron 注入，
+// 模块在纯 Node 下也可加载（验证脚本用假实现测试其余逻辑）。
+const thumbService = createThumbService({ thumbsDir: THUMBS_DIR, nativeImage });
 
 // 登录凭据保存（记住账号 / 记住密码）：
 // 文件位于本机用户数据目录，密码经 Electron safeStorage 系统级加密后保存，
@@ -1396,7 +1407,7 @@ async function restartServerIfNeeded() {
       await httpServer.close();
       httpServer = null;
     }
-    httpServer = await startServer(store, { port: cfg.port });
+    httpServer = await startServer(store, { port: cfg.port, thumbs: thumbService });
     // 服务端后台常驻（需求13）：运行时切换到服务端也创建托盘并防休眠
     createTray();
     if (powerSaveId === null) {
@@ -1739,18 +1750,26 @@ app.whenReady().then(async () => {
     }
   });
 
-  // 照片协议：服务端模式读本地，客户端模式从远程拉取
+  // 照片协议：服务端模式读本地，客户端模式从远程拉取；带 ?w= 时返回缩略图（失败回退原图）
   protocol.handle(PHOTO_SCHEME, async (request) => {
     try {
-      const fileName = decodeURIComponent(new URL(request.url).pathname.replace(/^\/+/, ''));
+      const u = new URL(request.url);
+      const fileName = decodeURIComponent(u.pathname.replace(/^\/+/, ''));
+      // 网格缩略图参数 ?w=：非法值返回 null，按「无参数」处理、回退原图
+      const width = normalizeThumbSize(u.searchParams.get('w'));
       const filePath = store.resolvePhotoFile(fileName);
       if (!fileName || !filePath) {
         return new Response('Forbidden', { status: 403 });
       }
       const cfg = store.loadConfig();
       if (cfg.mode === 'client') {
-        const photoUrl = cfg.serverUrl + '/photo?f=' + encodeURIComponent(fileName) + '&token=' + encodeURIComponent(cfg.serverToken);
+        const photoUrl = cfg.serverUrl + '/photo?f=' + encodeURIComponent(fileName) + (width ? '&w=' + width : '') + '&token=' + encodeURIComponent(cfg.serverToken);
         return net.fetch(photoUrl);
+      }
+      if (width) {
+        // 缩略图：命中缓存或生成成功时返回缓存文件；失败回退原图
+        const thumbPath = thumbService.getOrCreate(filePath, fileName, width);
+        if (thumbPath) return net.fetch(pathToFileURL(thumbPath).toString());
       }
       return net.fetch(pathToFileURL(filePath).toString());
     } catch (e) {
@@ -1762,7 +1781,7 @@ app.whenReady().then(async () => {
   const cfg = store.loadConfig();
   if (cfg.mode === 'server') {
     try {
-      httpServer = await startServer(store, { port: cfg.port });
+      httpServer = await startServer(store, { port: cfg.port, thumbs: thumbService });
       // 服务端后台常驻（需求13）：创建托盘图标，并阻止系统休眠导致服务中断
       createTray();
       if (powerSaveId === null) {

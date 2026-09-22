@@ -14,10 +14,13 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const { withRequestIp, SESSION_REVOKED_CODE } = require('./store');
+const { normalizeThumbSize } = require('./thumb');
 
 function startServer(store, opts = {}) {
   const port = opts.port || 17521;
   const host = opts.host || '0.0.0.0';
+  // 缩略图服务（可选，由主进程注入）：未注入时 /photo 的 ?w= 按原图处理
+  const thumbs = opts.thumbs || null;
 
   function readBody(req) {
     return new Promise((resolve, reject) => {
@@ -126,7 +129,15 @@ function startServer(store, opts = {}) {
       res.writeHead(403);
       return res.end('Forbidden');
     }
-    fs.readFile(filePath, (err, buf) => {
+    // 带 ?w= 时优先返回缩略图缓存：命中缓存或生成成功用缓存文件；
+    // 生成失败（或未注入缩略图服务、参数非法）一律回退原图，保证图片始终可见
+    let servePath = filePath;
+    const width = thumbs ? normalizeThumbSize(query.get && query.get('w')) : null;
+    if (width) {
+      const thumbPath = thumbs.getOrCreate(filePath, fileName, width);
+      if (thumbPath) servePath = thumbPath;
+    }
+    fs.readFile(servePath, (err, buf) => {
       if (err) {
         res.writeHead(404);
         return res.end('Not Found');
