@@ -27,7 +27,58 @@ const DEFAULT_PHOTO_DIR = path.join(app.getPath('userData'), 'photos');
 const RENDERER_DIR = path.join(__dirname, '..', 'renderer');
 
 const APP_VERSION = require('../package.json').version;
-const UPDATE_DIR = path.join(app.getPath('userData'), 'updates');
+// 统一的软件更新文件夹：更新下载、备用更新扫描、强制推送三处共用这一个目录。
+// 正式安装后位于软件安装目录下（…\星期衣精致洗衣衣物照片系统\软件更新）；
+// 若安装目录不可写（例如装到 Program Files 且无写权限），自动退回用户数据目录。
+// 开发运行（npm start）时 Electron 可执行文件在 node_modules 里，不往那里写，直接用用户数据目录。
+const UPDATE_DIR = (() => {
+  const candidates = app.isPackaged
+    ? [path.join(path.dirname(app.getPath('exe')), '软件更新'), path.join(app.getPath('userData'), '软件更新')]
+    : [path.join(app.getPath('userData'), '软件更新')];
+  for (const dir of candidates) {
+    try {
+      const fsProbe = require('fs');
+      fsProbe.mkdirSync(dir, { recursive: true });
+      const probe = path.join(dir, '.write-test-' + process.pid);
+      fsProbe.writeFileSync(probe, '');
+      fsProbe.unlinkSync(probe);
+      return dir;
+    } catch (e) {
+      /* 该目录不可用，尝试下一个 */
+    }
+  }
+  return candidates[candidates.length - 1];
+})();
+
+// 旧版本曾把安装包分散在「系统下载目录\xingqiyi-laundry-photo」与用户数据目录的 updates 下。
+// 启动时做一次尽力而为的搬迁：只复制安装包文件（不删除原文件、不覆盖新目录同名文件），
+// 让历史下载的安装包继续可用（强制推送的同名缓存检查也因此能命中）。
+function migrateLegacyUpdateDirs() {
+  try {
+    const fs = require('fs');
+    const olds = [
+      path.join(app.getPath('downloads'), 'xingqiyi-laundry-photo'),
+      path.join(app.getPath('userData'), 'updates')
+    ];
+    for (const old of olds) {
+      if (path.resolve(old) === path.resolve(UPDATE_DIR)) continue;
+      if (!fs.existsSync(old)) continue;
+      for (const name of fs.readdirSync(old)) {
+        if (!/\.exe$/i.test(name)) continue;
+        const dst = path.join(UPDATE_DIR, name);
+        if (fs.existsSync(dst)) continue;
+        try {
+          fs.copyFileSync(path.join(old, name), dst);
+        } catch (e) {
+          /* 单个文件失败不影响其余 */
+        }
+      }
+    }
+  } catch (e) {
+    /* 搬迁失败不影响启动 */
+  }
+}
+
 // 缩略图缓存目录：放在 userData 下而非照片目录内。
 // 照片目录是用户数据，往里写生成文件会扩大备份范围，也可能被同步盘反复上传。
 const THUMBS_DIR = path.join(app.getPath('userData'), 'thumbs');
@@ -1102,7 +1153,7 @@ handle('system:openUpdatePage', () => {
 });
 
 // ---------- 自动下载更新安装包 ----------
-// 从 GitHub Releases 或服务端强制推送地址下载安装包到「下载」目录下的专属文件夹，
+// 从 GitHub Releases 或服务端强制推送地址下载安装包到统一的「软件更新」文件夹（安装目录下），
 // 边下边报进度，完成后自动打开文件夹定位文件。手动下载与强制推送自动下载共用此实现。
 let activeDownload = null;
 
@@ -1113,7 +1164,7 @@ async function downloadInstaller(url, name, opts = {}) {
   if (!url || !/^https?:\/\//i.test(String(url))) return { ok: false, message: '下载地址无效' };
   if (!mainWindow) return { ok: false, message: '窗口未就绪' };
 
-  const dir = path.join(app.getPath('downloads'), 'xingqiyi-laundry-photo');
+  const dir = UPDATE_DIR;
   fs.mkdirSync(dir, { recursive: true });
   let fileName = String(name || '').replace(/[\\/:*?"<>|]/g, '_').slice(0, 120);
   if (!fileName) fileName = 'xingqiyi-laundry-photo-setup-' + Date.now() + '.exe';
@@ -1298,7 +1349,7 @@ async function checkForceUpdateForClient() {
 
   // 本机已下载过同一安装包（同名且大小一致）时不重复下载，直接提示安装
   const fs = require('fs');
-  const dir = path.join(app.getPath('downloads'), 'xingqiyi-laundry-photo');
+  const dir = UPDATE_DIR;
   const cached = path.join(dir, f.fileName);
   let payload = {
     needUpdate: true,
@@ -1728,6 +1779,8 @@ app.whenReady().then(async () => {
   if (!gotSingleInstanceLock) return;
 
   store.ensureSeedData();
+  // 把旧位置（系统下载目录 / 用户数据目录）里的历史安装包搬进统一的「软件更新」文件夹
+  migrateLegacyUpdateDirs();
   Menu.setApplicationMenu(null);
 
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {

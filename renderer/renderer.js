@@ -3590,7 +3590,7 @@ const AdminSystemPage = {
             {{ downloading ? '下载中…' : '一键下载更新' }}
           </button>
           <button class="btn btn-ghost" @click="openUpdatePage">前往下载页</button>
-          <button v-if="info.mode === 'server'" class="btn btn-ghost" @click="openUpdateFolder">打开备用更新文件夹</button>
+          <button v-if="info.mode === 'server'" class="btn btn-ghost" @click="openUpdateFolder">打开软件更新文件夹</button>
         </div>
       </div>
 
@@ -3635,7 +3635,7 @@ const AdminSystemPage = {
         </div>
 
         <p class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#f0f7ff;border:1px solid #cfe2f7;border-radius:8px">
-          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-0.1.7.exe）放入更新文件夹 →
+          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.1.exe）放入软件安装目录下的「软件更新」文件夹 →
           在上方列表选中它 → 点「开启强制推送」。客户端下次登录时会自动从服务器下载该安装包，
           下载完成后弹窗提示店员双击安装；版本号不高于客户端当前版本的不会触发。
         </p>
