@@ -1518,8 +1518,9 @@ async function restartServerIfNeeded() {
 // ---------- 窗口 ----------
 let mainWindow = null;
 
-// 窗口状态持久化：记住上次是否最大化及手动调整过的尺寸，下次启动沿用。
-// 首次运行（无状态文件）默认最大化，满足「打开软件即全屏显示」的要求。
+// 窗口状态持久化：记录手动调整过的尺寸与位置（作为最大化前的过渡参数）。
+// 「打开即最大化」：无论上次是否手动还原过窗口，启动/唤出都会最大化显示，
+// 满足「打开软件即全屏显示」的要求（开机自启静默驻留、从托盘唤出的场景见 showMainWindow）。
 const WINDOW_STATE_FILE = path.join(app.getPath('userData'), 'window-state.json');
 const DEFAULT_WINDOW = { width: 1300, height: 860, isMaximized: true };
 
@@ -1530,8 +1531,9 @@ function loadWindowState() {
     // 尺寸需落在合理范围内，避免显示器变化后窗口过小或跑出屏幕
     const width = Number(state.width) >= 800 ? Number(state.width) : DEFAULT_WINDOW.width;
     const height = Number(state.height) >= 600 ? Number(state.height) : DEFAULT_WINDOW.height;
-    // 强制最大化：如果用户没有明确设置过窗口状态，或者窗口尺寸过小，都强制最大化
-    const isMaximized = state.isMaximized === undefined || state.isMaximized !== false || (width < 1200 || height < 700);
+    // 打开即最大化：固定为最大化（不再区分上次是否手动还原过；
+    // 如需恢复「记住手动还原状态」的旧行为，改为解析 state.isMaximized 即可）
+    const isMaximized = true;
     return {
       width,
       height,
@@ -1708,6 +1710,14 @@ function showMainWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) {
     createWindow();
     return;
+  }
+  // 唤出即最大化：开机自启静默驻留的窗口在创建时不能执行最大化
+  // （Electron 的 maximize() 会把隐藏窗口一并显示出来，破坏静默驻留），
+  // 因此统一在唤出路径补齐，保证「从托盘/快捷方式打开」与直接启动一致。
+  try {
+    if (!mainWindow.isMaximized()) mainWindow.maximize();
+  } catch (e) {
+    /* 忽略 */
   }
   // 复用统一的焦点恢复逻辑（含 restore 与 webContents.focus）：
   // 静默驻留后首次唤出若缺少 webContents.focus()，会重现 v0.1.7 那个
