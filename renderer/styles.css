@@ -1600,6 +1600,20 @@ tr:hover td {
   font-variant-numeric: tabular-nums;
 }
 
+.pager-jump {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* 页码选择：紧凑下拉，与幽灵按钮同高 */
+.pager-select {
+  max-width: 132px;
+  padding: 4px 8px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  border-radius: 8px;
+}
+
 /* ---------- 设置页 ---------- */
 .settings-grid {
   display: grid;

@@ -2123,6 +2123,15 @@ const QueryPage = {
       }
     }
 
+    // 页码选择：跳到指定页（越界自动收敛到合法范围；同页不重复查询）
+    function goPage(n) {
+      const t = Math.max(1, Math.min(totalPages.value, Math.floor(Number(n) || 1)));
+      if (t !== page.value) {
+        page.value = t;
+        search(false);
+      }
+    }
+
     Vue.onMounted(() => {
       loadUsers();
       // 首屏必须先按容器尺寸算出每页数量再查询。
@@ -2156,7 +2165,7 @@ const QueryPage = {
       page, pageSize, totalPages, loading, detail, detailIndex, gridEl,
       selected, batchDeleting, toggleSelect, selectAll, batchDelete,
       exporting, exportByBarcode, exportByDate,
-      search, reset, openDetail, remove, prev, next, fmt,
+      search, reset, openDetail, remove, prev, next, goPage, fmt,
       // 灯箱预览：缩放、平移、切换
       zoomScale, panX, panY, imgLoaded, imgNatural,
       closeDetail, prevPhoto, nextPhoto, zoomIn, zoomOut, zoomReset,
@@ -2250,6 +2259,11 @@ const QueryPage = {
         <div class="pager">
           <span class="pager-info">共 {{ total }} 条 · 第 {{ page }}/{{ totalPages }} 页</span>
           <button class="btn btn-ghost btn-sm" :disabled="page <= 1" @click="prev">上一页</button>
+          <span class="pager-jump" title="选择页码直达">
+            <select class="pager-select" :value="page" :disabled="totalPages <= 1" @change="goPage($event.target.value)" aria-label="选择页码">
+              <option v-for="p in totalPages" :key="p" :value="p">{{ p }} / {{ totalPages }}</option>
+            </select>
+          </span>
           <button class="btn btn-ghost btn-sm" :disabled="page >= totalPages" @click="next">下一页</button>
         </div>
       </div>
@@ -3729,7 +3743,7 @@ const AdminSystemPage = {
         </div>
 
         <p class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#f0f7ff;border:1px solid #cfe2f7;border-radius:8px">
-          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.6.exe）放入软件安装目录下的「软件更新」文件夹 →
+          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.7.exe）放入软件安装目录下的「软件更新」文件夹 →
           在上方列表选中它 → 点「开启强制推送」。客户端下次登录时会自动从服务器下载该安装包，
           下载完成后弹窗提示店员双击安装；版本号不高于客户端当前版本的不会触发。
         </p>
