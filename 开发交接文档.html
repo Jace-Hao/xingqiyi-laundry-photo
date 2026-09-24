@@ -103,7 +103,7 @@ blockquote.callout{margin:18px 0 0;padding:10px 16px;border-left:2px solid var(-
     <a href="#s07"><span class="no">07</span>验证与开发工具</a>
     <a href="#s08"><span class="no">08</span>私有不入库清单</a>
     <a href="#s09"><span class="no">09</span>本机环境与注意事项</a>
-    <a href="#s10"><span class="no">10</span>本次整理记录</a>
+    <a href="#s10"><span class="no">10</span>整理记录</a>
     <a href="#s11"><span class="no">11</span>交接清单</a>
   </nav>
   <div class="side-foot">GENERATED 2026-09-24 · md2doc</div>
@@ -115,7 +115,7 @@ blockquote.callout{margin:18px 0 0;padding:10px 16px;border-left:2px solid var(-
   <header class="masthead">
     <div class="kicker">Developer Handover · 开发交接文档</div>
     <h1>星期衣精致洗衣衣物照片系统 · 开发交接文档</h1>
-    <p class="lede">适用版本 v1.1.6 · 文档日期 2026-09-24 · 项目路径 E:\软件开发\星期衣精致洗衣衣物照片系统</p>
+    <p class="lede">适用版本 v1.1.10 · 文档日期 2026-09-24 · 项目路径 E:\软件开发\星期衣精致洗衣衣物照片系统</p>
     <div class="meta-strip">
       <div class="barcode-block">
         <svg class="barcode" width="131" height="20" viewBox="0 0 131 20" aria-hidden="true">
@@ -133,7 +133,7 @@ blockquote.callout{margin:18px 0 0;padding:10px 16px;border-left:2px solid var(-
 
 <section id="s01"><div class="sec-head"><span class="sec-no">01</span><h2>项目速览</h2></div>
 
-<ul class="doc"><li>定位：洗衣门店「衣物拍照存档」桌面系统 —— 扫码建档、最大分辨率拍照、拍摄时间水印烧录、多机联网协同、照片查询与导出。</li><li>技术栈：Electron 33 + Vue 3（渲染层为单文件应用），运行时零第三方依赖；打包 NSIS（Windows x64）。</li><li>仓库与发布：https://github.com/Jace-Hao/xingqiyi-laundry-photo —— 对外发布走 GitHub Releases；下载页为 docs/index.html（发布页）。</li><li>当前版本：v1.1.6（2026-09-24）。本机 dist 目录仅保留 1.1.3 ~ 1.1.6 安装包；历史版本见 GitHub Releases（v0.1.8 起）。</li><li>质量基线：npm run verify 共 9 个脚本、384 项断言全绿；界面截图流水线与行为测试见第七章。</li></ul>
+<ul class="doc"><li>定位：洗衣门店「衣物拍照存档」桌面系统 —— 扫码建档、最大分辨率拍照、拍摄时间水印烧录、多机联网协同、照片查询与导出。</li><li>技术栈：Electron 33 + Vue 3（渲染层为单文件应用），运行时零第三方依赖；打包 NSIS（Windows x64）。</li><li>仓库与发布：https://github.com/Jace-Hao/xingqiyi-laundry-photo —— 对外发布走 GitHub Releases；下载页为 docs/index.html（发布页）。</li><li>当前版本：v1.1.10（2026-09-24）。本机 dist 目录仅保留 1.1.8 ~ 1.1.10 安装包（09-24 整理后）；历史版本见 GitHub Releases（v0.1.8 起）。</li><li>质量基线：npm run verify 共 9 个脚本、384 项断言全绿；界面截图流水线与行为测试见第七章。</li></ul>
 
 </section>
 
@@ -167,6 +167,14 @@ blockquote.callout{margin:18px 0 0;padding:10px 16px;border-left:2px solid var(-
 
 <ul class="doc"><li>问题背景：安装包存放在 安装目录\软件更新\ 内，electron-builder 默认的「关闭正在运行的应用」按 $INSTDIR 路径前缀匹配进程，会把安装器自己一并匹配——温和阶段发 WM_CLOSE 直接关掉向导，强制阶段直接结束自身进程；且旧版（≤v1.1.5）卸载器同款逻辑会在升级时把新安装器一起杀掉（旧文件被卸、新文件未装）。</li><li>修复①（build/installer.nsh，electron-builder 自动拾取）：<code class="t-mono">customCheckAppRunning</code> 改为按进程名精确 tasklist/taskkill（只针对应用，不碰安装器/卸载器）；温和关闭失败再逐级 <code class="t-mono">/F /T</code> 强杀；仍失败弹重试对话框。</li><li>修复②（同文件 <code class="t-mono">customInit</code>）：从「…\软件更新」目录内启动安装器时，先复制自身到 %TEMP%（保留原文件名）再从那里重启，脱离旧卸载器的路径匹配范围。</li><li>修复③（main/main.js）：关闭事件检测到「{包名}-setup*」或「Uninstall {产品名}*」进程时真正退出（不再隐藏托盘）；「立即安装」启动安装器后轮询监视，检测到安装器进程即自动退出让位（startUpdaterCoExitWatcher）。</li><li>验证：隔离测试副本（改名构建）跑「旧版运行中 + 升级安装」与「新版运行中 + 重装」两场景，全流程到完成页、无孤儿临时目录、无自杀。</li></ul>
 
+<h3>查询页分页与当日订单表格（v1.1.7 ~ v1.1.10）</h3>
+
+<ul class="doc"><li>查询页分页器：上一页/下一页之间有页码下拉（goPage + .pager-select），选项「当前页/总页数」，越界自动收敛；仅 QueryPage，管理端日志页分页器未动。</li><li>「⬇ 下载当日订单」按钮（筛选栏「重置」旁，任何筛选状态可见——批量栏在列表为空时会隐藏）：一键导出今天录入的全部订单，<strong>只生成表格不复制照片</strong>（v1.1.9 原为完整导出，v1.1.10 按反馈改为仅表格，供洗衣管家上传助手同步照片使用）。</li><li>实现：exportPhotosByDate 带 tableOnly 参数——CSV 列 = 条码 / 已存档张数 / 照片在本系统的实际存放文件夹（服务端按 photoDir 实路径；客户端写服务端相对目录）；旧版服务端无此模式时渲染层自动回退完整导出；确认框与 toast 明确「不含照片」。</li><li>测试：exporttoday-test.js（stub 覆写 confirm 与选目录，断言按钮存在 / 确认框含今日日期 / 成功 toast / 可重复触发）；截图识图确认上屏排版。</li></ul>
+
+<h3>输入法组合态防护（v1.1.8 起）</h3>
+
+<ul class="doc"><li>所有 window 级 keydown 处理器（拍照页 onKeydown、查询页灯箱 onKeydown）开头必须放行输入法组合态：<code class="t-mono">if (e.isComposing || e.keyCode === 229) return;</code>。</li><li>否则中文输入法按回车确认候选词会被 preventDefault 强杀组合并失焦，表现为「输入内容删除后无法再次输入」。</li><li>新增任何键盘快捷键时照抄这一行；测试见 capture-input-test.js 场景 D（keyCode 229 模拟，修复前 FAIL / 修复后 PASS）。</li></ul>
+
 <h3>摄像头按需占用（v1.1.3 起）</h3>
 
 <ul class="doc"><li>拍照页空闲 3 分钟自动休眠并释放摄像头；窗口最小化/隐藏立即释放；回到前台自动恢复；</li><li>唤醒方式：扫码、按空格、点击「唤醒拍摄」按钮；另有「释放摄像头」手动按钮；</li><li>实现位于 renderer.js 的 CapturePage 组件（常量 CAM_IDLE_DEFAULT_MS 可调，测试可用 window.__xqyCamIdleMs 覆盖）。</li></ul>
@@ -179,7 +187,7 @@ blockquote.callout{margin:18px 0 0;padding:10px 16px;border-left:2px solid var(-
 
 <section id="s05"><div class="sec-head"><span class="sec-no">05</span><h2>版本历史</h2></div>
 
-<div class="table-wrap"><table><thead><tr><th>版本</th><th>日期</th><th>主题</th></tr></thead><tbody><tr><td>v1.1.6</td><td>2026-09-24</td><td>修复安装更新包「双杀 / 无法关闭」：安装器按进程名精准关闭 + 自复制 TEMP 运行 + 软件侧协同退出（新增 build/installer.nsh）</td></tr><tr><td>v1.1.5</td><td>2026-09-23</td><td>打开窗口默认最大化修复</td></tr><tr><td>v1.1.4</td><td>2026-09-22</td><td>更新下载自动加速（国内镜像多路降级 + 接口加速兜底）</td></tr><tr><td>v1.1.3</td><td>2026-09-22</td><td>拍照页摄像头按需占用（空闲释放 / 最小化释放 / 多路唤醒）</td></tr><tr><td>v1.1.2</td><td>2026-09-22</td><td>软件图标更换（衬衫+相机）＋ 更新文件夹统一到安装目录「软件更新」</td></tr><tr><td>v1.1.1</td><td>2026-09-22</td><td>界面品牌化精修（墨绿 × 黄铜 × 纸白）+ 线性图标体系</td></tr><tr><td>v1.1.0</td><td>2026-09-20 起</td><td>门店分组、四级角色、时间水印、导出汇总、唯一登录、保留期、缩略图缓存（多批）</td></tr><tr><td>v1.0.0</td><td>2026-09-13</td><td>更换激活密钥并整改授权机制泄露风险</td></tr><tr><td>v0.1.9</td><td>2026-09-12</td><td>完成所有待修复及增加功能（台账清空）</td></tr><tr><td>v0.1.7 ~ v0.1.8</td><td>2026-09-08</td><td>激活码体系、离线冗余、导出、强制推送、内置手册等</td></tr><tr><td>v0.1.0 ~ v0.1.6</td><td>2026-09-02 ~ 09-04</td><td>立项初版至早期迭代</td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>版本</th><th>日期</th><th>主题</th></tr></thead><tbody><tr><td>v1.1.10</td><td>2026-09-24</td><td>「下载当日订单」改为仅生成表格（不复制照片，供上传助手同步）</td></tr><tr><td>v1.1.9</td><td>2026-09-24</td><td>查询页新增「下载当日订单」一键导出按钮</td></tr><tr><td>v1.1.8</td><td>2026-09-24</td><td>修复输入法打字被快捷键打断（删除内容后无法再次输入）</td></tr><tr><td>v1.1.7</td><td>2026-09-24</td><td>查询页分页器新增页码下拉选择</td></tr><tr><td>v1.1.6</td><td>2026-09-24</td><td>修复安装更新包「双杀 / 无法关闭」：安装器按进程名精准关闭 + 自复制 TEMP 运行 + 软件侧协同退出（新增 build/installer.nsh）</td></tr><tr><td>v1.1.5</td><td>2026-09-23</td><td>打开窗口默认最大化修复</td></tr><tr><td>v1.1.4</td><td>2026-09-22</td><td>更新下载自动加速（国内镜像多路降级 + 接口加速兜底）</td></tr><tr><td>v1.1.3</td><td>2026-09-22</td><td>拍照页摄像头按需占用（空闲释放 / 最小化释放 / 多路唤醒）</td></tr><tr><td>v1.1.2</td><td>2026-09-22</td><td>软件图标更换（衬衫+相机）＋ 更新文件夹统一到安装目录「软件更新」</td></tr><tr><td>v1.1.1</td><td>2026-09-22</td><td>界面品牌化精修（墨绿 × 黄铜 × 纸白）+ 线性图标体系</td></tr><tr><td>v1.1.0</td><td>2026-09-20 起</td><td>门店分组、四级角色、时间水印、导出汇总、唯一登录、保留期、缩略图缓存（多批）</td></tr><tr><td>v1.0.0</td><td>2026-09-13</td><td>更换激活密钥并整改授权机制泄露风险</td></tr><tr><td>v0.1.9</td><td>2026-09-12</td><td>完成所有待修复及增加功能（台账清空）</td></tr><tr><td>v0.1.7 ~ v0.1.8</td><td>2026-09-08</td><td>激活码体系、离线冗余、导出、强制推送、内置手册等</td></tr><tr><td>v0.1.0 ~ v0.1.6</td><td>2026-09-02 ~ 09-04</td><td>立项初版至早期迭代</td></tr></tbody></table></div>
 
 <p>详细逐版本变更见 CHANGELOG.md；发布资产见 GitHub Releases。</p>
 
@@ -193,7 +201,7 @@ blockquote.callout{margin:18px 0 0;padding:10px 16px;border-left:2px solid var(-
 $env:ELECTRON_BUILDER_BINARIES_MIRROR = 'https://npmmirror.com/mirrors/electron-builder-binaries/'
 npm run build</code></pre>
 
-<ol class="doc"><li>发布页同步：以 <code class="t-mono">开发工具\发布与补丁\patch-docs-114.js</code> 为模板（从构建产物实读大小/SHA 回填，带命中数断言与残留检查）。</li><li>提交与推送：git add 指定文件 → commit → push（GitHub 直连不稳，建议脚本化重试）→ 打 tag 并推送。</li><li>发布 Release：以 <code class="t-mono">开发工具\发布与补丁\github-release-114.ps1</code> 为模板（改顶部 tag / 文件名即可）。脚本自动：组装发布说明（CHANGELOG 段 + SHA256）→ 建草稿 → 上传 blockmap + exe → 转正式 → 带凭据与匿名双路复核。</li><li>终检：匿名访问 releases/latest 应指向新版本；直链与三个加速通道抽查（HTTP 200/206）。</li></ol>
+<ol class="doc"><li>发布页同步：以 <code class="t-mono">开发工具\发布与补丁\patch-docs-*.js</code> 最新版本号为模板（现有 116~119+110，升版时滚动复制一份改参数）（从构建产物实读大小/SHA 回填，带命中数断言与残留检查）。</li><li>提交与推送：git add 指定文件 → commit → push（GitHub 直连不稳，建议脚本化重试）→ 打 tag 并推送。</li><li>发布 Release：以 <code class="t-mono">开发工具\发布与补丁\github-release-*.ps1</code> 最新版本号为模板（现有 116~119+110；改顶部 tag / 文件名即可）。脚本自动：组装发布说明（CHANGELOG 段 + SHA256）→ 建草稿 → 上传 blockmap + exe → 转正式 → 带凭据与匿名双路复核。</li><li>终检：匿名访问 releases/latest 应指向新版本；直链与三个加速通道抽查（HTTP 200/206）。</li></ol>
 
 <p>注意：不要修改已发布版本的资产；一切新内容走「版本号升级 + 新 Release」。</p>
 
@@ -207,9 +215,7 @@ npm run build</code></pre>
 
 <ul class="doc"><li>行为测试（<code class="t-mono">开发工具\测试\</code>）：</li></ul>
 
-<p>- cam-test.js：摄像头按需占用 8 项（取流 / 不休眠 / 空闲释放 / 空格唤醒 / 隐藏释放 / 前台恢复 / 手动释放 / 离开页面释放）； - dl-test.js：下载自动降级 11 项（候选生成 / 正常下载 / 拒连切换 / 卡死切换 / 龟速切换 / 500 切换 / 取消 / 全失败提示 / 进度）； - 运行同上（换文件名即可），退出码 0 = 全过；日志写同目录。</p>
-
-<ul class="doc"><li>常用场景对照：改界面 → capture + page-check 复核；改更新逻辑 → dl-test 必须全过；改拍照页 → cam-test 复跑；任何提交前 → npm run verify。</li></ul>
+<p>- cam-test.js：摄像头按需占用 8 项（取流 / 不休眠 / 空闲释放 / 空格唤醒 / 隐藏释放 / 前台恢复 / 手动释放 / 离开页面释放）； - dl-test.js：下载自动降级 11 项（候选生成 / 正常下载 / 拒连切换 / 卡死切换 / 龟速切换 / 500 切换 / 取消 / 全失败提示 / 进度）； - pager-test.js：查询页页码选择 12 项（下拉存在 / 选项数=总页数 / 选页跳转 / 网格联动 / 首末页禁用态）；注意页面有多个 .pager-info（批量栏也用），断言选择器需限定 .pager 容器； - capture-input-test.js：输入框行为 20 项（条码框输入/回车/删除/再输入、休眠浮层不遮挡、查询关键词框、输入法组合态回车防护场景 D）； - exporttoday-test.js：下载当日订单 3 项（按钮存在 / confirm 含今日日期与「不含照片」提示 / 表格生成 toast；stub 自动选目录并覆写 confirm）。 - 运行同上（换文件名即可），退出码 0 = 全过；日志写同目录。 改键盘/输入相关 → capture-input-test 复跑；改导出 → exporttoday-test 复跑；改拍照页 → cam-test 复跑；任何提交前 → npm run verify。</p>
 
 </section>
 
@@ -223,11 +229,17 @@ npm run build</code></pre>
 
 <section id="s09"><div class="sec-head"><span class="sec-no">09</span><h2>本机环境与注意事项（踩坑清单）</h2></div>
 
-<ul class="doc"><li>换行符：部分文件在历史 rebase 后为 CRLF —— 编写补丁脚本要用「行尾自适应」（按文件实际 CRLF/LF 匹配与回写），否则会命中失败或产生整文件 diff。</li><li>临时区易失：<code class="t-mono">.openclaw\tmp</code>（E:\软件开发 与 E:\autoclaw 两处）会被外部清理（2026-09-22 已发生）——重要产物及时落进项目内或提交入库，不要长期放临时区。</li><li>GitHub 网络：push、构建、发布都可能需要重试；构建用 npmmirror 镜像最稳；git 凭据经 git credential fill 读取（不落盘）。</li><li>更新文件夹：位于软件安装目录下「软件更新」，卸载软件会连同清理——需要长期留存的安装包请另存。</li><li>安装器自我追杀陷阱：安装包放在安装目录内 + electron-builder 默认关闭逻辑按路径前缀匹配 → 升级时新安装器/旧卸载器会杀掉自己或对方（v1.1.6 已修，详见 §四「安装更新自保护」）；以后若改动更新目录名或关闭逻辑，务必重跑隔离升级验证。</li><li>端口：服务端默认 17521，被占用时在设置中修改。</li><li>本机可能同时承担门店日常使用（有常驻业务软件）——涉及系统级操作（重启资源管理器、安装/覆盖软件）请避开营业时段。</li><li>文档习惯：中文、全角标点；提交信息沿用 <code class="t-mono">feat / fix / chore / release: ...</code> 前缀风格。</li></ul>
+<ul class="doc"><li>换行符：部分文件在历史 rebase 后为 CRLF —— 编写补丁脚本要用「行尾自适应」（按文件实际 CRLF/LF 匹配与回写），否则会命中失败或产生整文件 diff。</li><li>临时区易失：<code class="t-mono">.openclaw\tmp</code>（E:\软件开发 与 E:\autoclaw 两处）会被外部清理（2026-09-22 已发生）——重要产物及时落进项目内或提交入库，不要长期放临时区。</li><li>GitHub 网络：push、构建、发布都可能需要重试；构建用 npmmirror 镜像最稳；git 凭据经 git credential fill 读取（不落盘）。</li><li>更新文件夹：位于软件安装目录下「软件更新」，卸载软件会连同清理——需要长期留存的安装包请另存。</li><li>安装器自我追杀陷阱：安装包放在安装目录内 + electron-builder 默认关闭逻辑按路径前缀匹配 → 升级时新安装器/旧卸载器会杀掉自己或对方（v1.1.6 已修，详见 §四「安装更新自保护」）；以后若改动更新目录名或关闭逻辑，务必重跑隔离升级验证。</li><li>端口：服务端默认 17521，被占用时在设置中修改。</li><li>本机可能同时承担门店日常使用（有常驻业务软件）——涉及系统级操作（重启资源管理器、安装/覆盖软件）请避开营业时段。</li><li>输入法组合态：所有 keydown 快捷键必须带 <code class="t-mono">isComposing || keyCode===229</code> 防护（v1.1.8 教训：中文输入法回车确认候选被拦截 → 删除内容后无法再次输入）；合成事件测试全过 ≠ 真实键盘没问题，输入类报障优先查 IME 路径。</li><li>测试窗口弹在门店机上会被人顺手点击（2026-09-24 实际发生，导致向导被人为推进）：自动化向导测试要把按钮点击做全（「安装(&amp;I)」这类文本会误中单选按钮文案），测试尽量短、即测即清。</li><li>文档习惯：中文、全角标点；提交信息沿用 <code class="t-mono">feat / fix / chore / release: ...</code> 前缀风格。</li></ul>
 
 </section>
 
-<section id="s10"><div class="sec-head"><span class="sec-no">10</span><h2>本次整理记录（2026-09-22）</h2></div>
+<section id="s10"><div class="sec-head"><span class="sec-no">10</span><h2>整理记录</h2></div>
+
+<h3>2026-09-24（v1.1.6 ~ v1.1.10 五连发后）</h3>
+
+<ul class="doc"><li>dist 旧安装包入回收站：1.1.3 ~ 1.1.7 共 5 个版本（exe+blockmap 10 个文件，约 385 MB）——保留 1.1.8 / 1.1.9 / 1.1.10；更早版本均已在 GitHub Releases（v1.1.0 起曾发布）。</li><li>当日发布五个版本：v1.1.6 安装更新自保护（双杀/无法关闭）/ v1.1.7 查询页页码选择 / v1.1.8 输入法组合态防护 / v1.1.9 当日订单按钮 / v1.1.10 仅表格化；发布脚本逐版本滚动：github-release-116~119+110.ps1、patch-bump/docs-116~119+110.js（开发工具\发布与补丁\，不入库）。</li><li>新增测试归档：pager-test / capture-input-test / exporttoday-test（开发工具\测试\）。</li><li>本交接文档全面更新至 v1.1.10 并重生成 HTML（副本同步 E:\autoclaw\deliverables\）。</li></ul>
+
+<h3>2026-09-22</h3>
 
 <p>已移入回收站（可恢复）：</p>
 
@@ -243,7 +255,7 @@ npm run build</code></pre>
 
 <section id="s11"><div class="sec-head"><span class="sec-no">11</span><h2>交接清单（接手必读）</h2></div>
 
-<ol class="doc"><li>读完 README.md 与本交接文档，浏览 CHANGELOG.md 与「待修复及增加功能.md」（需求台账）。</li><li><code class="t-mono">npm install &amp;&amp; npm start</code> 把应用跑起来，管理端与客户端各过一遍主流程。</li><li>跑 <code class="t-mono">npm run verify</code> 确认基线全绿；再各跑一次 cam-test / dl-test 熟悉工具。</li><li>出下一版：按第六章流程走（脚本模板都在 开发工具\发布与补丁\）。</li><li>改动私密文件（激活相关）前先读第八章；任何提交前 <code class="t-mono">git status</code> + verify 双检查。</li><li>现场配置以客户现场实际为准（开发机与门店机可能分开部署）。</li></ol>
+<ol class="doc"><li>读完 README.md 与本交接文档，浏览 CHANGELOG.md 与「待修复及增加功能.md」（需求台账）。</li><li><code class="t-mono">npm install &amp;&amp; npm start</code> 把应用跑起来，管理端与客户端各过一遍主流程。</li><li>跑 <code class="t-mono">npm run verify</code> 确认基线全绿；再各跑一次 cam-test / dl-test 熟悉工具。</li><li>出下一版：按第六章流程走（脚本模板都在 开发工具\发布与补丁\）。</li><li>改动私密文件（激活相关）前先读第八章；任何提交前 <code class="t-mono">git status</code> + verify 双检查。</li><li>现场配置以客户现场实际为准（开发机与门店机可能分开部署）。</li><li>v1.1.10 的当日订单表格（仅表格不复制照片）为 09-24 新特性：留意门店实际使用反馈（表格列是否够用、与洗衣管家上传助手的衔接是否顺畅）。</li></ol>
 
 </section>
 
