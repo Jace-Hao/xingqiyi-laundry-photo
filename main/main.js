@@ -667,6 +667,8 @@ async function clientExportPhotosByDate(p, sessionToken) {
   }
   if (!all.length) return { ok: false, message: '该日期范围内没有存档记录，无法导出' };
 
+  // tableOnly：只生成「条码+照片位置」表格，不下载照片文件（供洗衣管家上传助手同步使用）
+  const tableOnly = !!(p && p.tableOnly);
   const cfg = store.loadConfig();
   const photoUrl = (file) =>
     cfg.serverUrl + '/photo?f=' + encodeURIComponent(file) + '&token=' + encodeURIComponent(cfg.serverToken);
@@ -688,6 +690,12 @@ async function clientExportPhotosByDate(p, sessionToken) {
   let skipped = 0;
   let failed = 0;
   for (const [code, list] of groups) {
+    if (tableOnly) {
+      // 仅表格：不下载照片，「文件位置」为服务端照片目录下该条码的相对文件夹
+      list.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+      rows.push([code, list.length, path.dirname(String(list[0].photoFile || ''))]);
+      continue;
+    }
     const safeCode = code.replace(/[\\/:*?"<>|]/g, '_').slice(0, 64) || '未命名';
     const dir = path.join(targetDir, safeCode);
     fs.mkdirSync(dir, { recursive: true });
@@ -716,7 +724,20 @@ async function clientExportPhotosByDate(p, sessionToken) {
   const csvPath = path.join(targetDir, `导出清单_${dateFrom}_${dateTo}.csv`);
   fs.writeFileSync(csvPath, '\ufeff' + csv, 'utf8');
 
-  return { ok: true, data: { exported, skipped, failed, folders: groups.size, targetDir, csvPath } };
+  return {
+    ok: true,
+    data: {
+      exported: tableOnly ? 0 : exported,
+      skipped,
+      failed: tableOnly ? 0 : failed,
+      folders: tableOnly ? 0 : groups.size,
+      barcodes: groups.size,
+      photos: all.length,
+      tableOnly,
+      targetDir,
+      csvPath
+    }
+  };
 }
 
 handle('records:exportPhotosByDate', async (p, token) => {

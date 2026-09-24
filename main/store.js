@@ -1917,6 +1917,8 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     records = records.filter((r) => r.createdAt >= fromIso && r.createdAt <= toIso);
     if (!records.length) throw new Error('该日期范围内没有存档记录，无法导出');
 
+    // tableOnly：只生成「条码+照片位置」表格，不复制照片文件（供洗衣管家上传助手同步使用）
+    const tableOnly = !!(p && p.tableOnly);
     const photoDir = getPhotoDir();
     // 表格按订单（条码）汇总：每个条码一条记录，记录其归档文件夹位置，
     // 不逐张照片罗列（照片仍全部复制到该文件夹内）
@@ -1935,6 +1937,13 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     const sortedCodes = [...byBarcode.keys()].sort((a, b) => a.localeCompare(b, 'zh-CN'));
     for (const code of sortedCodes) {
       const group = byBarcode.get(code);
+      if (tableOnly) {
+        // 仅表格：不复制照片，「文件位置」指向本系统内该条码的照片文件夹
+        group.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+        const firstSrc = path.join(photoDir, group[0].photoFile || '');
+        rows.push([code, group.length, path.dirname(firstSrc)]);
+        continue;
+      }
       const safeCode = code.replace(/[\\/:*?"<>|]/g, '_').slice(0, 64) || '未命名';
       const dir = path.join(targetDir, safeCode);
       fs.mkdirSync(dir, { recursive: true });
@@ -1966,14 +1975,26 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     appendLog({
       ...logBase(me),
       module: isSysAdmin(me) ? '数据管理' : '记录查询',
-      action: '按日期导出照片',
+      action: tableOnly ? '导出当日订单表格' : '按日期导出照片',
       detail:
-        `按日期范围导出衣物照片：${dateFrom} 至 ${dateTo}，` +
-        `${folderCount} 个条码文件夹、${exported} 张` +
-        `${skipped ? `，照片缺失跳过 ${skipped} 张` : ''}${failed ? `，导出失败 ${failed} 张` : ''} → ${targetDir}`,
+        tableOnly
+          ? `生成订单表格（仅表格）：${dateFrom} 至 ${dateTo}，${sortedCodes.length} 个条码、${records.length} 张记录 → ${csvPath}`
+          : `按日期范围导出衣物照片：${dateFrom} 至 ${dateTo}，` +
+            `${folderCount} 个条码文件夹、${exported} 张` +
+            `${skipped ? `，照片缺失跳过 ${skipped} 张` : ''}${failed ? `，导出失败 ${failed} 张` : ''} → ${targetDir}`,
       result: '成功'
     });
-    return { exported, skipped, failed, folders: folderCount, targetDir, csvPath };
+    return {
+      exported: tableOnly ? 0 : exported,
+      skipped,
+      failed: tableOnly ? 0 : failed,
+      folders: tableOnly ? 0 : folderCount,
+      barcodes: sortedCodes.length,
+      photos: records.length,
+      tableOnly,
+      targetDir,
+      csvPath
+    };
   }
 
   return {

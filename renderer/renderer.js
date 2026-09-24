@@ -1951,29 +1951,34 @@ const QueryPage = {
       }
     }
 
-    // 一键导出当日订单：今天录入的全部订单照片（复用按日期导出：按条码归档 + 生成表格）
+    // 一键导出当日订单表格：今天录入的全部订单（不复制照片，供洗衣管家上传助手同步使用）
     async function exportToday() {
       if (exporting.value) return;
       const now = new Date();
       const p2 = (n) => String(n).padStart(2, '0');
       const day = now.getFullYear() + '-' + p2(now.getMonth() + 1) + '-' + p2(now.getDate());
-      if (!window.confirm('将导出今天（' + day + '）录入的全部订单照片，按条码分文件夹归档并生成表格。\n下一步请选择保存目录。')) return;
+      if (!window.confirm('将生成今天（' + day + '）全部订单的「条码 + 照片位置」表格（不包含照片文件），供洗衣管家上传助手同步照片使用。\n下一步请选择保存目录。')) return;
       const d = await window.api.chooseExportDir();
       if (!d.ok) {
         if (d.message && d.message !== '已取消') toast(d.message, 'error');
         return;
       }
       exporting.value = true;
-      toast('正在导出今日订单照片，请稍候…', 'success');
+      toast('正在生成当日订单表格，请稍候…', 'success');
       try {
-        const res = await window.api.exportPhotosByDate(props.token, { targetDir: d.data, dateFrom: day, dateTo: day });
+        const res = await window.api.exportPhotosByDate(props.token, { targetDir: d.data, dateFrom: day, dateTo: day, tableOnly: true });
         if (res.ok) {
-          toast(
-            '导出完成：' + res.data.folders + ' 个条码文件夹、' + res.data.exported + ' 张照片，表格已生成' +
-            (res.data.skipped ? '，缺失跳过 ' + res.data.skipped + ' 张' : '') +
-            (res.data.failed ? '，失败 ' + res.data.failed + ' 张' : ''),
-            'success'
-          );
+          if (res.data.tableOnly) {
+            toast('当日订单表格已生成：' + res.data.barcodes + ' 个条码、' + res.data.photos + ' 张照片记录，已保存到所选目录', 'success');
+          } else {
+            // 旧版服务端不支持仅表格模式：回退为完整导出
+            toast(
+              '导出完成：' + res.data.folders + ' 个条码文件夹、' + res.data.exported + ' 张照片，表格已生成' +
+              (res.data.skipped ? '，缺失跳过 ' + res.data.skipped + ' 张' : '') +
+              (res.data.failed ? '，失败 ' + res.data.failed + ' 张' : ''),
+              'success'
+            );
+          }
         } else {
           toast(res.message || '导出失败', 'error');
         }
@@ -2251,7 +2256,7 @@ const QueryPage = {
           </div>
           <button class="btn btn-primary" @click="search(true)">查询</button>
           <button class="btn btn-ghost" @click="reset">重置</button>
-          <button class="btn btn-ghost" :disabled="exporting" @click="exportToday" title="一键导出今天录入的全部订单照片（按条码归档并生成表格）">
+          <button class="btn btn-ghost" :disabled="exporting" @click="exportToday" title="生成今天全部订单的「条码+照片位置」表格（不含照片），供洗衣管家上传助手同步使用">
             {{ exporting ? '导出中…' : '⬇ 下载当日订单' }}
           </button>
         </div>
@@ -3783,7 +3788,7 @@ const AdminSystemPage = {
         </div>
 
         <p class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#f0f7ff;border:1px solid #cfe2f7;border-radius:8px">
-          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.9.exe）放入软件安装目录下的「软件更新」文件夹 →
+          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.10.exe）放入软件安装目录下的「软件更新」文件夹 →
           在上方列表选中它 → 点「开启强制推送」。客户端下次登录时会自动从服务器下载该安装包，
           下载完成后弹窗提示店员双击安装；版本号不高于客户端当前版本的不会触发。
         </p>
