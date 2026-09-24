@@ -106,7 +106,7 @@ blockquote.callout{margin:18px 0 0;padding:10px 16px;border-left:2px solid var(-
     <a href="#s10"><span class="no">10</span>本次整理记录</a>
     <a href="#s11"><span class="no">11</span>交接清单</a>
   </nav>
-  <div class="side-foot">GENERATED 2026-09-22 · md2doc</div>
+  <div class="side-foot">GENERATED 2026-09-24 · md2doc</div>
 </aside>
 
 <main class="main">
@@ -115,7 +115,7 @@ blockquote.callout{margin:18px 0 0;padding:10px 16px;border-left:2px solid var(-
   <header class="masthead">
     <div class="kicker">Developer Handover · 开发交接文档</div>
     <h1>星期衣精致洗衣衣物照片系统 · 开发交接文档</h1>
-    <p class="lede">适用版本 v1.1.4 · 文档日期 2026-09-22 · 项目路径 E:\软件开发\星期衣精致洗衣衣物照片系统</p>
+    <p class="lede">适用版本 v1.1.6 · 文档日期 2026-09-24 · 项目路径 E:\软件开发\星期衣精致洗衣衣物照片系统</p>
     <div class="meta-strip">
       <div class="barcode-block">
         <svg class="barcode" width="131" height="20" viewBox="0 0 131 20" aria-hidden="true">
@@ -133,7 +133,7 @@ blockquote.callout{margin:18px 0 0;padding:10px 16px;border-left:2px solid var(-
 
 <section id="s01"><div class="sec-head"><span class="sec-no">01</span><h2>项目速览</h2></div>
 
-<ul class="doc"><li>定位：洗衣门店「衣物拍照存档」桌面系统 —— 扫码建档、最大分辨率拍照、拍摄时间水印烧录、多机联网协同、照片查询与导出。</li><li>技术栈：Electron 33 + Vue 3（渲染层为单文件应用），运行时零第三方依赖；打包 NSIS（Windows x64）。</li><li>仓库与发布：https://github.com/Jace-Hao/xingqiyi-laundry-photo —— 对外发布走 GitHub Releases；下载页为 docs/index.html（发布页）。</li><li>当前版本：v1.1.4（2026-09-22）。本机 dist 目录仅保留 1.1.3 / 1.1.4 安装包；历史版本见 GitHub Releases（v0.1.8 起）。</li><li>质量基线：npm run verify 共 9 个脚本、384 项断言全绿；界面截图流水线与行为测试见第七章。</li></ul>
+<ul class="doc"><li>定位：洗衣门店「衣物拍照存档」桌面系统 —— 扫码建档、最大分辨率拍照、拍摄时间水印烧录、多机联网协同、照片查询与导出。</li><li>技术栈：Electron 33 + Vue 3（渲染层为单文件应用），运行时零第三方依赖；打包 NSIS（Windows x64）。</li><li>仓库与发布：https://github.com/Jace-Hao/xingqiyi-laundry-photo —— 对外发布走 GitHub Releases；下载页为 docs/index.html（发布页）。</li><li>当前版本：v1.1.6（2026-09-24）。本机 dist 目录仅保留 1.1.3 ~ 1.1.6 安装包；历史版本见 GitHub Releases（v0.1.8 起）。</li><li>质量基线：npm run verify 共 9 个脚本、384 项断言全绿；界面截图流水线与行为测试见第七章。</li></ul>
 
 </section>
 
@@ -163,6 +163,10 @@ blockquote.callout{margin:18px 0 0;padding:10px 16px;border-left:2px solid var(-
 
 <ol class="doc"><li>检查更新：api.github.com 直连失败/超时后，自动经 <code class="t-mono">gh-proxy.com</code> 镜像重试（整体 24 秒超时兜底）。</li><li>下载安装包（main/update-download.js）：候选链为「直连 → 三个国内加速通道（gh-proxy.com / ghproxy.net / gh.ddlc.top）」。连接失败、15 秒断流、首段速度过慢均自动切换下一通道；下载进度会标注当前通道（直连 / 国内加速），完成提示注明是否走了加速；取消立即生效且不会继续切换通道。</li><li>备用与内网分发：统一使用软件安装目录下的「软件更新」文件夹（历史位置：系统下载目录、%APPDATA%\updates，应用启动时会自动搬迁）；启动与「检查更新」会扫描该文件夹并提示。</li><li>强制推送：服务端管理员选包开启后，客户端下次登录静默下载（内网地址直连下载，不走加速）。</li><li>维护：加速镜像失效时改 main/main.js 顶部的 <code class="t-mono">GH_ACCEL</code> 列表即可；接口加速前缀为 <code class="t-mono">GH_ACCEL_API</code>（当前仅 gh-proxy.com 支持代理 api.github.com）。</li></ol>
 
+<h3>安装更新自保护（v1.1.6 起）</h3>
+
+<ul class="doc"><li>问题背景：安装包存放在 安装目录\软件更新\ 内，electron-builder 默认的「关闭正在运行的应用」按 $INSTDIR 路径前缀匹配进程，会把安装器自己一并匹配——温和阶段发 WM_CLOSE 直接关掉向导，强制阶段直接结束自身进程；且旧版（≤v1.1.5）卸载器同款逻辑会在升级时把新安装器一起杀掉（旧文件被卸、新文件未装）。</li><li>修复①（build/installer.nsh，electron-builder 自动拾取）：<code class="t-mono">customCheckAppRunning</code> 改为按进程名精确 tasklist/taskkill（只针对应用，不碰安装器/卸载器）；温和关闭失败再逐级 <code class="t-mono">/F /T</code> 强杀；仍失败弹重试对话框。</li><li>修复②（同文件 <code class="t-mono">customInit</code>）：从「…\软件更新」目录内启动安装器时，先复制自身到 %TEMP%（保留原文件名）再从那里重启，脱离旧卸载器的路径匹配范围。</li><li>修复③（main/main.js）：关闭事件检测到「{包名}-setup*」或「Uninstall {产品名}*」进程时真正退出（不再隐藏托盘）；「立即安装」启动安装器后轮询监视，检测到安装器进程即自动退出让位（startUpdaterCoExitWatcher）。</li><li>验证：隔离测试副本（改名构建）跑「旧版运行中 + 升级安装」与「新版运行中 + 重装」两场景，全流程到完成页、无孤儿临时目录、无自杀。</li></ul>
+
 <h3>摄像头按需占用（v1.1.3 起）</h3>
 
 <ul class="doc"><li>拍照页空闲 3 分钟自动休眠并释放摄像头；窗口最小化/隐藏立即释放；回到前台自动恢复；</li><li>唤醒方式：扫码、按空格、点击「唤醒拍摄」按钮；另有「释放摄像头」手动按钮；</li><li>实现位于 renderer.js 的 CapturePage 组件（常量 CAM_IDLE_DEFAULT_MS 可调，测试可用 window.__xqyCamIdleMs 覆盖）。</li></ul>
@@ -175,7 +179,7 @@ blockquote.callout{margin:18px 0 0;padding:10px 16px;border-left:2px solid var(-
 
 <section id="s05"><div class="sec-head"><span class="sec-no">05</span><h2>版本历史</h2></div>
 
-<div class="table-wrap"><table><thead><tr><th>版本</th><th>日期</th><th>主题</th></tr></thead><tbody><tr><td>v1.1.4</td><td>2026-09-22</td><td>更新下载自动加速（国内镜像多路降级 + 接口加速兜底）</td></tr><tr><td>v1.1.3</td><td>2026-09-22</td><td>拍照页摄像头按需占用（空闲释放 / 最小化释放 / 多路唤醒）</td></tr><tr><td>v1.1.2</td><td>2026-09-22</td><td>软件图标更换（衬衫+相机）＋ 更新文件夹统一到安装目录「软件更新」</td></tr><tr><td>v1.1.1</td><td>2026-09-22</td><td>界面品牌化精修（墨绿 × 黄铜 × 纸白）+ 线性图标体系</td></tr><tr><td>v1.1.0</td><td>2026-09-20 起</td><td>门店分组、四级角色、时间水印、导出汇总、唯一登录、保留期、缩略图缓存（多批）</td></tr><tr><td>v1.0.0</td><td>2026-09-13</td><td>更换激活密钥并整改授权机制泄露风险</td></tr><tr><td>v0.1.9</td><td>2026-09-12</td><td>完成所有待修复及增加功能（台账清空）</td></tr><tr><td>v0.1.7 ~ v0.1.8</td><td>2026-09-08</td><td>激活码体系、离线冗余、导出、强制推送、内置手册等</td></tr><tr><td>v0.1.0 ~ v0.1.6</td><td>2026-09-02 ~ 09-04</td><td>立项初版至早期迭代</td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>版本</th><th>日期</th><th>主题</th></tr></thead><tbody><tr><td>v1.1.6</td><td>2026-09-24</td><td>修复安装更新包「双杀 / 无法关闭」：安装器按进程名精准关闭 + 自复制 TEMP 运行 + 软件侧协同退出（新增 build/installer.nsh）</td></tr><tr><td>v1.1.5</td><td>2026-09-23</td><td>打开窗口默认最大化修复</td></tr><tr><td>v1.1.4</td><td>2026-09-22</td><td>更新下载自动加速（国内镜像多路降级 + 接口加速兜底）</td></tr><tr><td>v1.1.3</td><td>2026-09-22</td><td>拍照页摄像头按需占用（空闲释放 / 最小化释放 / 多路唤醒）</td></tr><tr><td>v1.1.2</td><td>2026-09-22</td><td>软件图标更换（衬衫+相机）＋ 更新文件夹统一到安装目录「软件更新」</td></tr><tr><td>v1.1.1</td><td>2026-09-22</td><td>界面品牌化精修（墨绿 × 黄铜 × 纸白）+ 线性图标体系</td></tr><tr><td>v1.1.0</td><td>2026-09-20 起</td><td>门店分组、四级角色、时间水印、导出汇总、唯一登录、保留期、缩略图缓存（多批）</td></tr><tr><td>v1.0.0</td><td>2026-09-13</td><td>更换激活密钥并整改授权机制泄露风险</td></tr><tr><td>v0.1.9</td><td>2026-09-12</td><td>完成所有待修复及增加功能（台账清空）</td></tr><tr><td>v0.1.7 ~ v0.1.8</td><td>2026-09-08</td><td>激活码体系、离线冗余、导出、强制推送、内置手册等</td></tr><tr><td>v0.1.0 ~ v0.1.6</td><td>2026-09-02 ~ 09-04</td><td>立项初版至早期迭代</td></tr></tbody></table></div>
 
 <p>详细逐版本变更见 CHANGELOG.md；发布资产见 GitHub Releases。</p>
 
@@ -219,7 +223,7 @@ npm run build</code></pre>
 
 <section id="s09"><div class="sec-head"><span class="sec-no">09</span><h2>本机环境与注意事项（踩坑清单）</h2></div>
 
-<ul class="doc"><li>换行符：部分文件在历史 rebase 后为 CRLF —— 编写补丁脚本要用「行尾自适应」（按文件实际 CRLF/LF 匹配与回写），否则会命中失败或产生整文件 diff。</li><li>临时区易失：<code class="t-mono">.openclaw\tmp</code>（E:\软件开发 与 E:\autoclaw 两处）会被外部清理（2026-09-22 已发生）——重要产物及时落进项目内或提交入库，不要长期放临时区。</li><li>GitHub 网络：push、构建、发布都可能需要重试；构建用 npmmirror 镜像最稳；git 凭据经 git credential fill 读取（不落盘）。</li><li>更新文件夹：位于软件安装目录下「软件更新」，卸载软件会连同清理——需要长期留存的安装包请另存。</li><li>端口：服务端默认 17521，被占用时在设置中修改。</li><li>本机可能同时承担门店日常使用（有常驻业务软件）——涉及系统级操作（重启资源管理器、安装/覆盖软件）请避开营业时段。</li><li>文档习惯：中文、全角标点；提交信息沿用 <code class="t-mono">feat / fix / chore / release: ...</code> 前缀风格。</li></ul>
+<ul class="doc"><li>换行符：部分文件在历史 rebase 后为 CRLF —— 编写补丁脚本要用「行尾自适应」（按文件实际 CRLF/LF 匹配与回写），否则会命中失败或产生整文件 diff。</li><li>临时区易失：<code class="t-mono">.openclaw\tmp</code>（E:\软件开发 与 E:\autoclaw 两处）会被外部清理（2026-09-22 已发生）——重要产物及时落进项目内或提交入库，不要长期放临时区。</li><li>GitHub 网络：push、构建、发布都可能需要重试；构建用 npmmirror 镜像最稳；git 凭据经 git credential fill 读取（不落盘）。</li><li>更新文件夹：位于软件安装目录下「软件更新」，卸载软件会连同清理——需要长期留存的安装包请另存。</li><li>安装器自我追杀陷阱：安装包放在安装目录内 + electron-builder 默认关闭逻辑按路径前缀匹配 → 升级时新安装器/旧卸载器会杀掉自己或对方（v1.1.6 已修，详见 §四「安装更新自保护」）；以后若改动更新目录名或关闭逻辑，务必重跑隔离升级验证。</li><li>端口：服务端默认 17521，被占用时在设置中修改。</li><li>本机可能同时承担门店日常使用（有常驻业务软件）——涉及系统级操作（重启资源管理器、安装/覆盖软件）请避开营业时段。</li><li>文档习惯：中文、全角标点；提交信息沿用 <code class="t-mono">feat / fix / chore / release: ...</code> 前缀风格。</li></ul>
 
 </section>
 

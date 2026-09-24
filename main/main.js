@@ -28,6 +28,7 @@ const DEFAULT_PHOTO_DIR = path.join(app.getPath('userData'), 'photos');
 const RENDERER_DIR = path.join(__dirname, '..', 'renderer');
 
 const APP_VERSION = require('../package.json').version;
+const PKG_NAME = require('../package.json').name;
 // 统一的软件更新文件夹：更新下载、备用更新扫描、强制推送三处共用这一个目录。
 // 正式安装后位于软件安装目录下（…\星期衣精致洗衣衣物照片系统\软件更新）；
 // 若安装目录不可写（例如装到 Program Files 且无写权限），自动退回用户数据目录。
@@ -1456,6 +1457,7 @@ handle('system:runInstaller', (p) => {
   return shell.openPath(file).then((err) => {
     if (err) return { ok: false, message: '启动安装程序失败：' + err };
     setTimeout(() => ensureWindowFocus(), 600);
+    startUpdaterCoExitWatcher();
     return { ok: true, data: { opened: true, file } };
   });
 });
@@ -1686,6 +1688,10 @@ function createWindow() {
     }
     saveWindowState();
     if (isQuitting) return;
+    // v1.1.6 修复：检测到本应用的更新安装器/卸载器正在运行时，点关闭=真正退出，
+    // 让升级流程顺利完成（此前服务端模式会隐藏到托盘，安装器只能反复强杀；
+    // 旧版安装器还会因路径前缀误判把安装器自己一起关掉，导致安装中断）。
+    if (isUpdaterProcessRunningSync()) return;
     if (isServerRunning()) {
       e.preventDefault();
       mainWindow.hide();
@@ -1701,6 +1707,95 @@ function createWindow() {
 function isServerRunning() {
   const cfg = store.loadConfig();
   return cfg.mode === 'server' && !!httpServer;
+}
+
+// ---------- 更新安装器协同退出（v1.1.6） ----------
+// 安装包固定存放在 安装目录\软件更新\ 内。electron-builder 默认的「关闭正在运行的应用」
+// 逻辑按 $INSTDIR 路径前缀匹配进程，会把位于该目录内的安装器自己也匹配进去：
+// 温和阶段向安装器发 WM_CLOSE（安装器直接消失），强制阶段直接结束自身进程
+// （安装中断、临时目录残留）——即用户反馈的「软件关闭的同时安装程序也被关闭」。
+// 安装器侧已改为按进程名精准关闭（build/installer.nsh），这里让软件侧配合：
+// 检测到安装器/卸载器运行时真正退出，而不是隐藏到托盘。
+
+// 从 tasklist 输出解析进程名列表（中文 Windows 下 tasklist 输出为 GBK 编码）
+function parseProcessNamesFromTasklist(buf) {
+  let text = '';
+  try {
+    text = new TextDecoder('gbk').decode(buf);
+  } catch (e) {
+    text = buf.toString('utf8');
+  }
+  const names = [];
+  for (const line of text.split('\n')) {
+    const m = line.match(/^"([^"]+)"/);
+    if (m) names.push(m[1].toLowerCase());
+  }
+  return names;
+}
+
+function isUpdaterProcessName(name) {
+  // 安装包：{包名}-setup-{版本}.exe（文件名含版本号，按前缀匹配）
+  if (name.startsWith(PKG_NAME + '-setup')) return true;
+  // 卸载器：Uninstall {产品名}.exe
+  if (name.startsWith('uninstall ' + app.getName().toLowerCase())) return true;
+  return false;
+}
+
+// 同步版本：关闭事件里必须立刻决定是否 preventDefault，容许一次性几百毫秒的检测耗时
+function isUpdaterProcessRunningSync() {
+  try {
+    const { execFileSync } = require('child_process');
+    const buf = execFileSync('tasklist', ['/FO', 'CSV', '/NH'], {
+      windowsHide: true,
+      maxBuffer: 8 * 1024 * 1024,
+      timeout: 5000
+    });
+    return parseProcessNamesFromTasklist(buf).some(isUpdaterProcessName);
+  } catch (e) {
+    // 检测失败按未运行处理，回退到原有隐藏逻辑
+    return false;
+  }
+}
+
+// 异步版本：安装器启动后的轮询监视用
+function isUpdaterProcessRunning() {
+  return new Promise((resolve) => {
+    const { execFile } = require('child_process');
+    execFile('tasklist', ['/FO', 'CSV', '/NH'], {
+      windowsHide: true,
+      maxBuffer: 8 * 1024 * 1024,
+      timeout: 5000
+    }, (err, stdout) => {
+      try {
+        if (err && !stdout) return resolve(false);
+        resolve(parseProcessNamesFromTasklist(stdout).some(isUpdaterProcessName));
+      } catch (e) {
+        resolve(false);
+      }
+    });
+  });
+}
+
+// 「立即安装」启动安装器后：轮询等待安装器进程出现，出现即自动退出软件，
+// 把升级流程完整让给安装器（数据均已即时落盘，退出走正常清理）。
+let updaterCoExitTimer = null;
+function startUpdaterCoExitWatcher() {
+  if (updaterCoExitTimer) return; // 已在监视中
+  let tries = 0;
+  updaterCoExitTimer = setInterval(() => {
+    tries += 1;
+    if (tries > 240) { // 最多监视 8 分钟，超时放弃（例如安装包被取消）
+      clearInterval(updaterCoExitTimer);
+      updaterCoExitTimer = null;
+      return;
+    }
+    isUpdaterProcessRunning().then((running) => {
+      if (!running) return;
+      clearInterval(updaterCoExitTimer);
+      updaterCoExitTimer = null;
+      app.quit();
+    }).catch(() => {});
+  }, 2000);
 }
 
 // 显示并聚焦主窗口（托盘菜单 / 双击托盘图标 / 窗口已销毁时重建）
