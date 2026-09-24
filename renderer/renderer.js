@@ -1510,6 +1510,9 @@ const CapturePage = {
 
     // 快捷键：空格拍摄、回车保存；条码框内回车 = 确认条码并进入拍摄状态
     function onKeydown(e) {
+      // 输入法组合态（拼音候选确认等）一律放行：拦截 Enter 会强杀组合并失焦，
+      // 之后打字失灵，表现为「删掉内容后再也打不出字」（keyCode 229 为组合态 keydown 兼容标志）。
+      if (e.isComposing || e.keyCode === 229) return;
       const t = e.target;
       const inBarcode = t === barcodeEl.value;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) {
@@ -1831,6 +1834,7 @@ const QueryPage = {
 
     // 灯箱打开期间监听键盘：←/→ 切换，+/- 缩放，0 复位，Esc 关闭
     function onKeydown(e) {
+      if (e.isComposing || e.keyCode === 229) return; // 输入法组合态放行，避免打断候选确认
       if (!detail.value) return;
       switch (e.key) {
         case 'ArrowLeft':
@@ -3743,7 +3747,7 @@ const AdminSystemPage = {
         </div>
 
         <p class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#f0f7ff;border:1px solid #cfe2f7;border-radius:8px">
-          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.7.exe）放入软件安装目录下的「软件更新」文件夹 →
+          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.8.exe）放入软件安装目录下的「软件更新」文件夹 →
           在上方列表选中它 → 点「开启强制推送」。客户端下次登录时会自动从服务器下载该安装包，
           下载完成后弹窗提示店员双击安装；版本号不高于客户端当前版本的不会触发。
         </p>
