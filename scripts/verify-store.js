@@ -1148,6 +1148,59 @@ check('保留期设置与清理均记入操作日志', () => {
 
 fs.rmSync(purDir, { recursive: true, force: true });
 
+console.log('\n== 条码改号（录入纠错） ==');
+const renDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xqy-ren-'));
+const renStore = createStore({
+  dataDir: path.join(renDir, 'data'),
+  defaultPhotoDir: path.join(renDir, 'photos'),
+  updateDir: path.join(renDir, 'updates'),
+  appVersion: '0.1.0',
+  photoScheme: 'xqy-photo'
+});
+check('条码改号：照片随迁 + 编号重排 + 日志', () => {
+  renStore.ensureSeedData();
+  const at = renStore.login({ username: 'admin', password: 'admin123' }).sessionToken;
+  // 建 A 条码 2 张、B 条码 1 张
+  renStore.addRecord(at, { imageData: tinyJpeg, barcode: 'AAA001' });
+  renStore.addRecord(at, { imageData: tinyJpeg, barcode: 'AAA001' });
+  renStore.addRecord(at, { imageData: tinyJpeg, barcode: 'BBB001' });
+  const list = renStore.listRecords(at, { barcode: 'AAA001' });
+  if (list.total !== 2) throw new Error('前置数据异常');
+  const rec = list.items[1]; // 第 2 张
+  const photoAbsOld = path.join(renDir, 'photos', rec.photoFile);
+  if (!fs.existsSync(photoAbsOld)) throw new Error('照片文件不存在');
+  const renamed = renStore.renameRecordBarcode(at, rec.id, 'BBB001');
+  if (renamed.barcode !== 'BBB001') throw new Error('条码未更新');
+  if (!renamed.photoFile.startsWith('BBB001/')) throw new Error('照片未随迁：' + renamed.photoFile);
+  if (!fs.existsSync(path.join(renDir, 'photos', renamed.photoFile))) throw new Error('随迁后文件不存在');
+  if (fs.existsSync(photoAbsOld)) throw new Error('原位置文件应已移走');
+  const bList = renStore.listRecords(at, { barcode: 'BBB001' });
+  if (bList.total !== 2) throw new Error('B 条码应有 2 张');
+  const seqs = bList.items.map((r) => r.seq).sort((x, y) => x - y);
+  if (seqs.join(',') !== '1,2') throw new Error('编号未重排：' + seqs.join(','));
+  const aAfter = renStore.listRecords(at, { barcode: 'AAA001' });
+  if (aAfter.total !== 1 || aAfter.items[0].seq !== 1) throw new Error('A 条码剩余记录异常');
+  const logs = renStore.listLogs(at, { action: '修改条码' });
+  if (!logs.items.length || !/AAA001/.test(logs.items[0].detail) || !/BBB001/.test(logs.items[0].detail)) throw new Error('改号日志缺失');
+});
+check('条码改号：非本人记录拒绝 / 非法条码拒绝 / 相同条码拒绝', () => {
+  const at = renStore.login({ username: 'admin', password: 'admin123' }).sessionToken;
+  renStore.createUser(at, { username: 'renclerk', name: '改码店员', password: 'ren123456', permissions: { capture: true, query: true } });
+  const ct = renStore.login({ username: 'renclerk', password: 'ren123456' }).sessionToken;
+  const list = renStore.listRecords(at, {});
+  const adminRec = list.items.find((r) => r.username !== 'clerk01');
+  if (adminRec) {
+    expectThrow(() => renStore.renameRecordBarcode(ct, adminRec.id, 'ZZZ999'), '无权限');
+  }
+  renStore.addRecord(ct, { imageData: tinyJpeg, barcode: 'CCC001' });
+  const own = renStore.listRecords(ct, {});
+  const rec = own.items[0];
+  expectThrow(() => renStore.renameRecordBarcode(ct, rec.id, 'a/b'), '非法字符');
+  expectThrow(() => renStore.renameRecordBarcode(ct, rec.id, 'ab'), '至少 3 位');
+  expectThrow(() => renStore.renameRecordBarcode(ct, rec.id, rec.barcode), '相同');
+});
+fs.rmSync(renDir, { recursive: true, force: true });
+
 console.log('\n结果：' + passed + ' 通过，' + failed + ' 失败');
 fs.rmSync(tmpDir, { recursive: true, force: true });
 process.exit(failed ? 1 : 0);

@@ -630,6 +630,65 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     return true;
   }
 
+  // ---------- 条码改号（管理端纠错） ----------
+  // 错误录入后把某条记录的条码改成正确值：照片文件随迁到新条码目录，
+  // 编号按「新条码既有张数 + 1」重新排列；同条码多张改号时按原时间顺序依次接续。
+  function renameRecordBarcode(token, id, newBarcodeRaw) {
+    const me = requireSession(token);
+    const newBarcode = String(newBarcodeRaw || '').trim();
+    if (!newBarcode) throw new Error('请填写新条码');
+    if (newBarcode.length < 3) throw new Error('新条码至少 3 位');
+    if (newBarcode.length > 64) throw new Error('新条码过长（最多 64 位）');
+    if (/[\\/:*?"<>|\s]/.test(newBarcode)) throw new Error('新条码含非法字符');
+    const records = loadRecords();
+    const rec = records.find((r) => r.id === id);
+    if (!rec) throw new Error('记录不存在或已被删除');
+    // 权限：系统管理员可改任意记录；其余角色仅可改本人存档
+    if (!isSysAdmin(me) && rec.userId !== me.id) throw new Error('无权限修改他人订单的条码');
+    const oldBarcode = rec.barcode;
+    if (newBarcode === oldBarcode) throw new Error('新条码与原条码相同');
+    const photoDir = getPhotoDir();
+    // 照片文件随迁到新条码目录，文件名保持不变（含拍摄时间与原编号）
+    const safeOld = oldBarcode.replace(/[\\/:*?"<>|]/g, '_').slice(0, 64);
+    const safeNew = newBarcode.replace(/[\\/:*?"<>|]/g, '_').slice(0, 64);
+    const oldDir = path.join(photoDir, safeOld);
+    const newDir = path.join(photoDir, safeNew);
+    fs.mkdirSync(newDir, { recursive: true });
+    const fileName = path.basename(rec.photoFile || '');
+    const srcAbs = path.join(photoDir, rec.photoFile || '');
+    if (fileName && fs.existsSync(srcAbs)) {
+      let dstName = fileName;
+      let k = 2;
+      while (fs.existsSync(path.join(newDir, dstName)) && dstName !== fileName) {
+        const ext = path.extname(fileName) || '.jpg';
+        dstName = path.basename(fileName, ext) + '-' + k + ext;
+        k++;
+      }
+      fs.renameSync(srcAbs, path.join(newDir, dstName));
+      rec.photoFile = safeNew + '/' + dstName;
+    }
+    rec.barcode = newBarcode;
+    // 新条码组按拍摄时间排序后重排编号；本次改的记录排在最后
+    const group = records
+      .filter((r) => r.barcode === newBarcode)
+      .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+    group.forEach((r, i) => { r.seq = i + 1; });
+    // 原条码组剩余记录同样重排，消去改号留下的编号空洞
+    const oldGroup = records
+      .filter((r) => r.barcode === oldBarcode)
+      .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+    oldGroup.forEach((r, i) => { r.seq = i + 1; });
+    saveRecords(records);
+    appendLog({
+      ...logBase(me),
+      module: isSysAdmin(me) ? '数据管理' : '记录查询',
+      action: '修改条码',
+      detail: `条码改号：${oldBarcode} → ${newBarcode}（记录 ${id}，编至第 ${rec.seq} 张）`,
+      result: '成功'
+    });
+    return withPhotoUrls(rec);
+  }
+
   // ---------- 条码索引清单（条码纠错用） ----------
   // 返回库中全部已存档条码（去重排序），供拍照页做「相似条码」预警比对
   function listBarcodes(token) {
@@ -1111,7 +1170,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
   // 新增日志动作时，只需在此登记一次。
   const LOG_ACTIONS = [
     '登录', '登录失败', '退出登录', '修改密码', '重置密码',
-    '新增条码', '新增存档照片', '离线存档', '删除存档', '批量删除存档',
+    '新增条码', '新增存档照片', '修改条码', '离线存档', '删除存档', '批量删除存档',
     '查询记录', '查看记录', '批量导出照片', '按日期导出照片',
     '新增用户', '修改用户', '删除用户',
     '查询日志', '修改端口', '重置连接码', '修改照片路径',
@@ -2020,6 +2079,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     resolvePhotoFile,
     addRecord,
     listRecords,
+    renameRecordBarcode,
     listBarcodes,
     getRecord,
     deleteRecord,

@@ -300,6 +300,7 @@ function localCall(route, body, token) {
     'records/exportPhotos': () => store.exportPhotos(token, b),
     'records/exportPhotosByDate': () => store.exportPhotosByDate(token, b),
     'records/barcodes': () => store.listBarcodes(token),
+    'records/renameBarcode': () => store.renameRecordBarcode(token, b.id, b.barcode),
     'users/list': () => store.listUsers(token),
     'users/create': () => store.createUser(token, b),
     'users/update': () => store.updateUser(token, b),
@@ -552,6 +553,8 @@ handle('auth:changePassword', (p, token) => dispatch('auth/changePassword', p, t
 handle('records:add', (p, token) => dispatch('records/add', p, token));
 handle('records:list', (p, token) => dispatch('records/list', p, token));
 handle('records:get', (p, token) => dispatch('records/get', p, token));
+handle('records:barcodes', (p, token) => dispatch('records/barcodes', p, token));
+handle('records:renameBarcode', (p, token) => dispatch('records/renameBarcode', p, token));
 handle('records:delete', (p, token) => dispatch('records/delete', p, token));
 handle('records:deleteBatch', (p, token) => dispatch('records/deleteBatch', p, token));
 

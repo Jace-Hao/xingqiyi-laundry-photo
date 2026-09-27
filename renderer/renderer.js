@@ -61,6 +61,37 @@ function barcodeSimilarList(target, known) {
   return out.slice(0, 5);
 }
 
+// 从库中条码提取「格式画像」：出现最多的长度为主长度，字符集取并集。
+// 样本 <2 条时返回 null（无规律可参照，不做格式判定）。
+function barcodeFormatProfile(known) {
+  const list = (known || []).map((x) => String(x || '').trim()).filter((x) => x.length >= 6);
+  if (list.length < 2) return null;
+  const lenCount = new Map();
+  let chars = '';
+  for (const s of list) {
+    lenCount.set(s.length, (lenCount.get(s.length) || 0) + 1);
+  }
+  let mainLen = 0, mainCount = 0;
+  for (const [len, c] of lenCount) { if (c > mainCount || (c === mainCount && len > mainLen)) { mainLen = len; mainCount = c; } }
+  if (mainCount < Math.max(2, Math.ceil(list.length / 2))) return null;
+  for (const s of list) {
+    for (const ch of s) { if (!chars.includes(ch)) chars += ch; }
+  }
+  return { mainLen, charset: chars, sample: list.length };
+}
+
+// 当前条码对格式画像的偏差说明（无偏差返回空数组）
+function barcodeFormatIssues(target, profile) {
+  const s = String(target || '').trim();
+  const out = [];
+  if (!s || !profile) return out;
+  if (s.length !== profile.mainLen) out.push(`长度 ${s.length} 位（应为 ${profile.mainLen} 位）`);
+  for (const ch of s) {
+    if (!profile.charset.includes(ch)) { out.push(`含历史条码中未出现过的字符「${ch}」`); break; }
+  }
+  return out;
+}
+
 function fmt(iso) {
   if (!iso) return '-';
   const d = new Date(iso);
@@ -1492,6 +1523,8 @@ const CapturePage = {
     // ---------- 条码纠错（扫码枪误读防护） ----------
     // barcodeWarn：{ suspicious:[可疑字符], cleaned:清洗建议, similar:[相似已有条码] } 或 null
     const barcodeWarn = Vue.ref(null);
+    // 扫码锁定：回车确认条码后锁住输入框（防误触/误扫改码），保存全部照片后自动解锁，也可手动解锁
+    const barcodeLocked = Vue.ref(false);
     let similarTimer = null;
     async function refreshBarcodeWarn(val) {
       const v = String(val || '').trim();
@@ -1503,20 +1536,28 @@ const CapturePage = {
         if (/[0-9A-Za-z_\-]/.test(ch) || /[\u4e00-\u9fa5]/.test(ch)) cleaned += ch;
         else if (!suspicious.includes(ch)) suspicious.push(ch);
       }
-      // 相似条码：与库中已有条码比对（离线/接口失败时静默跳过）
+      // 相似条码 + 格式画像：与库中已有条码比对（离线/接口失败时静默跳过）
       let similar = [];
+      let formatIssues = [];
       try {
         if (v.length >= 6 && window.api && window.api.listBarcodes) {
           const r = await window.api.listBarcodes(props.token);
           if (r && r.ok && Array.isArray(r.data)) {
-            // 条码已精确存在于库中：不做相似预警（重复存档自有「已存档 N 张」提示，
+            // 条码已精确存在于库中：不做相似/格式预警（重复存档自有「已存档 N 张」提示，
             // 而顺序连号天然编辑距离 1，逐条预警只会制造噪声）
-            similar = r.data.includes(v) ? [] : barcodeSimilarList(cleaned.length >= 6 ? cleaned : v, r.data);
+            if (!r.data.includes(v)) {
+              similar = barcodeSimilarList(cleaned.length >= 6 ? cleaned : v, r.data);
+              // 格式画像纠错：参照库中历史条码的主长度与字符集规律，
+              // 偏差（长度不符 / 出现没见过的字符）即预警 —— 例如 11 位纯数字是常态，
+              // 扫成 11:300044740（10 位 + 冒号）立刻两条都命中
+              const profile = barcodeFormatProfile(r.data);
+              formatIssues = barcodeFormatIssues(cleaned.length >= 6 ? cleaned : v, profile);
+            }
           }
         }
       } catch (e) { /* 忽略 */ }
-      barcodeWarn.value = (suspicious.length || similar.length)
-        ? { suspicious, cleaned: suspicious.length ? cleaned : '', similar }
+      barcodeWarn.value = (suspicious.length || similar.length || formatIssues.length)
+        ? { suspicious, cleaned: suspicious.length ? cleaned : '', similar, formatIssues }
         : null;
     }
     function applyCleaned() {
@@ -1525,11 +1566,17 @@ const CapturePage = {
     function applySimilar(code) {
       if (code) barcode.value = String(code);
     }
+    function unlockBarcode() {
+      barcodeLocked.value = false;
+    }
 
     // 扫码枪扫入后会自动发送回车：核对条码并退出输入框，立即进入拍摄状态
     function onBarcodeDone() {
       checkBarcodeCount();
       ready.value = !!barcode.value.trim();
+      // 有效条码回车确认后锁定输入框，防止后续误扫/误触改码；
+      // 保存全部照片后自动解锁（见 saveAll），也可点输入框旁的解锁按钮手动解锁
+      if (ready.value) barcodeLocked.value = true;
       if (barcodeEl.value && document.activeElement === barcodeEl.value) barcodeEl.value.blur();
     }
 
@@ -1545,6 +1592,7 @@ const CapturePage = {
         const probs = [];
         if (warn.suspicious.length) probs.push('含有可疑字符 ' + warn.suspicious.join(' '));
         if (warn.similar.length) probs.push('与库中已有条码相似：' + warn.similar.join('、'));
+        if (warn.formatIssues && warn.formatIssues.length) probs.push('不符合历史条码格式：' + warn.formatIssues.join('、'));
         if (warn.cleaned) {
           const useClean = window.confirm(
             '条码纠错提醒：当前条码' + probs.join('，且') + '。' +
@@ -1586,10 +1634,11 @@ const CapturePage = {
           toast('已保存 ' + ok + ' 张：条码 ' + barcode.value.trim() + '，编至第 ' + lastSeq + ' 张', 'success');
           shots.value = [];
           note.value = '';
-          // 保存完成后清空条码、重置状态，焦点回到条码框等待扫下一件
+          // 保存完成后清空条码、解锁输入框，焦点回到条码框等待扫下一件
           barcode.value = '';
           ready.value = false;
           barcodeCount.value = null;
+          barcodeLocked.value = false;
           focusBarcode();
         } else if (ok > 0) {
           shots.value = shots.value.slice(ok);
@@ -1597,6 +1646,7 @@ const CapturePage = {
           toast('已保存 ' + ok + ' 张，剩余照片保存失败，请重试', 'error');
         } else {
           toast('保存失败，请重试', 'error');
+          barcodeLocked.value = false;
         }
       } catch (e) {
         toast('保存失败：' + (e.message || e), 'error');
@@ -1705,7 +1755,7 @@ const CapturePage = {
     return {
       stream, devices, deviceId, cameraError, resolution, shots,
       barcode, note, saving, barcodeCount, videoEl, barcodeEl, ready,
-      barcodeWarn, applyCleaned, applySimilar,
+      barcodeWarn, applyCleaned, applySimilar, barcodeLocked, unlockBarcode,
       sleeping, startCamera, wakeCamera, sleepCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone
     };
   },
@@ -1752,14 +1802,18 @@ const CapturePage = {
           <div class="card-title">🧾 存档信息</div>
 
           <label>衣物条形码 *</label>
-          <input v-model="barcode" ref="barcodeEl" placeholder="扫码枪扫入或手动输入条形码，回车确认" @keyup.enter="onBarcodeDone" @change="onBarcodeDone" />
+          <div style="display:flex;gap:8px;align-items:center">
+            <input v-model="barcode" ref="barcodeEl" :disabled="barcodeLocked" placeholder="扫码枪扫入或手动输入条形码，回车确认" @keyup.enter="onBarcodeDone" @change="onBarcodeDone" />
+            <button v-if="barcodeLocked" class="btn btn-ghost btn-sm" style="flex-shrink:0" @click="unlockBarcode">🔓 解锁修改</button>
+          </div>
           <div v-if="ready && stream" class="barcode-count ok">条码已就绪，按空格键拍摄、回车保存全部</div>
           <div v-if="barcodeCount" class="barcode-count">该条码已存档 {{ barcodeCount }} 张，本次保存将接着编号</div>
           <div v-if="barcodeWarn" class="barcode-warn">
             <div class="bw-line">
               ⚠ 条码纠错：
               <template v-if="barcodeWarn.suspicious.length">检测到可疑字符（{{ barcodeWarn.suspicious.join(' ') }}），可能为扫码枪误读</template>
-              <template v-if="barcodeWarn.suspicious.length && barcodeWarn.similar.length">；</template>
+              <template v-if="barcodeWarn.formatIssues && barcodeWarn.formatIssues.length">{{ barcodeWarn.formatIssues.join('，') }}</template>
+              <template v-if="(barcodeWarn.suspicious.length || barcodeWarn.formatIssues.length) && barcodeWarn.similar.length">；</template>
               <template v-if="barcodeWarn.similar.length">与库中已有条码相似，请核对</template>
             </div>
             <div v-if="barcodeWarn.cleaned" class="bw-actions">
@@ -2150,6 +2204,34 @@ const QueryPage = {
         batchDeleting.value = false;
       }
     }
+    // ---------- 条码改号（录入纠错） ----------
+    const rename = Vue.ref(null); // { id, barcode, newBarcode, saving }
+    function openRename(r) {
+      rename.value = { id: r.id, barcode: r.barcode, newBarcode: r.barcode, saving: false };
+    }
+    async function submitRename() {
+      const st = rename.value;
+      if (!st || st.saving) return;
+      const nb = String(st.newBarcode || '').trim();
+      if (!nb) { toast('请输入新条码', 'error'); return; }
+      if (nb === st.barcode) { toast('新条码与原条码相同', 'error'); return; }
+      if (!window.confirm('确定把条码「' + st.barcode + '」改为「' + nb + '」？\n照片将移入新条码文件夹，编号重新排列，操作会记入日志。')) return;
+      st.saving = true;
+      try {
+        const res = await window.api.renameBarcode(props.token, st.id, nb);
+        if (res.ok) {
+          toast('条码已改为 ' + nb + '，照片已随迁并重新编号', 'success');
+          rename.value = null;
+          search(false);
+        } else {
+          toast(res.message || '修改失败', 'error');
+          st.saving = false;
+        }
+      } catch (e) {
+        toast('修改失败：' + (e.message || e), 'error');
+        st.saving = false;
+      }
+    }
 
     async function loadUsers() {
       if (!props.adminMode) return;
@@ -2332,7 +2414,7 @@ const QueryPage = {
       page, pageSize, totalPages, loading, detail, detailIndex, gridEl,
       selected, batchDeleting, toggleSelect, selectAll, batchDelete,
       exporting, exportByBarcode, exportByDate, exportToday,
-      search, reset, openDetail, remove, prev, next, goPage, fmt,
+      search, reset, openDetail, remove, prev, next, goPage, fmt, rename, openRename, submitRename,
       // 灯箱预览：缩放、平移、切换
       zoomScale, panX, panY, imgLoaded, imgNatural,
       closeDetail, prevPhoto, nextPhoto, zoomIn, zoomOut, zoomReset,
@@ -2407,7 +2489,7 @@ const QueryPage = {
             <div v-for="r in items" :key="r.id" class="record-card" @click="openDetail(r)">
               <div class="record-photo"><img :src="r.thumbUrl || r.photoUrl" loading="lazy" decoding="async" /></div>
               <div class="record-meta">
-                <div class="record-customer">{{ r.barcode }}</div>
+                <div class="record-customer">{{ r.barcode }}<button v-if="adminMode || isMine(r)" class="btn-rename" title="修改此记录的条码" @click.stop="openRename(r)">改码</button></div>
                 <div class="record-tags">
                   <span class="tag tag-orange">第 {{ r.seq }} 张</span>
                   <span
@@ -2435,6 +2517,27 @@ const QueryPage = {
             </select>
           </span>
           <button class="btn btn-ghost btn-sm" :disabled="page >= totalPages" @click="next">下一页</button>
+        </div>
+      </div>
+
+      <div v-if="rename" class="modal-mask" @click.self="rename = null">
+        <div class="modal" style="max-width:420px">
+          <div class="modal-title">修改条码</div>
+          <div class="modal-body">
+            <div class="form-row">
+              <label>原条码</label>
+              <input :value="rename.barcode" disabled />
+            </div>
+            <div class="form-row">
+              <label>新条码 *</label>
+              <input v-model="rename.newBarcode" placeholder="输入正确条码，扫码枪可直接扫入" @keyup.enter="submitRename" />
+              <p class="form-tip">照片将移入新条码文件夹并重新编号，操作记入日志；仅系统管理员与本人存档可改。</p>
+            </div>
+          </div>
+          <div class="modal-foot">
+            <button class="btn btn-ghost" @click="rename = null">取消</button>
+            <button class="btn btn-primary" :disabled="rename.saving" @click="submitRename">{{ rename.saving ? '保存中…' : '确认修改' }}</button>
+          </div>
         </div>
       </div>
 
@@ -3913,7 +4016,7 @@ const AdminSystemPage = {
         </div>
 
         <p class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#f0f7ff;border:1px solid #cfe2f7;border-radius:8px">
-          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.11.exe）放入软件安装目录下的「软件更新」文件夹 →
+          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.12.exe）放入软件安装目录下的「软件更新」文件夹 →
           在上方列表选中它 → 点「开启强制推送」。客户端下次登录时会自动从服务器下载该安装包，
           下载完成后弹窗提示店员双击安装；版本号不高于客户端当前版本的不会触发。
         </p>

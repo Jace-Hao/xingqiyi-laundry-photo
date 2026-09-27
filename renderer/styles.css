@@ -2095,3 +2095,28 @@ tr:hover td {
 .bw-similar > span {
   color: #7a5310;
 }
+
+/* ---------- 记录卡改码按钮 / 改码弹窗 ---------- */
+.btn-rename {
+  margin-left: 6px;
+  padding: 1px 8px;
+  font-size: 11px;
+  border: 1px solid var(--line-strong, #c9bfa8);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-sub, #6b6b5f);
+  cursor: pointer;
+  line-height: 1.5;
+}
+
+.btn-rename:hover {
+  background: var(--primary-weak, #f0ead9);
+  color: var(--primary, #1e4d33);
+}
+
+.form-tip {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-sub, #6b6b5f);
+  line-height: 1.6;
+}
