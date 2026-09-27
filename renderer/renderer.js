@@ -47,6 +47,15 @@ function barcodeEditDistance(a, b, cap) {
 
 // 求与当前条码相似的已有条码：前缀包含（截断/多读）或编辑距离 ≤2（漏读/误读字符），
 // 双方长度 ≥6 才参与比对，避免短码误报；最多返回 5 条
+// 判断条码是否含「可疑字符」（合法集：字母/数字/下划线/连字符/中文之外的都算）
+function hasBarcodeSuspicious(s) {
+  for (const ch of String(s || '')) {
+    if (/[0-9A-Za-z_\-]/.test(ch) || /[\u4e00-\u9fa5]/.test(ch)) continue;
+    return true;
+  }
+  return false;
+}
+
 function barcodeSimilarList(target, known) {
   const s = String(target || '').trim();
   const out = [];
@@ -1543,15 +1552,19 @@ const CapturePage = {
         if (v.length >= 6 && window.api && window.api.listBarcodes) {
           const r = await window.api.listBarcodes(props.token);
           if (r && r.ok && Array.isArray(r.data)) {
-            // 条码已精确存在于库中：不做相似/格式预警（重复存档自有「已存档 N 张」提示，
-            // 而顺序连号天然编辑距离 1，逐条预警只会制造噪声）
-            if (!r.data.includes(v)) {
-              similar = barcodeSimilarList(cleaned.length >= 6 ? cleaned : v, r.data);
-              // 格式画像纠错：参照库中历史条码的主长度与字符集规律，
-              // 偏差（长度不符 / 出现没见过的字符）即预警 —— 例如 11 位纯数字是常态，
-              // 扫成 11:300044740（10 位 + 冒号）立刻两条都命中
-              const profile = barcodeFormatProfile(r.data);
-              formatIssues = barcodeFormatIssues(cleaned.length >= 6 ? cleaned : v, profile);
+            // 参照集只用「干净」条码：含可疑字符的历史条码本身大概率是误存错码，
+            // 不配当格式/相似的参照（否则错码存过一次就把自己洗白）
+            const cleanKnown = r.data.filter((k) => !hasBarcodeSuspicious(k));
+            const vClean = hasBarcodeSuspicious(v) ? cleaned : v;
+            // 条码（清洗后）已精确存在于库中且本身无可疑字符：不做相似/格式预警
+            // （重复存档自有「已存档 N 张」提示；顺序连号天然编辑距离 1，逐条预警只是噪声）。
+            // 带可疑字符的条码不受此豁免——永远预警。
+            if (!cleanKnown.includes(vClean)) {
+              similar = barcodeSimilarList(vClean, cleanKnown);
+              // 格式画像纠错：参照干净历史条码的主长度与字符集规律，
+              // 偏差（长度不符 / 出现没见过的字符）即预警
+              const profile = barcodeFormatProfile(cleanKnown);
+              formatIssues = barcodeFormatIssues(vClean, profile);
             }
           }
         }
@@ -4016,7 +4029,7 @@ const AdminSystemPage = {
         </div>
 
         <p class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#f0f7ff;border:1px solid #cfe2f7;border-radius:8px">
-          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.12.exe）放入软件安装目录下的「软件更新」文件夹 →
+          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.13.exe）放入软件安装目录下的「软件更新」文件夹 →
           在上方列表选中它 → 点「开启强制推送」。客户端下次登录时会自动从服务器下载该安装包，
           下载完成后弹窗提示店员双击安装；版本号不高于客户端当前版本的不会触发。
         </p>
