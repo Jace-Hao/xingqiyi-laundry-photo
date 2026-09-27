@@ -2067,3 +2067,31 @@ tr:hover td {
   border-radius: 3px;
   transition: width 0.2s var(--ease);
 }
+
+/* ---------- 条码纠错提示条 ---------- */
+.barcode-warn {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid #e8b04a;
+  border-radius: 10px;
+  background: #fdf6e8;
+  color: #7a5310;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.bw-line {
+  font-weight: 600;
+}
+
+.bw-actions {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.bw-similar > span {
+  color: #7a5310;
+}
