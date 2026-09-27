@@ -630,6 +630,19 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     return true;
   }
 
+  // ---------- 条码索引清单（条码纠错用） ----------
+  // 返回库中全部已存档条码（去重排序），供拍照页做「相似条码」预警比对
+  function listBarcodes(token) {
+    requireSessionPermission(token, 'query');
+    const records = loadRecords();
+    const set = new Set();
+    for (const r of records) {
+      const c = String(r.barcode || '').trim();
+      if (c) set.add(c);
+    }
+    return [...set].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+  }
+
   // ---------- 衣物照片存档（条形码索引） ----------
   function addRecord(token, p = {}) {
     const me = requireSessionPermission(token, 'capture');
@@ -2007,6 +2020,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     resolvePhotoFile,
     addRecord,
     listRecords,
+    listBarcodes,
     getRecord,
     deleteRecord,
     deleteRecords,

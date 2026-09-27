@@ -299,6 +299,7 @@ function localCall(route, body, token) {
     'records/deleteBatch': () => store.deleteRecords(token, b.ids),
     'records/exportPhotos': () => store.exportPhotos(token, b),
     'records/exportPhotosByDate': () => store.exportPhotosByDate(token, b),
+    'records/barcodes': () => store.listBarcodes(token),
     'users/list': () => store.listUsers(token),
     'users/create': () => store.createUser(token, b),
     'users/update': () => store.updateUser(token, b),

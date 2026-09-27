@@ -23,6 +23,44 @@ function toast(msg, type) {
   }, 2600);
 }
 
+/* ---------- 条码纠错工具 ---------- */
+// 限定深度的编辑距离（> cap 提前退出，返回 cap+1），用于扫码误读比对
+function barcodeEditDistance(a, b, cap) {
+  const m = a.length;
+  const n = b.length;
+  if (Math.abs(m - n) > cap) return cap + 1;
+  let prev = new Array(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    let best = i;
+    for (let j = 1; j <= n; j++) {
+      const c = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      cur[j] = c;
+      if (c < best) best = c;
+    }
+    if (best > cap) return cap + 1;
+    prev = cur;
+  }
+  return prev[n];
+}
+
+// 求与当前条码相似的已有条码：前缀包含（截断/多读）或编辑距离 ≤2（漏读/误读字符），
+// 双方长度 ≥6 才参与比对，避免短码误报；最多返回 5 条
+function barcodeSimilarList(target, known) {
+  const s = String(target || '').trim();
+  const out = [];
+  if (s.length < 6) return out;
+  for (const raw of known || []) {
+    const k = String(raw || '').trim();
+    if (!k || k === s || k.length < 6) continue;
+    if (s.startsWith(k) || k.startsWith(s)) { out.push(k); continue; }
+    const d = barcodeEditDistance(s, k, 2);
+    if (d <= 2 && Math.abs(s.length - k.length) <= 2) out.push(k);
+  }
+  return out.slice(0, 5);
+}
+
 function fmt(iso) {
   if (!iso) return '-';
   const d = new Date(iso);
@@ -1451,6 +1489,43 @@ const CapturePage = {
       if (r.ok) barcodeCount.value = r.data.total;
     }
 
+    // ---------- 条码纠错（扫码枪误读防护） ----------
+    // barcodeWarn：{ suspicious:[可疑字符], cleaned:清洗建议, similar:[相似已有条码] } 或 null
+    const barcodeWarn = Vue.ref(null);
+    let similarTimer = null;
+    async function refreshBarcodeWarn(val) {
+      const v = String(val || '').trim();
+      if (!v) { barcodeWarn.value = null; return; }
+      // 可疑字符：条码合法集（字母/数字/下划线/连字符/中文）之外的都算，例如误读插入的「:」
+      const suspicious = [];
+      let cleaned = '';
+      for (const ch of v) {
+        if (/[0-9A-Za-z_\-]/.test(ch) || /[\u4e00-\u9fa5]/.test(ch)) cleaned += ch;
+        else if (!suspicious.includes(ch)) suspicious.push(ch);
+      }
+      // 相似条码：与库中已有条码比对（离线/接口失败时静默跳过）
+      let similar = [];
+      try {
+        if (v.length >= 6 && window.api && window.api.listBarcodes) {
+          const r = await window.api.listBarcodes(props.token);
+          if (r && r.ok && Array.isArray(r.data)) {
+            // 条码已精确存在于库中：不做相似预警（重复存档自有「已存档 N 张」提示，
+            // 而顺序连号天然编辑距离 1，逐条预警只会制造噪声）
+            similar = r.data.includes(v) ? [] : barcodeSimilarList(cleaned.length >= 6 ? cleaned : v, r.data);
+          }
+        }
+      } catch (e) { /* 忽略 */ }
+      barcodeWarn.value = (suspicious.length || similar.length)
+        ? { suspicious, cleaned: suspicious.length ? cleaned : '', similar }
+        : null;
+    }
+    function applyCleaned() {
+      if (barcodeWarn.value && barcodeWarn.value.cleaned) barcode.value = barcodeWarn.value.cleaned;
+    }
+    function applySimilar(code) {
+      if (code) barcode.value = String(code);
+    }
+
     // 扫码枪扫入后会自动发送回车：核对条码并退出输入框，立即进入拍摄状态
     function onBarcodeDone() {
       checkBarcodeCount();
@@ -1463,6 +1538,28 @@ const CapturePage = {
       if (!barcode.value.trim()) {
         toast('请填写衣物条形码', 'error');
         return;
+      }
+      // 保存前条码纠错确认：有可疑字符或相似条码时必须过一道人工确认，防止误读条码入库
+      const warn = barcodeWarn.value;
+      if (warn) {
+        const probs = [];
+        if (warn.suspicious.length) probs.push('含有可疑字符 ' + warn.suspicious.join(' '));
+        if (warn.similar.length) probs.push('与库中已有条码相似：' + warn.similar.join('、'));
+        if (warn.cleaned) {
+          const useClean = window.confirm(
+            '条码纠错提醒：当前条码' + probs.join('，且') + '。' +
+            '\n\n建议使用清洗后的条码：' + warn.cleaned +
+            '\n\n【确定】使用清洗后条码保存；【取消】返回修改'
+          );
+          if (!useClean) return;
+          barcode.value = warn.cleaned;
+        } else {
+          const go = window.confirm(
+            '条码纠错提醒：当前条码' + probs.join('，且') + '。' +
+            '\n\n【确定】仍按当前条码保存；【取消】返回修改'
+          );
+          if (!go) return;
+        }
       }
       if (!shots.value.length) {
         toast('请先拍摄照片（空格键或点击「📸 拍照」）', 'error');
@@ -1554,13 +1651,24 @@ const CapturePage = {
     }
 
     Vue.watch(barcode, (v) => {
-      if (!String(v || '').trim()) {
+      const s = String(v == null ? '' : v);
+      // 自动清理：仅去除空白与控制字符（扫码枪常见尾部噪声），不改动其它字符
+      const cleanedSpace = s.replace(/[\x00-\x1f\x7f\s]+/g, '');
+      if (cleanedSpace !== s) {
+        barcode.value = cleanedSpace;
+        return;
+      }
+      if (!s.trim()) {
         ready.value = false;
         barcodeCount.value = null;
+        barcodeWarn.value = null;
       } else if (sleeping.value) {
         // 扫码/输入条码代表马上要拍：静默唤醒摄像头
         wakeCamera();
       }
+      // 条码纠错检查防抖（避免逐键触发接口比对）
+      if (similarTimer) clearTimeout(similarTimer);
+      similarTimer = setTimeout(() => refreshBarcodeWarn(barcode.value), 250);
     });
 
     function stopCamera() {
@@ -1590,12 +1698,14 @@ const CapturePage = {
       window.removeEventListener('pointerdown', bumpActivity, true);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       clearIdleTimer();
+      if (similarTimer) clearTimeout(similarTimer);
       stopCamera();
     });
 
     return {
       stream, devices, deviceId, cameraError, resolution, shots,
       barcode, note, saving, barcodeCount, videoEl, barcodeEl, ready,
+      barcodeWarn, applyCleaned, applySimilar,
       sleeping, startCamera, wakeCamera, sleepCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone
     };
   },
@@ -1645,6 +1755,21 @@ const CapturePage = {
           <input v-model="barcode" ref="barcodeEl" placeholder="扫码枪扫入或手动输入条形码，回车确认" @keyup.enter="onBarcodeDone" @change="onBarcodeDone" />
           <div v-if="ready && stream" class="barcode-count ok">条码已就绪，按空格键拍摄、回车保存全部</div>
           <div v-if="barcodeCount" class="barcode-count">该条码已存档 {{ barcodeCount }} 张，本次保存将接着编号</div>
+          <div v-if="barcodeWarn" class="barcode-warn">
+            <div class="bw-line">
+              ⚠ 条码纠错：
+              <template v-if="barcodeWarn.suspicious.length">检测到可疑字符（{{ barcodeWarn.suspicious.join(' ') }}），可能为扫码枪误读</template>
+              <template v-if="barcodeWarn.suspicious.length && barcodeWarn.similar.length">；</template>
+              <template v-if="barcodeWarn.similar.length">与库中已有条码相似，请核对</template>
+            </div>
+            <div v-if="barcodeWarn.cleaned" class="bw-actions">
+              <button class="btn btn-ghost btn-sm" @click="applyCleaned">使用清洗后条码：{{ barcodeWarn.cleaned }}</button>
+            </div>
+            <div v-if="barcodeWarn.similar.length" class="bw-actions bw-similar">
+              <span>相似条码：</span>
+              <button v-for="c in barcodeWarn.similar" :key="c" class="btn btn-ghost btn-sm" @click="applySimilar(c)">{{ c }}</button>
+            </div>
+          </div>
 
           <label>备注</label>
           <textarea v-model="note" rows="2" placeholder="已有瑕疵、特殊洗护要求等（可选）"></textarea>
@@ -3788,7 +3913,7 @@ const AdminSystemPage = {
         </div>
 
         <p class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#f0f7ff;border:1px solid #cfe2f7;border-radius:8px">
-          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.10.exe）放入软件安装目录下的「软件更新」文件夹 →
+          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.11.exe）放入软件安装目录下的「软件更新」文件夹 →
           在上方列表选中它 → 点「开启强制推送」。客户端下次登录时会自动从服务器下载该安装包，
           下载完成后弹窗提示店员双击安装；版本号不高于客户端当前版本的不会触发。
         </p>

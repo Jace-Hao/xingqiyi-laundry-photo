@@ -80,6 +80,7 @@ function startServer(store, opts = {}) {
       'records/delete': () => store.deleteRecord(sessionToken, body.id),
       'records/deleteBatch': () => store.deleteRecords(sessionToken, body.ids),
       'records/exportPhotos': () => store.exportPhotos(sessionToken, body),
+      'records/barcodes': () => store.listBarcodes(sessionToken),
       // 用户管理
       'users/list': () => store.listUsers(sessionToken),
       'users/create': () => store.createUser(sessionToken, body),

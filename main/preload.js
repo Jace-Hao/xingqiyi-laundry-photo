@@ -64,6 +64,7 @@ contextBridge.exposeInMainWorld('api', {
   // 衣物存档
   addRecord: (token, payload) => call('records:add', payload, token),
   listRecords: (token, payload) => call('records:list', payload, token),
+  listBarcodes: (token) => call('records:barcodes', undefined, token),
   getRecord: (token, id) => call('records:get', { id }, token),
   deleteRecord: (token, id) => call('records:delete', { id }, token),
   deleteRecords: (token, ids) => call('records:deleteBatch', { ids }, token),
