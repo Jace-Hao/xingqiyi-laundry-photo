@@ -66,6 +66,7 @@ contextBridge.exposeInMainWorld('api', {
   listRecords: (token, payload) => call('records:list', payload, token),
   listBarcodes: (token) => call('records:barcodes', undefined, token),
   renameBarcode: (token, id, barcode) => call('records:renameBarcode', { id, barcode }, token),
+  renameBarcodeBatch: (token, ids, barcode) => call('records:renameBarcodeBatch', { ids, barcode }, token),
   getRecord: (token, id) => call('records:get', { id }, token),
   deleteRecord: (token, id) => call('records:delete', { id }, token),
   deleteRecords: (token, ids) => call('records:deleteBatch', { ids }, token),

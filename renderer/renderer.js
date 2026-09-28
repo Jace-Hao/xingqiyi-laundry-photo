@@ -74,7 +74,9 @@ function barcodeSimilarList(target, known) {
 // 样本 <2 条时返回 null（无规律可参照，不做格式判定）。
 function barcodeFormatProfile(known) {
   const list = (known || []).map((x) => String(x || '').trim()).filter((x) => x.length >= 6);
-  if (list.length < 2) return null;
+  // 需 10 条以上干净条码才总结规律：样本太少时长度/字符集规律不可靠，
+  // 宁可只报可疑字符与相似条码，避免小样本误判（现场要求：十条以上）
+  if (list.length < 10) return null;
   const lenCount = new Map();
   let chars = '';
   for (const s of list) {
@@ -1572,6 +1574,10 @@ const CapturePage = {
       barcodeWarn.value = (suspicious.length || similar.length || formatIssues.length)
         ? { suspicious, cleaned: suspicious.length ? cleaned : '', similar, formatIssues }
         : null;
+      // 锁定状态下扫入了带可疑字符的错码：自动解锁，让用户能直接改码，无需先点解锁
+      if (barcodeWarn.value && barcodeWarn.value.suspicious.length && barcodeLocked.value) {
+        barcodeLocked.value = false;
+      }
     }
     function applyCleaned() {
       if (barcodeWarn.value && barcodeWarn.value.cleaned) barcode.value = barcodeWarn.value.cleaned;
@@ -1584,12 +1590,14 @@ const CapturePage = {
     }
 
     // 扫码枪扫入后会自动发送回车：核对条码并退出输入框，立即进入拍摄状态
-    function onBarcodeDone() {
+    function onBarcodeDone(onlyLock) {
       checkBarcodeCount();
       ready.value = !!barcode.value.trim();
-      // 有效条码回车确认后锁定输入框，防止后续误扫/误触改码；
-      // 保存全部照片后自动解锁（见 saveAll），也可点输入框旁的解锁按钮手动解锁
-      if (ready.value) barcodeLocked.value = true;
+      // 仅回车确认（扫码枪扫入或手动回车）才锁定输入框；
+      // 失焦触发的 change 不锁——否则手动输入后点别处就被锁死，无法继续修改（现场反馈）。
+      // 保存全部照片后自动解锁（见 saveAll），扫入错码时自动解锁（见 refreshBarcodeWarn），
+      // 也可点输入框旁的解锁按钮手动解锁
+      if (onlyLock === true && ready.value) barcodeLocked.value = true;
       if (barcodeEl.value && document.activeElement === barcodeEl.value) barcodeEl.value.blur();
     }
 
@@ -1816,7 +1824,7 @@ const CapturePage = {
 
           <label>衣物条形码 *</label>
           <div style="display:flex;gap:8px;align-items:center">
-            <input v-model="barcode" ref="barcodeEl" :disabled="barcodeLocked" placeholder="扫码枪扫入或手动输入条形码，回车确认" @keyup.enter="onBarcodeDone" @change="onBarcodeDone" />
+            <input v-model="barcode" ref="barcodeEl" :disabled="barcodeLocked" placeholder="扫码枪扫入或手动输入条形码，回车确认" @keyup.enter="onBarcodeDone(true)" @change="onBarcodeDone(false)" />
             <button v-if="barcodeLocked" class="btn btn-ghost btn-sm" style="flex-shrink:0" @click="unlockBarcode">🔓 解锁修改</button>
           </div>
           <div v-if="ready && stream" class="barcode-count ok">条码已就绪，按空格键拍摄、回车保存全部</div>
@@ -2245,6 +2253,36 @@ const QueryPage = {
         st.saving = false;
       }
     }
+    // ---------- 批量改码（整批误扫一次修正） ----------
+    const renameBatch = Vue.ref(null); // { newBarcode, saving }
+    function openRenameBatch() {
+      if (!selected.value.length) { toast('请先勾选要改码的记录', 'error'); return; }
+      renameBatch.value = { newBarcode: '', saving: false };
+    }
+    async function submitRenameBatch() {
+      const st = renameBatch.value;
+      if (!st || st.saving) return;
+      const nb = String(st.newBarcode || '').trim();
+      if (!nb) { toast('请输入新条码', 'error'); return; }
+      if (!window.confirm('确定把选中的 ' + selected.value.length + ' 条记录统一改为「' + nb + '」？\n照片将移入新条码文件夹并重新编号，操作记入日志。')) return;
+      st.saving = true;
+      try {
+        const res = await window.api.renameBarcodeBatch(props.token, selected.value.slice(), nb);
+        if (res.ok) {
+          const d = res.data || {};
+          toast('已改码 ' + d.renamed + ' 条' + (d.denied ? '，跳过无权限 ' + d.denied + ' 条' : ''), 'success');
+          renameBatch.value = null;
+          selected.value = [];
+          search(false);
+        } else {
+          toast(res.message || '批量改码失败', 'error');
+          st.saving = false;
+        }
+      } catch (e) {
+        toast('批量改码失败：' + (e.message || e), 'error');
+        st.saving = false;
+      }
+    }
 
     async function loadUsers() {
       if (!props.adminMode) return;
@@ -2427,7 +2465,7 @@ const QueryPage = {
       page, pageSize, totalPages, loading, detail, detailIndex, gridEl,
       selected, batchDeleting, toggleSelect, selectAll, batchDelete,
       exporting, exportByBarcode, exportByDate, exportToday,
-      search, reset, openDetail, remove, prev, next, goPage, fmt, rename, openRename, submitRename,
+      search, reset, openDetail, remove, prev, next, goPage, fmt, rename, openRename, submitRename, renameBatch, openRenameBatch, submitRenameBatch,
       // 灯箱预览：缩放、平移、切换
       zoomScale, panX, panY, imgLoaded, imgNatural,
       closeDetail, prevPhoto, nextPhoto, zoomIn, zoomOut, zoomReset,
@@ -2490,6 +2528,9 @@ const QueryPage = {
           <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="exportByDate" title="按上方日期范围导出照片，并生成条码+文件位置表格">
             ⬇ 按日期导出
           </button>
+          <button v-if="adminMode || canDelete" class="btn btn-ghost btn-sm" :disabled="!selected.length" @click="openRenameBatch" title="把选中的多条记录统一改为同一个正确条码（照片随迁并重新编号）">
+            ⇄ 批量改码
+          </button>
           <button v-if="canDelete" class="btn btn-danger btn-sm" :disabled="!selected.length || batchDeleting" @click="batchDelete">
             {{ batchDeleting ? '删除中…' : '批量删除' }}
           </button>
@@ -2550,6 +2591,23 @@ const QueryPage = {
           <div class="modal-foot">
             <button class="btn btn-ghost" @click="rename = null">取消</button>
             <button class="btn btn-primary" :disabled="rename.saving" @click="submitRename">{{ rename.saving ? '保存中…' : '确认修改' }}</button>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="renameBatch" class="modal-mask" @click.self="renameBatch = null">
+        <div class="modal" style="max-width:420px">
+          <div class="modal-title">批量改码</div>
+          <div class="modal-body">
+            <div class="form-row">
+              <label>已选 {{ selected.length }} 条记录，统一改为新条码 *</label>
+              <input v-model="renameBatch.newBarcode" placeholder="输入正确条码，扫码枪可直接扫入" @keyup.enter="submitRenameBatch" />
+              <p class="form-tip">所有选中记录的照片将移入新条码文件夹并重新编号，操作记入日志；无权限的记录自动跳过。</p>
+            </div>
+          </div>
+          <div class="modal-foot">
+            <button class="btn btn-ghost" @click="renameBatch = null">取消</button>
+            <button class="btn btn-primary" :disabled="renameBatch.saving" @click="submitRenameBatch">{{ renameBatch.saving ? '保存中…' : '确认修改' }}</button>
           </div>
         </div>
       </div>
@@ -4029,7 +4087,7 @@ const AdminSystemPage = {
         </div>
 
         <p class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#f0f7ff;border:1px solid #cfe2f7;border-radius:8px">
-          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.13.exe）放入软件安装目录下的「软件更新」文件夹 →
+          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.14.exe）放入软件安装目录下的「软件更新」文件夹 →
           在上方列表选中它 → 点「开启强制推送」。客户端下次登录时会自动从服务器下载该安装包，
           下载完成后弹窗提示店员双击安装；版本号不高于客户端当前版本的不会触发。
         </p>

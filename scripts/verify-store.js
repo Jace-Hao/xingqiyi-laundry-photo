@@ -1199,6 +1199,43 @@ check('条码改号：非本人记录拒绝 / 非法条码拒绝 / 相同条码�
   expectThrow(() => renStore.renameRecordBarcode(ct, rec.id, 'ab'), '至少 3 位');
   expectThrow(() => renStore.renameRecordBarcode(ct, rec.id, rec.barcode), '相同');
 });
+check('条码批量改号：统一改码 + 照片随迁 + 编号重排 + 无权限跳过', () => {
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'xqy-renb-'));
+  const st2 = createStore({
+    dataDir: path.join(dir2, 'data'),
+    defaultPhotoDir: path.join(dir2, 'photos'),
+    updateDir: path.join(dir2, 'updates'),
+    appVersion: '0.1.0',
+    photoScheme: 'xqy-photo'
+  });
+  st2.ensureSeedData();
+  const at2 = st2.login({ username: 'admin', password: 'admin123' }).sessionToken;
+  st2.createUser(at2, { username: 'bclerk', name: '批量店员', password: 'bat123456', permissions: { capture: true, query: true } });
+  const bt = st2.login({ username: 'bclerk', password: 'bat123456' }).sessionToken;
+  // 店员误扫：BAD001 存 2 张、BAD002 存 1 张，另有正确条码 OKC001 一张
+  st2.addRecord(bt, { imageData: tinyJpeg, barcode: 'BAD001' });
+  st2.addRecord(bt, { imageData: tinyJpeg, barcode: 'BAD001' });
+  st2.addRecord(bt, { imageData: tinyJpeg, barcode: 'BAD002' });
+  st2.addRecord(bt, { imageData: tinyJpeg, barcode: 'OKC001' });
+  const bad1 = st2.listRecords(bt, { barcode: 'BAD001' });
+  const bad2 = st2.listRecords(bt, { barcode: 'BAD002' });
+  const ids = [...bad1.items.map((r) => r.id), ...bad2.items.map((r) => r.id)];
+  const res = st2.renameRecordsBarcode(bt, ids, 'OKC001');
+  if (res.renamed !== 3) throw new Error('改码数异常: ' + res.renamed);
+  const okList = st2.listRecords(bt, { barcode: 'OKC001' });
+  if (okList.total !== 4) throw new Error('合并后应 4 张: ' + okList.total);
+  const seqs = okList.items.map((r) => r.seq).sort((x, y) => x - y);
+  if (seqs.join(',') !== '1,2,3,4') throw new Error('编号未重排: ' + seqs.join(','));
+  for (const r of okList.items) {
+    if (!r.photoFile.startsWith('OKC001/')) throw new Error('照片未随迁: ' + r.photoFile);
+    if (!fs.existsSync(path.join(dir2, 'photos', r.photoFile))) throw new Error('文件不存在');
+  }
+  if (st2.listRecords(bt, { barcode: 'BAD001' }).total !== 0) throw new Error('旧条码应清空');
+  const logs2 = st2.listLogs(at2, { action: '修改条码' });
+  if (!logs2.items.some((l) => /批量改码/.test(l.detail))) throw new Error('批量改码日志缺失');
+  fs.rmSync(dir2, { recursive: true, force: true });
+});
+
 fs.rmSync(renDir, { recursive: true, force: true });
 
 console.log('\n结果：' + passed + ' 通过，' + failed + ' 失败');

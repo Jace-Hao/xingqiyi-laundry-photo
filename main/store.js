@@ -689,6 +689,63 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     return withPhotoUrls(rec);
   }
 
+  // ---------- 条码批量改号（整批误扫纠错） ----------
+  // 把多条记录统一改成同一个新条码：照片随迁、新旧两组编号各自重排；无权限的记录跳过
+  function renameRecordsBarcode(token, ids, newBarcodeRaw) {
+    const me = requireSession(token);
+    const newBarcode = String(newBarcodeRaw || '').trim();
+    if (!newBarcode) throw new Error('请填写新条码');
+    if (newBarcode.length < 3) throw new Error('新条码至少 3 位');
+    if (newBarcode.length > 64) throw new Error('新条码过长（最多 64 位）');
+    if (/[\\/:*?"<>|\s]/.test(newBarcode)) throw new Error('新条码含非法字符');
+    if (!Array.isArray(ids) || !ids.length) throw new Error('请先勾选要改码的记录');
+    const records = loadRecords();
+    const targets = records.filter((r) => ids.includes(r.id));
+    if (!targets.length) throw new Error('选中的记录不存在或已被删除');
+    const allowed = targets.filter((r) => isSysAdmin(me) || r.userId === me.id);
+    const denied = targets.length - allowed.length;
+    if (!allowed.length) throw new Error('无权限修改选中记录的条码');
+    const photoDir = getPhotoDir();
+    const safeNew = newBarcode.replace(/[\\/:*?"<>|]/g, '_').slice(0, 64);
+    fs.mkdirSync(path.join(photoDir, safeNew), { recursive: true });
+    const oldBarcodes = new Set();
+    const byTime = (a, b) => (a.createdAt || '').localeCompare(b.createdAt || '');
+    let renamed = 0;
+    for (const rec of allowed) {
+      oldBarcodes.add(rec.barcode);
+      const fileName = path.basename(rec.photoFile || '');
+      const srcAbs = path.join(photoDir, rec.photoFile || '');
+      if (fileName && fs.existsSync(srcAbs)) {
+        let dstName = fileName;
+        let k = 2;
+        while (fs.existsSync(path.join(photoDir, safeNew, dstName)) && dstName !== fileName) {
+          const ext = path.extname(fileName) || '.jpg';
+          dstName = path.basename(fileName, ext) + '-' + k + ext;
+          k++;
+        }
+        fs.renameSync(srcAbs, path.join(photoDir, safeNew, dstName));
+        rec.photoFile = safeNew + '/' + dstName;
+      }
+      rec.barcode = newBarcode;
+      renamed++;
+    }
+    // 新条码组与每个原条码组各自重排编号（消去空洞）
+    records.filter((r) => r.barcode === newBarcode).sort(byTime).forEach((r, i) => { r.seq = i + 1; });
+    for (const ob of oldBarcodes) {
+      if (ob === newBarcode) continue;
+      records.filter((r) => r.barcode === ob).sort(byTime).forEach((r, i) => { r.seq = i + 1; });
+    }
+    saveRecords(records);
+    appendLog({
+      ...logBase(me),
+      module: isSysAdmin(me) ? '数据管理' : '记录查询',
+      action: '修改条码',
+      detail: `批量改码：${renamed} 条 → ${newBarcode}${denied ? `，跳过无权限 ${denied} 条` : ''}`,
+      result: '成功'
+    });
+    return { renamed, denied, newBarcode, records: allowed.map((r) => withPhotoUrls(r)) };
+  }
+
   // ---------- 条码索引清单（条码纠错用） ----------
   // 返回库中全部已存档条码（去重排序），供拍照页做「相似条码」预警比对
   function listBarcodes(token) {
@@ -2080,6 +2137,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     addRecord,
     listRecords,
     renameRecordBarcode,
+    renameRecordsBarcode,
     listBarcodes,
     getRecord,
     deleteRecord,

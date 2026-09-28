@@ -82,6 +82,7 @@ function startServer(store, opts = {}) {
       'records/exportPhotos': () => store.exportPhotos(sessionToken, body),
       'records/barcodes': () => store.listBarcodes(sessionToken),
       'records/renameBarcode': () => store.renameRecordBarcode(sessionToken, body.id, body.barcode),
+      'records/renameBarcodeBatch': () => store.renameRecordsBarcode(sessionToken, body.ids, body.barcode),
       // 用户管理
       'users/list': () => store.listUsers(sessionToken),
       'users/create': () => store.createUser(sessionToken, body),
