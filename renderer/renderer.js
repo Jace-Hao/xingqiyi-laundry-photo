@@ -91,6 +91,37 @@ function barcodeFormatProfile(known) {
   return { mainLen, charset: chars, sample: list.length };
 }
 
+// 扫码枪近形误读映射：字母/符号 → 数字（仅当库内字符集确实含该数字时才启用）
+const BARCODE_NEAR_MISS = {
+  O: '0', Q: '0', D: '0', o: '0',
+  I: '1', L: '1', l: '1', i: '1',
+  Z: '2', z: '2',
+  A: '4',
+  S: '5', s: '5',
+  B: '6', b: '6', G: '6',
+  T: '7',
+  E: '8',
+  g: '9', q: '9'
+};
+
+// 修复式纠错：把当前条码中不在库内字符集里的字符按近形映射修正，
+// 返回 { value, note }；value 是否可用由调用方按格式画像校验后决定
+function barcodeRepair(s, profile) {
+  const src = String(s || '');
+  const chars = [];
+  const fixes = [];
+  for (const ch of src) {
+    if (profile.charset.includes(ch)) { chars.push(ch); continue; }
+    const mapped = BARCODE_NEAR_MISS[ch];
+    if (mapped && profile.charset.includes(mapped)) {
+      chars.push(mapped);
+      fixes.push(ch + '→' + mapped);
+    }
+    // 无法映射的字符直接丢弃：位数/字符集规则会在后续校验中暴露问题
+  }
+  return { value: chars.join(''), note: fixes.length ? '近形字符 ' + fixes.join('、') + ' 已按库内字符集修正' : '' };
+}
+
 // 当前条码对格式画像的偏差说明（无偏差返回空数组）
 function barcodeFormatIssues(target, profile) {
   const s = String(target || '').trim();
@@ -1542,14 +1573,16 @@ const CapturePage = {
       if (!v) { barcodeWarn.value = null; return; }
       // 可疑字符：条码合法集（字母/数字/下划线/连字符/中文）之外的都算，例如误读插入的「:」
       const suspicious = [];
+      let stripped = '';
+      // cleaned 专指「通过格式校验的修复建议」，不是简单的去字符结果
       let cleaned = '';
       for (const ch of v) {
-        if (/[0-9A-Za-z_\-]/.test(ch) || /[\u4e00-\u9fa5]/.test(ch)) cleaned += ch;
+        if (/[0-9A-Za-z_\-]/.test(ch) || /[\u4e00-\u9fa5]/.test(ch)) stripped += ch;
         else if (!suspicious.includes(ch)) suspicious.push(ch);
       }
       // 相似条码 + 格式画像：与库中已有条码比对（离线/接口失败时静默跳过）
-      let similar = [];
       let formatIssues = [];
+      let repairNote = '';
       try {
         if (v.length >= 6 && window.api && window.api.listBarcodes) {
           const r = await window.api.listBarcodes(props.token);
@@ -1557,22 +1590,33 @@ const CapturePage = {
             // 参照集只用「干净」条码：含可疑字符的历史条码本身大概率是误存错码，
             // 不配当格式/相似的参照（否则错码存过一次就把自己洗白）
             const cleanKnown = r.data.filter((k) => !hasBarcodeSuspicious(k));
-            const vClean = hasBarcodeSuspicious(v) ? cleaned : v;
+            const vClean = hasBarcodeSuspicious(v) ? stripped : v;
             // 条码（清洗后）已精确存在于库中且本身无可疑字符：不做相似/格式预警
             // （重复存档自有「已存档 N 张」提示；顺序连号天然编辑距离 1，逐条预警只是噪声）。
             // 带可疑字符的条码不受此豁免——永远预警。
             if (!cleanKnown.includes(vClean)) {
-              similar = barcodeSimilarList(vClean, cleanKnown);
-              // 格式画像纠错：参照干净历史条码的主长度与字符集规律，
-              // 偏差（长度不符 / 出现没见过的字符）即预警
+              // 格式画像纠错：只对照库中历史条码的规律（长度 + 字符集）
               const profile = barcodeFormatProfile(cleanKnown);
               formatIssues = barcodeFormatIssues(vClean, profile);
+              // 修复式纠错：按库内字符集做近形修正（b→6、O→0…），
+              // 修复值必须通过长度/字符集校验才作为建议，绝不推荐明知不合规的值
+              //（如「应为 12 位」时绝不建议 11 位码）
+              if (profile) {
+                const rep = barcodeRepair(vClean, profile);
+                if (rep.value !== vClean && !barcodeFormatIssues(rep.value, profile).length) {
+                  cleaned = rep.value;
+                  repairNote = rep.note;
+                }
+              } else if (suspicious.length) {
+                // 库中样本不足、无可靠规律时沿用旧行为：仅去除可疑字符，不承诺符合规律
+                cleaned = stripped;
+              }
             }
           }
         }
       } catch (e) { /* 忽略 */ }
-      barcodeWarn.value = (suspicious.length || similar.length || formatIssues.length)
-        ? { suspicious, cleaned: suspicious.length ? cleaned : '', similar, formatIssues }
+      barcodeWarn.value = (suspicious.length || formatIssues.length)
+        ? { suspicious, cleaned, repairNote, formatIssues }
         : null;
       // 锁定状态下扫入了带可疑字符的错码：自动解锁，让用户能直接改码，无需先点解锁
       if (barcodeWarn.value && barcodeWarn.value.suspicious.length && barcodeLocked.value) {
@@ -1593,11 +1637,7 @@ const CapturePage = {
     function onBarcodeDone(onlyLock) {
       checkBarcodeCount();
       ready.value = !!barcode.value.trim();
-      // 仅回车确认（扫码枪扫入或手动回车）才锁定输入框；
-      // 失焦触发的 change 不锁——否则手动输入后点别处就被锁死，无法继续修改（现场反馈）。
-      // 保存全部照片后自动解锁（见 saveAll），扫入错码时自动解锁（见 refreshBarcodeWarn），
-      // 也可点输入框旁的解锁按钮手动解锁
-      if (onlyLock === true && ready.value) barcodeLocked.value = true;
+      // v1.1.15：不再自动锁定——锁定曾导致扫码一次后无法输入（现场判定为严重 bug）；
       if (barcodeEl.value && document.activeElement === barcodeEl.value) barcodeEl.value.blur();
     }
 
@@ -1612,12 +1652,11 @@ const CapturePage = {
       if (warn) {
         const probs = [];
         if (warn.suspicious.length) probs.push('含有可疑字符 ' + warn.suspicious.join(' '));
-        if (warn.similar.length) probs.push('与库中已有条码相似：' + warn.similar.join('、'));
         if (warn.formatIssues && warn.formatIssues.length) probs.push('不符合历史条码格式：' + warn.formatIssues.join('、'));
         if (warn.cleaned) {
           const useClean = window.confirm(
             '条码纠错提醒：当前条码' + probs.join('，且') + '。' +
-            '\n\n建议使用清洗后的条码：' + warn.cleaned +
+            '\n\n建议条码：' + warn.cleaned +
             '\n\n【确定】使用清洗后条码保存；【取消】返回修改'
           );
           if (!useClean) return;
@@ -1833,17 +1872,14 @@ const CapturePage = {
             <div class="bw-line">
               ⚠ 条码纠错：
               <template v-if="barcodeWarn.suspicious.length">检测到可疑字符（{{ barcodeWarn.suspicious.join(' ') }}），可能为扫码枪误读</template>
+              <template v-if="barcodeWarn.suspicious.length && barcodeWarn.formatIssues.length">；</template>
               <template v-if="barcodeWarn.formatIssues && barcodeWarn.formatIssues.length">{{ barcodeWarn.formatIssues.join('，') }}</template>
-              <template v-if="(barcodeWarn.suspicious.length || barcodeWarn.formatIssues.length) && barcodeWarn.similar.length">；</template>
-              <template v-if="barcodeWarn.similar.length">与库中已有条码相似，请核对</template>
+              <template v-if="barcodeWarn.repairNote">{{ barcodeWarn.repairNote }}</template>
             </div>
             <div v-if="barcodeWarn.cleaned" class="bw-actions">
-              <button class="btn btn-ghost btn-sm" @click="applyCleaned">使用清洗后条码：{{ barcodeWarn.cleaned }}</button>
+              <button class="btn btn-ghost btn-sm" @click="applyCleaned">使用建议条码：{{ barcodeWarn.cleaned }}</button>
             </div>
-            <div v-if="barcodeWarn.similar.length" class="bw-actions bw-similar">
-              <span>相似条码：</span>
-              <button v-for="c in barcodeWarn.similar" :key="c" class="btn btn-ghost btn-sm" @click="applySimilar(c)">{{ c }}</button>
-            </div>
+
           </div>
 
           <label>备注</label>
@@ -4087,7 +4123,7 @@ const AdminSystemPage = {
         </div>
 
         <p class="setup-desc" style="margin-top:14px;padding:10px 12px;background:#f0f7ff;border:1px solid #cfe2f7;border-radius:8px">
-          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.14.exe）放入软件安装目录下的「软件更新」文件夹 →
+          📥 使用方法：把安装包（文件名需含版本号，如 xingqiyi-laundry-photo-setup-1.1.15.exe）放入软件安装目录下的「软件更新」文件夹 →
           在上方列表选中它 → 点「开启强制推送」。客户端下次登录时会自动从服务器下载该安装包，
           下载完成后弹窗提示店员双击安装；版本号不高于客户端当前版本的不会触发。
         </p>
