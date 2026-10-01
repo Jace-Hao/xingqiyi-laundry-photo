@@ -1530,6 +1530,8 @@ const CapturePage = {
         toast('摄像头画面未就绪', 'error');
         return;
       }
+      // 拍摄操作说明用户正在使用摄像头，重置空闲计时，防止键盘操作路径下误休眠
+      bumpActivity();
       // 时间取拍摄这一刻：连拍时每张各自记录自己的拍摄时间，
       // 不能等到统一保存时才取时间，否则连拍的多张会显示同一时刻
       const shotAt = new Date();
@@ -1639,6 +1641,8 @@ const CapturePage = {
       ready.value = !!barcode.value.trim();
       // v1.1.15：不再自动锁定——锁定曾导致扫码一次后无法输入（现场判定为严重 bug）；
       if (barcodeEl.value && document.activeElement === barcodeEl.value) barcodeEl.value.blur();
+      // 扫码/确认条码说明用户正在操作，重置空闲计时防止键盘路径下误休眠
+      bumpActivity();
     }
 
     async function saveAll() {
@@ -1647,6 +1651,8 @@ const CapturePage = {
         toast('请填写衣物条形码', 'error');
         return;
       }
+      // 保存操作说明用户正在使用系统，重置空闲计时防止保存过程中摄像头误休眠
+      bumpActivity();
       // 保存前条码纠错确认：有可疑字符或相似条码时必须过一道人工确认，防止误读条码入库
       const warn = barcodeWarn.value;
       if (warn) {
