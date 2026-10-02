@@ -6,7 +6,7 @@ import com.xingqiyi.laundryphoto.BuildConfig
 import com.xingqiyi.laundryphoto.data.local.AppDatabase
 import com.xingqiyi.laundryphoto.data.pref.SettingsStore
 import com.xingqiyi.laundryphoto.data.remote.ApiClient
-import com.xingqiyi.laundryphoto.data.remote.ApiError
+import com.xingqiyi.laundryphoto.data.remote.PingResultReporter
 import com.xingqiyi.laundryphoto.data.remote.SessionHolder
 import com.xingqiyi.laundryphoto.data.repository.AuthRepository
 import com.xingqiyi.laundryphoto.data.repository.LogRepository
@@ -81,15 +81,22 @@ class AppContainer(private val context: Context) {
         api.configure(serverUrl)
     }
 
-    /** 探测服务器是否可达（登录页「测试连接」） */
+    /**
+     * 探测服务器是否可达（登录页「测试连接」）。
+     *
+     * 现场故障复盘：这里曾直接对 `caps.serverVersion` 调 `.isBlank()`，
+     * 而旧版本桌面端返回的 `/ping` 响应体里根本没有 `serverVersion` 字段，
+     * Gson 反序列化不走 Kotlin 主构造函数、也不会执行默认值，
+     * 一律填 `null`（非空类型声明挡不住）→ NPE。
+     *
+     * 现在所有字段读取都走 [com.xingqiyi.laundryphoto.data.model.CapabilitiesDto]
+     * 的兜底计算属性，缺字段不再崩；文案组装交给
+     * [com.xingqiyi.laundryphoto.data.remote.PingResultReporter]，
+     * 之所以要抽出去，是因为本类依赖 Android `Context`，单元测试构造不出来，
+     * 放在这里就等于「降级提示对不对」永远没人能验证。
+     */
     suspend fun ping(): String {
         ensureConfigured()
-        return try {
-            val caps = systemRepository.ping()
-            val v = caps.serverVersion
-            if (v.isBlank()) "连接成功" else "连接成功，服务端版本 v$v"
-        } catch (e: ApiError) {
-            throw e
-        }
+        return PingResultReporter.success(systemRepository.ping())
     }
 }

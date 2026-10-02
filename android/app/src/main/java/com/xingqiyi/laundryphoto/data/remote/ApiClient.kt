@@ -3,6 +3,7 @@ package com.xingqiyi.laundryphoto.data.remote
 import com.google.gson.Gson
 import com.google.gson.JsonParseException
 import com.xingqiyi.laundryphoto.data.model.ApiEnvelope
+import com.xingqiyi.laundryphoto.util.ServerUrlNormalizer
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Response
@@ -43,15 +44,28 @@ class ApiClient(
     var capabilities: com.xingqiyi.laundryphoto.data.model.CapabilitiesDto? = null
         private set
 
+    /**
+     * 最近一次响应的正文片段（已脱敏截断）。
+     *
+     * 仅用于生成「对方返回的不是本系统的数据」这句排障提示：
+     * Gson 的解析异常里没有正文，而用户要判断「对方到底是 HTML 还是旧版 JSON」
+     * 必须看到原文。由 [ResponseSnippetCaptureInterceptor] 在网络层抓取。
+     */
+    @Volatile
+    private var lastResponseSnippet: String? = null
+
     val isConfigured: Boolean get() = service != null
 
     /**
      * 配置（或切换）服务器地址。
      *
-     * 传入的原始串会先经 [normalizeBaseUrl] 规范化：现场最常见的填错是漏写端口冒号
-     * （`http://192.168.110.1717521`），会被解析成主机名 + 80 端口，
-     * 请求打到不相干的服务上返回 HTML，最终只报「数据返回异常」，极难自查。
-     * 规范化会把冒号补回来，让请求真正落到服务端端口上。
+     * 传入的原始串会先经 [normalizeBaseUrl] 规范化。
+     *
+     * 注意：早前这里描述的场景是「`http://192.168.110.1717521` 漏写冒号 →
+     * 被当成主机名 + 80 端口 → 打到不相干的服务上返回 HTML」。
+     * 该问题现在由 [com.xingqiyi.laundryphoto.util.ServerUrlNormalizer] 在**发请求之前**
+     * 就补全端口解决了，**不会再有以 80 端口发出的请求**，
+     * 因此若仍看到「实际访问的是 80 端口」的提示，那一定是地址真的没写端口。
      *
      * @return 规范化后的 baseUrl；地址非法时返回 null，调用方提示用户即可。
      */
@@ -80,9 +94,9 @@ class ApiClient(
      * 规则见 [ServerUrlNormalizer]；这里只做一层薄封装，便于单测与复用。
      */
     fun normalizeBaseUrl(raw: String): String? =
-        when (val r = com.xingqiyi.laundryphoto.util.ServerUrlNormalizer.normalize(raw)) {
-            is com.xingqiyi.laundryphoto.util.ServerUrlNormalizer.Result.Ok -> r.baseUrl
-            is com.xingqiyi.laundryphoto.util.ServerUrlNormalizer.Result.Invalid -> null
+        when (val r = ServerUrlNormalizer.normalize(raw)) {
+            is ServerUrlNormalizer.Result.Ok -> r.baseUrl
+            is ServerUrlNormalizer.Result.Invalid -> null
         }
 
     fun rememberCapabilities(caps: com.xingqiyi.laundryphoto.data.model.CapabilitiesDto?) {
@@ -98,6 +112,14 @@ class ApiClient(
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
             .addInterceptor(AuthInterceptor(sessionHolder))
+            // 抓取响应正文片段供错误文案使用。放在鉴权之后：
+            // 片段里可能含敏感字段，交给脱敏器处理，同时避免在鉴权失败时也去读正文。
+            .addInterceptor(
+                ResponseSnippetCaptureInterceptor(
+                    secretsProvider = { listOf(sessionHolder.apiToken, sessionHolder.sessionToken) },
+                    onSnippet = { lastResponseSnippet = it }
+                )
+            )
         if (debug) {
             // 仅在 debug 包开启，且只到 BODY 级别；发布包不注入，避免日志里出现连接码
             builder.addInterceptor(
@@ -165,7 +187,7 @@ class ApiClient(
         // 都是 IOException 的子类，必须先匹配具体类型，否则会退化成笼统的「网络异常」，
         // 界面就无法区分「地址写错」和「服务器没开」这两种最常见的现场问题。
         is UnknownHostException ->
-            ApiError.Network("域名无法解析：$baseUrl。若目标是局域网电脑，请改用内网 IP（如 192.168.1.10:${com.xingqiyi.laundryphoto.util.ServerUrlNormalizer.DEFAULT_PORT}）")
+            ApiError.Network("域名无法解析：$baseUrl。若目标是局域网电脑，请改用内网 IP（如 192.168.1.10:${ServerUrlNormalizer.DEFAULT_PORT}）")
         is SocketTimeoutException -> ApiError.Network("连接服务器超时，请检查网络或服务端是否在线")
         is ConnectException -> ApiError.Network("无法连接服务器，请确认服务端已启动且端口可达")
         is SocketException -> ApiError.Network("网络连接中断，请稍后重试")
@@ -180,20 +202,13 @@ class ApiClient(
      * 走到这里说明 TCP 连接是通的，但对方返回的内容 Gson 解析不了——
      * 绝大多数情况是**地址或端口指错了服务**（打到了路由器后台、别的程序、
      * 或 80 端口上的 Web 页面），而不是本系统服务端真的坏了。
-     * 因此提示里必须带上实际使用的地址与端口，否则用户无从核对。
+     *
+     * 文案组装已抽到 [MalformedResponseReporter]：它只依赖 baseUrl 与已脱敏的响应体片段，
+     * 是纯函数，能被单元测试直接断言。留在本类里私有实现的历史教训是
+     * 「有没有填端口都提示 80 端口」这种自相矛盾逻辑没人能测出来。
      */
-    private fun malformedResponseMessage(): String {
-        val authority = baseUrl.substringAfter("://").trimEnd('/')
-        val host = authority.substringBefore('/')
-        val portHint = if (authority.substringAfter("://", "").contains(':')) {
-            ""
-        } else {
-            "（当前未指定端口，实际访问的是 80 端口；本系统默认端口为 ${com.xingqiyi.laundryphoto.util.ServerUrlNormalizer.DEFAULT_PORT}）"
-        }
-        return "已连接到 $host，但对方返回的不是本系统的数据$portHint。" +
-            "请核对：① 地址格式应为 http://内网IP:${com.xingqiyi.laundryphoto.util.ServerUrlNormalizer.DEFAULT_PORT}（别漏了冒号）；" +
-            "② 该端口确实是本系统服务端，而非路由器/其他程序。"
-    }
+    private fun malformedResponseMessage(): String =
+        MalformedResponseReporter.build(baseUrl, lastResponseSnippet)
 
     /**
      * 拼照片访问地址。

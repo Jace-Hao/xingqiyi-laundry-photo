@@ -116,17 +116,61 @@ data class SystemInfoDto(
     val localOnly: Boolean = true
 )
 
-/** 服务端能力集：移动端据此降级；老服务端没有该接口时按最低能力集处理 */
+/**
+ * 服务端能力集：移动端据此降级；老服务端没有该接口时按最低能力集处理。
+ *
+ * ## 为什么这里全部是可空类型
+ *
+ * 现场实测踩过的坑：用户桌面端是旧构建，`/ping` 只返回
+ * `{"ok":true,"data":{"app":"xingqiyi"}}`，**没有** `apiVersion` /
+ * `serverVersion` / `features`。
+ *
+ * Gson 反序列化**不走 Kotlin 主构造函数，也不会执行这里的默认值兜底**——
+ * 它用 Unsafe 直接分配对象并只填充 JSON 里存在的 key，缺失字段一律为 `null`。
+ * 所以若把 `serverVersion` 声明成非空 `String`，编译器不报错（默认值给了 ""），
+ * 运行时却拿到 `null`，调用方一句 `.isBlank()` 就是 NPE，
+ * 最终被翻译成一句「对方返回的不是本系统的数据」，把新旧版本不兼容
+ * 伪装成了「你地址填错了」，用户白查防火墙和 IP。
+ *
+ * 因此：**凡是要接收服务端可能缺字段的 DTO，字段一律可空**，
+ * 对外语义通过下面的计算属性兜底，调用方拿到的始终是非空值。
+ */
 data class CapabilitiesDto(
-    val app: String = "",
-    val apiVersion: Int = 1,
-    val serverVersion: String = "",
+    val app: String? = null,
+    val apiVersion: Int? = null,
+    val serverVersion: String? = null,
     val features: FeaturesDto? = null
 ) {
+    /** 兜底后的服务标识，调用方无需判空 */
+    val appName: String get() = app.orEmpty()
+
+    /** 兜底后的服务端版本号，老服务端缺字段时为空串 */
+    val serverVersionText: String get() = serverVersion.orEmpty()
+
+    /**
+     * 能力集 API 版本。老服务端无此字段时按 1 处理（仅基础能力）。
+     * 客户端 v1.3.0 引入的能力（原始上传、改备注）依赖 apiVersion >= 2。
+     */
+    val apiVersionValue: Int get() = apiVersion ?: 1
+
+    /** 服务端是否为支持 v1.3.0 增量接口的新版 */
+    val supportsMobileAddons: Boolean get() = apiVersionValue >= MIN_API_VERSION
+
     val uploadRaw: Boolean get() = features?.uploadRaw == true
     val setNote: Boolean get() = features?.setNote == true
     val thumb: Boolean get() = features?.thumb == true
     val photoTokenQuery: Boolean get() = features?.photoTokenQuery == true
+
+    companion object {
+        /**
+         * 首个支持 v1.3.0 增量接口的协议版本号。
+         * 低于此值（含缺失）即视为旧版服务端：原始上传与「改备注」不可用，走 base64 兼容通道。
+         */
+        const val MIN_API_VERSION = 2
+
+        /** 建议用户升级到的桌面端版本号，供升级指引文案使用 */
+        const val MIN_SERVER_VERSION = "1.3.0"
+    }
 }
 
 data class FeaturesDto(
