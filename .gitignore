@@ -49,3 +49,25 @@ web/
 开发工具/
 
 renderer/styles.*.bak.css
+
+# ---------- Android 移动端 ----------
+# Gradle 构建产物：必须写 build/（带斜杠且不锚定根目录），
+# 只写 /build 只能匹配仓库根目录，会漏掉 android/app/build
+# 并把上千个生成文件误提交进来。
+build/
+.gradle/
+android/.gradle/
+android/local.properties
+
+# 签名密钥库：丢失则无法覆盖升级已安装的 App（用户须卸载重装、丢数据）。
+# 密钥只保存在本机 C:\Users\haoyuwei\.build\release.jks，绝不入库。
+*.jks
+*.keystore
+
+# 打包好的 APK：体积大，发布时走 GitHub Releases 附件
+release-apk/
+android/app/release/
+android/app/debug/
+
+# WorkBuddy 工作区数据（项目记忆与本地配置，非源码）
+.workbuddy/

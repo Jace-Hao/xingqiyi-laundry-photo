@@ -1,5 +1,46 @@
 # 更新日志
 
+## v1.3.0（2026-10-02）
+
+### 新增
+
+- **服务端能力集接口 `system/capabilities`，`/ping` 同步返回能力集**。移动端配置服务器地址时先 `GET /ping`，既能验连通性也能拿到 `apiVersion` / `serverVersion` / `features`，无需登录即可判断服务端是否支持原始上传等增量功能，从而对旧服务端正确降级而非直接判定连接失败。
+- **原始二进制照片上传 `POST /upload`**（配 `records/addByFile` 建档）：base64 上传体积膨胀约 33% 且需整体读入内存，弱网下中断即从零重传；改为「先暂存原始字节、再凭文件名建档」两步，服务端可按 Content-Length 直接落盘。暂存文件名由服务端随机生成（客户端文件名不可信，避免路径穿越），`_upload/<日期>/` 下的残留由 `purgeStagedUploads` 定期清理。
+- **备注订正 `records/setNote`**：用于事后修改已存档记录的备注。
+- **`/photo` 支持 `?w=` 缩略图**，并兼容用查询参数传递连接码（移动端图片加载器无法附加自定义请求头）。
+
+### 修复
+
+- **安卓客户端「测试连接」在新旧版本桌面端混用时误报「不是本系统的数据」**：现场用户地址与端口都填得完全正确（`http://192.168.110.10:17521`），却始终连不上。排查确认为**三个独立缺陷叠加**：
+
+  1. **根因 —— Gson + Kotlin 非空类型陷阱**。桌面端在 v1.3.0 之前，`/ping` 只返回 `{"ok":true,"data":{"app":"xingqiyi"}}`，不含 `apiVersion` / `serverVersion` / `features`。而客户端 `CapabilitiesDto` 把这些字段声明为非空 `String` 并给了默认值——编译器完全放行，但 **Gson 反序列化不走主构造函数、不执行默认值兜底**，缺失字段一律填 `null`，于是 `ping()` 与 `SystemRepository.ping()` 中的 `.isNotBlank()` 直接抛 NPE，异常被兜底翻译成「对方返回的不是本系统的数据」，把**版本不兼容**伪装成了**用户地址填错**，导致用户反复检查防火墙与 IP 而查不到真因。
+     现在 `CapabilitiesDto` 字段统一改为可空类型 + 计算属性兜底（`appName` / `serverVersionText` / `apiVersionValue` / `supportsMobileAddons`），所有调用点均已修正，**旧版桌面端现在可以正常连接**，并按最低能力集降级运行。
+  2. **端口提示误报**。`ApiClient.malformedResponseMessage()` 先用 `substringAfter("://")` 剥掉 scheme，随后又对已剥离的串做一次 `substringAfter("://")` 去找 `://`，结果恒为空串 —— 导致**无论用户有没有填端口，都会提示「当前未指定端口，实际访问的是 80 端口」**。这正是用户看到「已连接到 192.168.110.10:17521，但……实际访问的是 80 端口」这句自相矛盾提示的来源。现已改为由 `ServerUrlNormalizer.parseEndpoint()` 统一解析地址，并额外附带**对方实际返回的内容片段**（脱敏后截断 120 字），让「连错服务」「版本过旧」一眼可辨。
+  3. **探活指纹校验短路放行**。原判定 `app.isNotBlank() && !app.startsWith("xingqiyi")` 在 `app` **缺失**时 `isNotBlank()` 为 false，整个条件短路 —— **最该拒绝的情况反而被放行**：任何返回 `{"ok":true,"data":{...}}` 的其他后端都会让用户看到「连接成功」，直到登录或上传才失败、且已离开现场无从排查。现已改为取反：只要不是本系统的 `app` 一律拒绝（大小写不敏感，用前缀而非全等，保证旧服务端的 `xingqiyi` 仍可通过）。
+
+### 更正
+
+- 上一版提交（`769ef8f`）将该故障根因误判为「用户漏写端口冒号」。当时新增的 `ServerUrlNormalizer`「漏冒号自动补端口」逻辑**本身有效，予以保留**；本次更正的是**错误提示本身不准确**所导致的二次误导。
+
+### 改进
+
+- 连接到低版本桌面端时，「测试连接」会明确提示「服务端版本较旧，原始上传与「改备注」不可用，建议将桌面端升级到 v1.3.0」，不再让功能静默消失后被当成缺陷。
+- 「对方实际返回：」片段由网络层新增的 `ResponseSnippetCaptureInterceptor` 抓取（经 `peekBody` 缓冲 512 字节，不消费响应体），并在进入文案前统一脱敏截断至 120 字符：**连接码、会话令牌等敏感字段一律打码**，可安全展示给用户与客服。
+- 地址的读出（`ServerUrlNormalizer.parseEndpoint`）与写入（`normalize`）收口为同一套规则，报错文案不再自行 `substringAfter("://")` 拆字符串——那类重复解析正是端口提示自相矛盾的来源。
+
+### 测试
+
+新增 4 个回归测试文件，共 36 个用例，`testDebugUnitTest` 全量 72 个用例全部通过：
+
+| 测试文件 | 覆盖内容 |
+|---|---|
+| `CapabilitiesCompatTest` | 以旧版桌面端真实响应体 `{"ok":true,"data":{"app":"xingqiyi"}}` 为输入，断言不抛异常且正确降级；含新版完整响应体用例 |
+| `MalformedResponseReporterTest` | **地址带端口时不得出现「80 端口」字样**；响应体片段脱敏与截断 |
+| `PingResultReporterTest` | 旧服务端不崩 + 必须给出可操作的升级指引 |
+| `PingFingerprintTest` | 探活指纹校验：`app` 缺失/为空串时**必须拒绝**（旧判定的 `isNotBlank() &&` 短路会把最危险的情况放行），同时旧服务端 `xingqiyi` 不被误伤 |
+| `ServerUrlNormalizerParseEndpointTest` | 地址读出与写入的一致性（normalize 产物可被 parseEndpoint 正确读回） |
+- `android/README.md` 常见问题补充「对方实际返回」自查表与版本判别方法。
+
 ## v1.2.2（2026-10-01）
 
 ### 修复
