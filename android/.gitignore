@@ -1,0 +1,18 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+# 注意：必须用 build/ 而非 /build。
+# 带前导斜杠只匹配 android/build，无法屏蔽各模块的 android/app/build，
+# 会把 kapt 生成代码、aar 产物等数千个文件提交进仓库。
+build/
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+# 发布签名信息切勿入库
+*.jks
+*.keystore
+# 本地打包产物
+/release-apk/
