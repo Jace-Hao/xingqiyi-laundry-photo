@@ -1,6 +1,7 @@
 package com.xingqiyi.laundryphoto.data.remote
 
 import com.google.gson.Gson
+import com.google.gson.JsonIOException
 import com.google.gson.JsonParseException
 import com.xingqiyi.laundryphoto.data.model.ApiEnvelope
 import com.xingqiyi.laundryphoto.util.ServerUrlNormalizer
@@ -191,9 +192,35 @@ class ApiClient(
         is SocketTimeoutException -> ApiError.Network("连接服务器超时，请检查网络或服务端是否在线")
         is ConnectException -> ApiError.Network("无法连接服务器，请确认服务端已启动且端口可达")
         is SocketException -> ApiError.Network("网络连接中断，请稍后重试")
+        is JsonIOException -> ApiError.Network(clientSideDefectMessage(e))
         is JsonParseException -> ApiError.Network(malformedResponseMessage())
         is IOException -> ApiError.Network("网络异常：${e.message ?: "未知错误"}")
         else -> ApiError.Network(e.message ?: "请求失败")
+    }
+
+    /**
+     * 「App 自己的 Gson 映射被混淆破坏」的提示。
+     *
+     * ## 为什么要把它和 [malformedResponseMessage] 分开
+     *
+     * [JsonIOException] 是 [JsonParseException] 的子类，而后者对应的是
+     * 「服务端返回了本系统不认识的非 JSON 内容」——责任在服务端或地址填错。
+     * 但 R8 剥离 DTO 字段时抛的也是 [JsonIOException]，责任在**发布包本身**。
+     *
+     * 两者混为一谈的后果非常具体：v1.3.0 就因为混淆规则漏了 `data.model.**`，
+     * release 包里 `ApiEnvelope`/`CapabilitiesDto` 被剥成零字段空壳，
+     * 于是每次 ping 都抛 JsonIOException，被翻译成
+     * 「已连接到 xxx，但对方返回的不是本系统的数据」——
+     * 而服务端返回的 JSON 明明完全合法（`app`/`apiVersion`/`features` 一应俱全）。
+     * 用户于是去查地址、查端口、查桌面端版本，三条线索全是错的。
+     *
+     * 所以这里必须原样带上 Gson 的原始信息：它会直接点名
+     * 「Adjust the R8 configuration」，这才是真正该做的事。
+     */
+    private fun clientSideDefectMessage(e: JsonIOException): String {
+        val detail = e.message?.takeIf { it.isNotBlank() } ?: "Gson 无法完成对象映射"
+        return "本 App 的安装包存在缺陷（数据映射被代码压缩破坏），并非服务器或地址问题。\n" +
+            "请安装最新版本；若已是最新，请把下面这行反馈给开发：\n$detail"
     }
 
     /**

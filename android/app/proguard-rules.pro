@@ -4,7 +4,28 @@
 # 因此必须显式保留。业务代码其余部分正常混淆。
 
 # Gson 数据模型：字段名即 JSON 键名，不能重命名也不能裁剪
--keepclassmembers,allowoptimization class com.xingqiyi.laundryphoto.data.remote.** { <fields>; }
+#
+# 【v1.3.1 修复】原先这里只 keep 了 data.remote.**，而**全部 DTO 都在 data.model.**
+# （Models.kt / Role.kt）。data.remote 只是 Retrofit/OkHttp 的网络层，一个 DTO 都没有。
+# 后果：release 包（isMinifyEnabled = true）里 R8 把 CapabilitiesDto / ApiEnvelope 的
+# 字段全部剥离，类体只剩一个 PUBLIC ABSTRACT 空壳（dex 实测 Instance fields = 0），
+# Gson 反射时抛
+#     JsonIOException: Abstract classes can't be instantiated!
+#     Adjust the R8 configuration ...
+# 而 JsonIOException 是 JsonParseException 的子类，正好命中 ApiClient.translate() 的
+# `is JsonParseException ->` 分支，于是被翻译成「已连接到 xxx，但对方返回的不是本系统的数据」。
+# 服务端返回的 JSON 完全合法（app/apiVersion/features 一应俱全），
+# 用户却被引导去查地址、查端口、查桌面端版本——三重误导，问题还永远查不出来。
+#
+# 关键教训：Gson DTO 的包名必须与实际存放位置一致。
+# 校验方式见 docs 里的 release 自检清单（dexdump 查 Instance fields 是否为 0）。
+-keepclassmembers,allowoptimization class com.xingqiyi.laundryphoto.data.model.** { <fields>; }
+-keep class com.xingqiyi.laundryphoto.data.model.** { *; }
+
+# Room 实体（本地离线队列）同样按字段名序列化，一并保留
+-keep class com.xingqiyi.laundryphoto.data.local.** { *; }
+
+# 网络层：Retrofit 接口靠注解反射、OkHttp 拦截器同理
 -keep class com.xingqiyi.laundryphoto.data.remote.** { *; }
 
 # Gson 自身的类型适配器与注解
