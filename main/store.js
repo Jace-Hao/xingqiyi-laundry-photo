@@ -1230,6 +1230,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     '新增条码', '新增存档照片', '修改条码', '离线存档', '删除存档', '批量删除存档',
     '查询记录', '查看记录', '批量导出照片', '按日期导出照片',
     '新增用户', '修改用户', '删除用户',
+    '修改备注',
     '查询日志', '修改端口', '重置连接码', '修改照片路径',
     '开启开机自启', '取消开机自启',
     '设置订单保留期', '取消订单保留期', '自动清理过期订单',
@@ -2126,6 +2127,197 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     };
   }
 
+  // ---------- 移动端补充能力（v1.3.0） ----------
+  // 以下四个方法为 Android 客户端新增，桌面端不调用，属于纯增量，不影响既有流程。
+
+  /**
+   * 暂存上传的照片（分片/原始二进制上传的第一步）。
+   *
+   * 背景：移动端在弱网下用 JSON + base64 上传大照片代价很高——
+   * base64 体积膨胀约 33%，且必须一次性整体读入内存与整体解析，
+   * 中途断网就要从零重传。改为「先原始字节暂存，再凭文件名建档」两步，
+   * 客户端可以只重传临时文件，服务端也能按 Content-Length 直接落盘。
+   *
+   * 暂存目录固定为照片根目录下的 _upload（与条码目录同级），
+   * 建档时会把文件移入条码目录，因此 _upload 里只会残留中断上传的临时文件，
+   * 可用 purgeStagedUploads 定期清理。
+   *
+   * @param {string} token 会话令牌（要求拍照权限）
+   * @param {string} rawName 客户端原始文件名，只用于取扩展名
+   * @param {Buffer} buf 照片字节
+   * @returns {string} 相对照片根目录的暂存路径
+   */
+  function stageUpload(token, rawName, buf) {
+    requireSessionPermission(token, 'capture');
+    if (!Buffer.isBuffer(buf) || !buf.length) throw new Error('上传内容为空');
+    // 单次上传上限 60MB：原图画质最高的手机照片约 20MB，留足冗余；
+    // 超出即拒绝，避免单个请求把服务端内存与磁盘吃满。
+    if (buf.length > 60 * 1024 * 1024) throw new Error('照片过大，单次上传上限 60MB');
+    // 只保留扩展名，文件名由服务端生成：客户端传入的文件名不可信，
+    // 直接采用会有路径穿越与覆盖他人照片的风险。
+    const ext = (path.extname(String(rawName || '')) || '').toLowerCase();
+    const safeExt = /^\.(jpg|jpeg|png|webp)$/.test(ext) ? ext : '.jpg';
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const day = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;
+    const dir = path.join(getPhotoDir(), '_upload', day);
+    fs.mkdirSync(dir, { recursive: true });
+    const name = `${crypto.randomBytes(8).toString('hex')}${safeExt}`;
+    fs.writeFileSync(path.join(dir, name), buf);
+    return `_upload/${day}/${name}`;
+  }
+
+  /** 暂存文件清理：删除超过 maxAgeMs 的临时文件，避免中断上传无限堆积 */
+  function purgeStagedUploads(maxAgeMs = 24 * 60 * 60 * 1000) {
+    const dir = path.join(getPhotoDir(), '_upload');
+    if (!fs.existsSync(dir)) return 0;
+    const cutoff = Date.now() - maxAgeMs;
+    let removed = 0;
+    for (const day of fs.readdirSync(dir)) {
+      const dayDir = path.join(dir, day);
+      if (!fs.statSync(dayDir).isDirectory()) continue;
+      for (const f of fs.readdirSync(dayDir)) {
+        const p = path.join(dayDir, f);
+        try {
+          if (fs.statSync(p).mtimeMs >= cutoff) continue;
+          fs.unlinkSync(p);
+          removed++;
+        } catch (e) {
+          /* 单个文件删除失败不影响其余清理 */
+        }
+      }
+      // 空目录顺手清掉，避免留下大量空日期目录
+      try {
+        if (!fs.readdirSync(dayDir).length) fs.rmdirSync(dayDir);
+      } catch (e) { /* 非空或占用时忽略 */ }
+    }
+    return removed;
+  }
+
+  /**
+   * 用已暂存的照片建档（原始二进制上传的第二步）。
+   * 与 addRecord 的区别仅是照片来源：这里不再接收 base64，而是把暂存文件移入条码目录。
+   * 校验、编号、日志的口径与 addRecord 完全一致，避免两条路径行为分叉。
+   */
+  function addRecordByFile(token, p = {}) {
+    const me = requireSessionPermission(token, 'capture');
+    const barcode = String(p.barcode || '').trim();
+    if (!barcode) throw new Error('请填写衣物条形码');
+    if (barcode.length > 64) throw new Error('条形码过长（最多 64 位）');
+    const staged = String(p.photoFile || '');
+    // 只接受自己 _upload 目录下的暂存路径：防止客户端借该接口读取/搬移任意照片文件
+    const parts = staged.split('/').filter(Boolean);
+    if (parts.length !== 3 || parts[0] !== '_upload') throw new Error('上传文件标识无效，请重新上传照片');
+    for (const seg of parts) {
+      if (seg === '.' || seg === '..' || /[/\\:*?"<>|]/.test(seg)) throw new Error('上传文件标识无效，请重新上传照片');
+    }
+    const srcAbs = path.join(getPhotoDir(), ...parts);
+    if (!fs.existsSync(srcAbs)) throw new Error('上传文件已失效，请重新上传照片');
+
+    const photoDir = getPhotoDir();
+    const safeBarcode = barcode.replace(/[\\/:*?"<>|]/g, '_').slice(0, 64);
+    const barcodeDir = path.join(photoDir, safeBarcode);
+    fs.mkdirSync(barcodeDir, { recursive: true });
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const baseName = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}`;
+    const ext = path.extname(srcAbs) || '.jpg';
+    let photoName = `${baseName}${ext}`;
+    let n = 2;
+    while (fs.existsSync(path.join(barcodeDir, photoName))) {
+      photoName = `${baseName}-${n}${ext}`;
+      n++;
+    }
+    const dstAbs = path.join(barcodeDir, photoName);
+    try {
+      fs.renameSync(srcAbs, dstAbs);
+    } catch (e) {
+      // 跨分区/跨盘时 rename 会失败，退化为复制后删除，保证建档不中断
+      fs.copyFileSync(srcAbs, dstAbs);
+      fs.unlinkSync(srcAbs);
+    }
+
+    const id = uid();
+    const records = loadRecords();
+    const seq = records.filter((r) => r.barcode === barcode).length + 1;
+    const record = {
+      id,
+      barcode,
+      seq,
+      userId: me.id,
+      username: me.username,
+      storeName: normalizeStore(me.store),
+      note: String(p.note || '').trim(),
+      photoFile: `${safeBarcode}/${photoName}`,
+      createdAt: now()
+    };
+    records.push(record);
+    saveRecords(records);
+    if (seq === 1) {
+      appendLog({
+        ...logBase(me),
+        module: '衣物拍照',
+        action: '新增条码',
+        detail: `新增衣物条码档案：条码「${barcode}」`,
+        result: '成功'
+      });
+    }
+    appendLog({
+      ...logBase(me),
+      module: '衣物拍照',
+      action: '新增存档照片',
+      detail: `新增存档照片：条码「${barcode}」第 ${seq} 张${p.offlineSync ? '（移动端离线补传）' : ''}`,
+      result: '成功'
+    });
+    return withPhotoUrls(record);
+  }
+
+  /** 修改存档备注：拍照页手输备注在移动端容易误触，允许事后单独订正 */
+  function setRecordNote(token, id, noteRaw) {
+    const me = requireSession(token);
+    const note = String(noteRaw || '').trim();
+    if (note.length > 200) throw new Error('备注过长（最多 200 字）');
+    const records = loadRecords();
+    const rec = records.find((r) => r.id === id);
+    if (!rec) throw new Error('记录不存在或已被删除');
+    if (!isSysAdmin(me) && rec.userId !== me.id) throw new Error('无权限修改他人订单的备注');
+    if (rec.note === note) return withPhotoUrls(rec);
+    const old = rec.note;
+    rec.note = note;
+    saveRecords(records);
+    appendLog({
+      ...logBase(me),
+      module: isSysAdmin(me) ? '数据管理' : '记录查询',
+      action: '修改备注',
+      detail: `修改备注：条码「${rec.barcode}」第 ${rec.seq} 张，${old ? `「${old}」→ ` : ''}「${note || '（清空）'}」`,
+      result: '成功'
+    });
+    return withPhotoUrls(rec);
+  }
+
+  /**
+   * 服务端能力集：移动端连接后据此判断可用功能。
+   * 老版本服务端没有 /api/system/capabilities，客户端收到「接口不存在」时应按最低能力集降级，
+   * 而不是直接判定连接失败——这样新旧服务端可以混用。
+   */
+  const CAPABILITIES = {
+    app: 'xingqiyi-laundry-photo',
+    apiVersion: 2,
+    features: {
+      // 原始二进制上传（POST /upload + records/addByFile）：弱网与大照片的首选通道
+      uploadRaw: true,
+      // 备注订正
+      setNote: true,
+      // /photo 支持 ?w= 缩略图
+      thumb: true,
+      // /photo 支持通过查询参数传递连接码（移动端图片加载器无法附加自定义头）
+      photoTokenQuery: true
+    }
+  };
+  function capabilities() {
+    return { ...CAPABILITIES, serverVersion: appVersion };
+  }
+
   return {
     ensureSeedData,
     login,
@@ -2135,6 +2327,11 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     getPhotoDir,
     resolvePhotoFile,
     addRecord,
+    stageUpload,
+    purgeStagedUploads,
+    addRecordByFile,
+    setRecordNote,
+    capabilities,
     listRecords,
     renameRecordBarcode,
     renameRecordsBarcode,

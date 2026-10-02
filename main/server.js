@@ -38,6 +38,30 @@ function startServer(store, opts = {}) {
     });
   }
 
+  /**
+   * 读取原始字节请求体（供 /upload 使用）。
+   * 与 readBody 的区别：不做 JSON 解析，也不把内容转成字符串
+   * （二进制转字符串再转 Buffer 会破坏字节，照片必然损坏）。
+   * 超限立即断开，避免恶意大请求把内存吃满。
+   */
+  function readRaw(req, limitBytes) {
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      let size = 0;
+      req.on('data', (chunk) => {
+        size += chunk.length;
+        if (size > limitBytes) {
+          reject(new Error('上传内容超过大小上限'));
+          req.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on('end', () => resolve(Buffer.concat(chunks)));
+      req.on('error', reject);
+    });
+  }
+
   function json(res, code, payload) {
     const body = JSON.stringify(payload);
     res.writeHead(code, {
@@ -83,6 +107,11 @@ function startServer(store, opts = {}) {
       'records/barcodes': () => store.listBarcodes(sessionToken),
       'records/renameBarcode': () => store.renameRecordBarcode(sessionToken, body.id, body.barcode),
       'records/renameBarcodeBatch': () => store.renameRecordsBarcode(sessionToken, body.ids, body.barcode),
+      // 移动端补充接口（v1.3.0）：
+      // addByFile 与 stageUpload 配套，用于弱网下的原始二进制上传；
+      // setNote 用于事后订正备注。桌面端不调用，属纯增量。
+      'records/addByFile': () => store.addRecordByFile(sessionToken, body),
+      'records/setNote': () => store.setRecordNote(sessionToken, body.id, body.note),
       // 用户管理
       'users/list': () => store.listUsers(sessionToken),
       'users/create': () => store.createUser(sessionToken, body),
@@ -95,6 +124,8 @@ function startServer(store, opts = {}) {
       'stats/overview': () => store.overview(sessionToken),
       // 系统设置（仅服务端本机管理员使用）
       'system/info': () => ({ ...store.systemInfo(), localOnly: true }),
+      // 能力集：移动端据此判断服务端是否支持原始上传等新特性（老服务端返回「接口不存在」即降级）
+      'system/capabilities': () => store.capabilities(),
       'system/checkUpdate': () => store.checkUpdates(),
       'system/settings': () => store.updateSystemSettings(sessionToken, body),
       'system/resetToken': () => store.resetApiToken(sessionToken),
@@ -153,6 +184,35 @@ function startServer(store, opts = {}) {
     });
   }
 
+  /**
+   * 原始二进制照片上传（POST /upload）。
+   *
+   * 移动端专用：弱网下用 JSON + base64 上传大照片代价很高（体积膨胀 33%、
+   * 需整体读入内存、断网即从零重传）。这里改为接收原始字节直接落盘，
+   * 客户端只需重传一个临时文件；随后调用 records/addByFile 完成建档。
+   *
+   * 与 /api/* 一样校验连接码与会话令牌：连接码取自请求头或查询参数（同 /photo），
+   * 会话令牌取自请求头或查询参数 st（部分移动端上传栈不便设置自定义头）。
+   */
+  async function handleUpload(req, res, query) {
+    const cfg = store.loadConfig();
+    const apiToken = req.headers['x-api-token'] || (query.get ? query.get('token') : '');
+    if (!apiToken || apiToken !== cfg.token) {
+      return json(res, 401, { ok: false, message: '连接码无效，请检查服务器连接码配置' });
+    }
+    const sessionToken = req.headers['x-session-token'] || (query.get ? query.get('st') : '') || '';
+    const rawName = req.headers['x-file-name'] || (query.get ? query.get('name') : '') || 'photo.jpg';
+    try {
+      const buf = await readRaw(req, 60 * 1024 * 1024);
+      const data = store.stageUpload(sessionToken, decodeURIComponent(String(rawName)), buf);
+      return json(res, 200, { ok: true, data: { photoFile: data } });
+    } catch (e) {
+      // 会话被顶下线要带 revoked，让移动端强制退回登录页而不是当成普通上传失败
+      const revoked = e && e.code === SESSION_REVOKED_CODE;
+      return json(res, 200, { ok: false, message: e.message || String(e), ...(revoked ? { revoked: true } : {}) });
+    }
+  }
+
   // 强制推送的安装包分发：客户端下载安装包走 net.fetch，无法附加自定义请求头，
   // 因此沿用 /photo 的方式通过查询参数传递连接码。文件名已在数据层做路径穿越防护。
   function handleUpdateFile(req, res, query) {
@@ -207,10 +267,14 @@ function startServer(store, opts = {}) {
           await handleApi(req, res, url.pathname.slice(5), url.searchParams);
         } else if (url.pathname === '/photo') {
           handlePhoto(req, res, url.searchParams);
+        } else if (url.pathname === '/upload') {
+          await handleUpload(req, res, url.searchParams);
         } else if (url.pathname === '/update-file') {
           handleUpdateFile(req, res, url.searchParams);
         } else if (url.pathname === '/ping') {
-          json(res, 200, { ok: true, data: { app: 'xingqiyi' } });
+          // 带上能力集：移动端在配置服务器地址时可先 ping，
+          // 既能验连通性也能拿到 apiVersion/features，无需登录即可做兼容性降级判断
+          json(res, 200, { ok: true, data: { app: 'xingqiyi', ...store.capabilities() } });
         } else {
           json(res, 404, { ok: false, message: 'Not Found' });
         }
