@@ -6,6 +6,7 @@ import com.xingqiyi.laundryphoto.data.model.UserDto
 import com.xingqiyi.laundryphoto.data.remote.ApiError
 import com.xingqiyi.laundryphoto.di.AppContainer
 import com.xingqiyi.laundryphoto.ui.base.BaseViewModel
+import com.xingqiyi.laundryphoto.util.ServerUrlNormalizer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -63,15 +64,34 @@ class LoginViewModel(private val container: AppContainer) : BaseViewModel() {
                 _testResult.tryEmit("请先填写服务器地址")
                 return@launchSafe
             }
-            container.settings.saveConnection(url, token)
-            container.applyConnection(url, token)
+
+            // 先规范化地址：漏写端口冒号是现场最高频的错误，
+            // 若不在这里补全，请求会打到 80 端口并得到一句难以自查的「数据返回异常」。
+            val normalized = when (val r = ServerUrlNormalizer.normalize(url)) {
+                is ServerUrlNormalizer.Result.Invalid -> {
+                    _testResult.tryEmit(r.reason)
+                    return@launchSafe
+                }
+                is ServerUrlNormalizer.Result.Ok -> {
+                    if (r.adjusted) {
+                        // 回填输入框，让用户看到系统实际用的是哪个地址
+                        serverUrl.value = r.baseUrl
+                    }
+                    r.baseUrl
+                }
+            }
+
+            container.settings.saveConnection(normalized, token)
+            container.applyConnection(normalized, token)
             try {
                 val msg = container.ping()
                 _testResult.tryEmit(msg)
             } catch (e: ApiError.Auth) {
                 _testResult.tryEmit("服务器可达，但连接码无效：${e.message}")
             } catch (e: ApiError) {
-                _testResult.tryEmit(e.message ?: "连接失败")
+                // 带上实际使用的地址，用户才能核对端口是否填对
+                val used = container.api.baseUrl.ifBlank { normalized }
+                _testResult.tryEmit("${e.message ?: "连接失败"}\n（实际连接：$used）")
             }
         }
     }
@@ -92,9 +112,22 @@ class LoginViewModel(private val container: AppContainer) : BaseViewModel() {
         }
         if (url.isBlank() || token.isBlank() || user.isBlank() || pwd.isBlank()) return
 
+        // 登录同样走规范化地址：漏写冒号时若不补全，会连到 80 端口的别的服务，
+        // 报出来的却是「账号或密码错误」，把人引到错误的方向上。
+        val normalized = when (val r = ServerUrlNormalizer.normalize(url)) {
+            is ServerUrlNormalizer.Result.Invalid -> {
+                emitToast(r.reason)
+                return
+            }
+            is ServerUrlNormalizer.Result.Ok -> {
+                if (r.adjusted) serverUrl.value = r.baseUrl
+                r.baseUrl
+            }
+        }
+
         launchSafe {
-            container.settings.saveConnection(url, token)
-            container.applyConnection(url, token)
+            container.settings.saveConnection(normalized, token)
+            container.applyConnection(normalized, token)
             try {
                 val logged = container.authRepository.login(user, pwd, remember.value)
                 container.refreshCapabilities()

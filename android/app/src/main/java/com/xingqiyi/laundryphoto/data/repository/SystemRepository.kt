@@ -39,6 +39,19 @@ class SystemRepository(private val api: ApiClient) {
     /**
      * 免鉴权探活：校验地址是否指向本系统服务端。
      * 用于「登录页填写服务器地址」时的即时校验，比等到登录失败再报错体验好得多。
+     *
+     * 除了网络可达性，还要确认**对方确实是本系统服务端**：
+     * 仅凭 HTTP 200 不够——连到路由器后台或其他 Web 服务同样会通，
+     * 但它们的返回体没有本系统的特征字段。因此这里显式校验 app 标识。
      */
-    suspend fun ping(): CapabilitiesDto = api.request { it.ping() }
+    suspend fun ping(): CapabilitiesDto {
+        val caps = api.request { it.ping() }
+        if (caps.app.isNotBlank() && !caps.app.startsWith("xingqiyi")) {
+            throw ApiError.Network(
+                "该地址返回的不是本系统服务端（app=${caps.app}）。" +
+                    "请确认端口是否为 ${com.xingqiyi.laundryphoto.util.ServerUrlNormalizer.DEFAULT_PORT}"
+            )
+        }
+        return caps
+    }
 }

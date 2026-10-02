@@ -17,8 +17,8 @@ android {
         // - 通知渠道（8.0 引入）是离线补传与强制更新提示的基础，低于 26 需额外兼容分支。
         minSdk = 26
         targetSdk = 34
-        versionCode = 10300
-        versionName = "1.3.0"
+        versionCode = 10301
+        versionName = "1.3.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

@@ -46,27 +46,44 @@ class ApiClient(
     val isConfigured: Boolean get() = service != null
 
     /**
-     * 配置（或切换）服务器地址。返回 false 表示地址非法，调用方提示用户即可。
-     * 地址变更后旧的 Retrofit 实例整体重建——baseUrl 是 Retrofit 不可变属性，
-     * 且令牌可能同时变更，重建比局部替换更不容易出错。
+     * 配置（或切换）服务器地址。
+     *
+     * 传入的原始串会先经 [normalizeBaseUrl] 规范化：现场最常见的填错是漏写端口冒号
+     * （`http://192.168.110.1717521`），会被解析成主机名 + 80 端口，
+     * 请求打到不相干的服务上返回 HTML，最终只报「数据返回异常」，极难自查。
+     * 规范化会把冒号补回来，让请求真正落到服务端端口上。
+     *
+     * @return 规范化后的 baseUrl；地址非法时返回 null，调用方提示用户即可。
      */
     fun configure(rawBaseUrl: String): Boolean {
-        val base = rawBaseUrl.trim().trimEnd('/')
-        if (base.isBlank()) {
+        val base = normalizeBaseUrl(rawBaseUrl)
+        if (base.isNullOrBlank()) {
             service = null
             baseUrl = ""
             return true
         }
         return try {
             // Retrofit 对 baseUrl 要求必须以 / 结尾且能被解析，非法地址在此直接抛异常
-            Retrofit.Builder().baseUrl("$base/").build()
-            service = buildService(base)
-            baseUrl = base
+            Retrofit.Builder().baseUrl(base).build()
+            service = buildService(base.removeSuffix("/"))
+            baseUrl = base.removeSuffix("/")
             true
         } catch (e: IllegalArgumentException) {
+            service = null
+            baseUrl = ""
             false
         }
     }
+
+    /**
+     * 把用户输入规整成 `scheme://host:port/`。
+     * 规则见 [ServerUrlNormalizer]；这里只做一层薄封装，便于单测与复用。
+     */
+    fun normalizeBaseUrl(raw: String): String? =
+        when (val r = com.xingqiyi.laundryphoto.util.ServerUrlNormalizer.normalize(raw)) {
+            is com.xingqiyi.laundryphoto.util.ServerUrlNormalizer.Result.Ok -> r.baseUrl
+            is com.xingqiyi.laundryphoto.util.ServerUrlNormalizer.Result.Invalid -> null
+        }
 
     fun rememberCapabilities(caps: com.xingqiyi.laundryphoto.data.model.CapabilitiesDto?) {
         capabilities = caps
@@ -141,18 +158,41 @@ class ApiClient(
         is HttpException -> when (e.code()) {
             401 -> ApiError.Auth("连接码无效或已被重置，请重新配置服务器连接码")
             403 -> ApiError.Auth("无权限访问该接口，请检查连接码与账号权限")
-            else -> ApiError.Network("服务端响应异常（HTTP ${e.code()}）")
+            // 服务端 404/500 也可能只是「地址指错了服务」，把状态码与地址一并带出
+            else -> ApiError.Network("服务端响应异常（HTTP ${e.code()}），请确认地址与端口指向本系统服务端")
         }
         // 以下顺序不可调换：UnknownHostException / SocketTimeoutException / ConnectException
         // 都是 IOException 的子类，必须先匹配具体类型，否则会退化成笼统的「网络异常」，
         // 界面就无法区分「地址写错」和「服务器没开」这两种最常见的现场问题。
-        is UnknownHostException -> ApiError.Network("无法连接服务器，请检查服务器地址是否正确")
+        is UnknownHostException ->
+            ApiError.Network("域名无法解析：$baseUrl。若目标是局域网电脑，请改用内网 IP（如 192.168.1.10:${com.xingqiyi.laundryphoto.util.ServerUrlNormalizer.DEFAULT_PORT}）")
         is SocketTimeoutException -> ApiError.Network("连接服务器超时，请检查网络或服务端是否在线")
         is ConnectException -> ApiError.Network("无法连接服务器，请确认服务端已启动且端口可达")
         is SocketException -> ApiError.Network("网络连接中断，请稍后重试")
-        is JsonParseException -> ApiError.Network("服务端返回数据异常，请确认地址指向的是本系统服务端")
+        is JsonParseException -> ApiError.Network(malformedResponseMessage())
         is IOException -> ApiError.Network("网络异常：${e.message ?: "未知错误"}")
         else -> ApiError.Network(e.message ?: "请求失败")
+    }
+
+    /**
+     * 响应体不是本系统 JSON 时的提示。
+     *
+     * 走到这里说明 TCP 连接是通的，但对方返回的内容 Gson 解析不了——
+     * 绝大多数情况是**地址或端口指错了服务**（打到了路由器后台、别的程序、
+     * 或 80 端口上的 Web 页面），而不是本系统服务端真的坏了。
+     * 因此提示里必须带上实际使用的地址与端口，否则用户无从核对。
+     */
+    private fun malformedResponseMessage(): String {
+        val authority = baseUrl.substringAfter("://").trimEnd('/')
+        val host = authority.substringBefore('/')
+        val portHint = if (authority.substringAfter("://", "").contains(':')) {
+            ""
+        } else {
+            "（当前未指定端口，实际访问的是 80 端口；本系统默认端口为 ${com.xingqiyi.laundryphoto.util.ServerUrlNormalizer.DEFAULT_PORT}）"
+        }
+        return "已连接到 $host，但对方返回的不是本系统的数据$portHint。" +
+            "请核对：① 地址格式应为 http://内网IP:${com.xingqiyi.laundryphoto.util.ServerUrlNormalizer.DEFAULT_PORT}（别漏了冒号）；" +
+            "② 该端口确实是本系统服务端，而非路由器/其他程序。"
     }
 
     /**
