@@ -50,24 +50,12 @@ web/
 
 renderer/styles.*.bak.css
 
-# ---------- Android 移动端 ----------
-# Gradle 构建产物：必须写 build/（带斜杠且不锚定根目录），
-# 只写 /build 只能匹配仓库根目录，会漏掉 android/app/build
-# 并把上千个生成文件误提交进来。
-build/
-.gradle/
-android/.gradle/
-android/local.properties
-
-# 签名密钥库：丢失则无法覆盖升级已安装的 App（用户须卸载重装、丢数据）。
-# 密钥只保存在本机 C:\Users\haoyuwei\.build\release.jks，绝不入库。
-*.jks
-*.keystore
-
-# 打包好的 APK：体积大，发布时走 GitHub Releases 附件
-release-apk/
-android/app/release/
-android/app/debug/
-
 # WorkBuddy 工作区数据（项目记忆与本地配置，非源码）
 .workbuddy/
+
+# ---------- 仓库边界 ----------
+# 本仓库**只放桌面端**（Electron + Vue 3）。移动端已迁出到独立仓库
+# Jace-Hao/xingqiyi-laundry-photo-android，其源码、构建产物（APK）、
+# 签名密钥库与版本号均随该仓库维护。若这里又出现 android/ 或 *.apk，
+# 说明有人把移动端产物放错了地方 —— 桌面端的自动更新会把它们当成
+# 新版本推给电脑用户（历史上正是这样误报过）。

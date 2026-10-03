@@ -27,6 +27,9 @@ const DATA_DIR = path.join(app.getPath('userData'), 'data');
 const DEFAULT_PHOTO_DIR = path.join(app.getPath('userData'), 'photos');
 const RENDERER_DIR = path.join(__dirname, '..', 'renderer');
 
+// 桌面端版本号的**唯一来源**：package.json 的 version。
+// 移动端版本号在另一个仓库（xingqiyi-laundry-photo-android）的 app/build.gradle.kts 里，
+// 两端各自维护、互不影响 —— 任何地方都不要再把两端版本写成同一个常量或互相推算。
 const APP_VERSION = require('../package.json').version;
 const PKG_NAME = require('../package.json').name;
 // 统一的软件更新文件夹：更新下载、备用更新扫描、强制推送三处共用这一个目录。
@@ -85,10 +88,20 @@ function migrateLegacyUpdateDirs() {
 // 照片目录是用户数据，往里写生成文件会扩大备份范围，也可能被同步盘反复上传。
 const THUMBS_DIR = path.join(app.getPath('userData'), 'thumbs');
 
-// 更新分发：通过 GitHub Releases 发布安装包，应用从这里检查最新版本。
+// 更新分发：桌面端安装包通过 GitHub Releases 发布，应用从这里检查最新版本。
+//
+// ⚠️ 这里指向的**必须是桌面端仓库**，且该仓库里只发布桌面端产物。
+// 移动端已拆到独立仓库 Jace-Hao/xingqiyi-laundry-photo-android（版本从 v1.0.0 重新计数）。
+// 历史上两端共用本仓库与同一套版本号，移动端发 v1.3.1 时，桌面端的更新检查
+// 会把「最高版本号」判成 1.3.1、并把 APK 当作安装包推给电脑用户 —— 因为原来的
+// 选版逻辑只看 tag 数字大小、不区分产物类型。拆库 + 下面的产物过滤共同堵住这个口子。
 // 仓库地址须与 package.json 的 repository 保持一致。
 const GITHUB_REPO = 'Jace-Hao/xingqiyi-laundry-photo';
 const GITHUB_RELEASES_PAGE = 'https://github.com/' + GITHUB_REPO + '/releases/latest';
+
+// 桌面端更新只认这几种产物（Windows 安装包）。
+// 移动端 APK 若哪天又混进这个仓库，会被 isDesktopAsset 过滤掉，不会再被当成新版本。
+const DESKTOP_ASSET_RE = /\.(exe|msi)$/i;
 
 // 国内加速通道：GitHub 直连不稳定时自动改用（下载安装包 / 检查更新共用）。
 // 如某个镜像失效，调整此列表即可（列表内保留至少一个可用镜像）。
@@ -1156,18 +1169,38 @@ function checkGitHubRelease() {
     }
     if (!list) return { ok: false, message: lastMessage };
     // 遍历全部正式发布，按版本号取最高者，
-    // 不依赖 GitHub「latest」的排序（其按发布时间排序，标签格式或发布顺序异常时会取错）
+    // 不依赖 GitHub「latest」的排序（其按发布时间排序，标签格式或发布顺序异常时会取错）。
+    //
+    // 两道过滤，缺一不可：
+    // ① tag 必须是纯版本号。移动端/其他平台的发布若以 android-v1.0.0 之类命名，
+    //    不再参与比较，避免「版本号最大」被一个不属于桌面端的发布抢走。
+    // ② 必须带桌面端安装包（.exe / .msi）。只有校验值或 APK 的发布不算数 ——
+    //    这正是过去「桌面端提示有新版本、点下去却下了个 APK」的直接原因。
     let best = null;
+    let scanned = 0;
     for (const rel of list) {
       if (rel.draft || rel.prerelease) continue;
+      scanned++;
       const tag = String(rel.tag_name || '').replace(/^v/i, '');
-      if (!tag) continue;
-      if (!best || store.compareVersions(tag, best.latestVersion) > 0) best = { latestVersion: tag, rel };
+      if (!/^\d+(\.\d+){0,3}$/.test(tag)) continue;
+      const assets = Array.isArray(rel.assets) ? rel.assets : [];
+      if (!assets.some((a) => DESKTOP_ASSET_RE.test(a.name || ''))) continue;
+      if (!best || store.compareVersions(tag, best.latestVersion) > 0) {
+        best = { latestVersion: tag, rel, assets };
+      }
     }
-    if (!best) return { ok: false, message: '仓库暂无正式发布' };
-    const assets = Array.isArray(best.rel.assets) ? best.rel.assets : [];
-    // 优先匹配 .exe 安装包，其次取任意第一个附件
-    const asset = assets.find((a) => /\.exe$/i.test(a.name || '')) || assets[0];
+    if (!best) {
+      return {
+        ok: false,
+        message: scanned
+          ? '仓库中暂无含桌面端安装包的正式发布'
+          : '仓库暂无正式发布'
+      };
+    }
+    // 优先 .exe（NSIS 安装向导），其次 .msi。绝不回退到「第一个附件」——
+    // 那种回退会把 APK、校验值文件当成安装包下载下来。
+    const asset = best.assets.find((a) => /\.exe$/i.test(a.name || '')) ||
+      best.assets.find((a) => DESKTOP_ASSET_RE.test(a.name || ''));
     return {
       ok: true,
       latestVersion: best.latestVersion,

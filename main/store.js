@@ -2127,7 +2127,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     };
   }
 
-  // ---------- 移动端补充能力（v1.3.0） ----------
+  // ---------- 移动端补充能力（配套移动端 App，首见于桌面端 v1.2.3） ----------
   // 以下四个方法为 Android 客户端新增，桌面端不调用，属于纯增量，不影响既有流程。
 
   /**

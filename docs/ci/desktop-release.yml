@@ -1,0 +1,95 @@
+name: 桌面端发布
+
+# 桌面端独立发布链路：只构建桌面端、只上传**本仓库**（xingqiyi-laundry-photo）
+# 的 .exe 安装包。移动端有自己仓库里的工作流，两端互不干涉。
+
+on:
+  push:
+    # 桌面端 tag 形如 v1.2.3。桌面端版本线为 1.2.x（1.2.3 → 1.2.4 → 1.2.5…），
+    # 与移动端仓库的 v1.0.0 起算的版本号没有任何关系。
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（形如 1.2.3，须与 package.json 的 version 一致）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建并发布安装包
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 读取版本号并校验与 tag 一致
+        id: ver
+        shell: bash
+        run: |
+          V=$(node -p "require('./package.json').version")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+          echo "package.json version = $V"
+          if [ "${{ github.event.inputs.version }}" != "" ] && [ "${{ github.event.inputs.version }}" != "$V" ]; then
+            echo "::error::手动输入的版本 ${{ github.event.inputs.version }} 与 package.json 的 $V 不一致"
+            exit 1
+          fi
+
+      - name: 校验 tag 与 package.json 一致
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [ "$TAG" != "${{ steps.ver.outputs.tag }}" ]; then
+            echo "::error::tag $TAG 与 package.json 的 version ${{ steps.ver.outputs.version }} 不一致"
+            exit 1
+          fi
+
+      # 发布隔离自检：确认仓库里没有移动端源码/产物、更新源指向桌面端仓库、
+      # 且自动更新选版带桌面产物过滤。这条红线一旦被破坏，桌面端又会把
+      # 移动端 APK 当成新版本推给用户。
+      - name: 发布隔离自检
+        run: node scripts/verify-release-isolation.js
+
+      # prebuild 会跑 copy-vue + sync-manual；
+      # sync-manual 同时校验 docs/manual.md 的版本号与 package.json 一致。
+      - name: 构建 Windows 安装包
+        env:
+          NODE_TLS_REJECT_UNAUTHORIZED: 0
+        run: npm run build
+
+      - name: 校验产物只含桌面端安装包
+        shell: bash
+        run: |
+          if ls dist/*.apk dist/*.aab >/dev/null 2>&1; then
+            echo "::error::dist/ 里出现了移动端产物，桌面端仓库不应发布 APK/AAB"
+            exit 1
+          fi
+          ls -la dist/*.exe
+
+      - name: 生成校验值
+        shell: bash
+        run: cd dist && sha256sum *.exe > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: 创建 Release 并上传附件
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: 桌面端 ${{ steps.ver.outputs.tag }}
+          body_path: docs/desktop-release/${{ steps.ver.outputs.tag }}-notes.md
+          draft: true
+          files: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

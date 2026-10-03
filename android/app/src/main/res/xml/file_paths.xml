@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!--
-  FileProvider 路径白名单。
-  只开放应用私有缓存下的 share/ 目录：分享出去的文件必须是本应用自己下载的，
-  不能把整个 cacheDir 或 filesDir 暴露出去（否则任意 App 都能借我们的 provider 读私有数据）。
--->
-<paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <cache-path name="shared_photos" path="share/" />
-</paths>

@@ -1,7 +1,7 @@
 {
   "name": "xingqiyi-laundry-photo",
   "productName": "星期衣精致洗衣衣物照片系统",
-  "version": "1.3.0",
+  "version": "1.2.3",
   "description": "洗衣店衣物拍照存档系统：客户端拍照/查询 + 管理端用户权限/日志/数据管理",
   "main": "main/main.js",
   "repository": {
@@ -14,7 +14,8 @@
     "sync-manual": "node scripts/sync-manual.js",
     "prebuild": "node scripts/copy-vue.js && node scripts/sync-manual.js",
     "build": "electron-builder --win",
-    "verify": "node scripts/verify-store.js && node scripts/verify-server.js && node scripts/verify-templates.js && node scripts/verify-watermark.js && node scripts/verify-thumb.js && node scripts/verify-credentials.js && node scripts/sync-manual.js && node scripts/verify-manual-sync.js && node scripts/verify-manual-render.js"
+    "release:desktop": "node scripts/release-desktop.js",
+    "verify": "node scripts/verify-store.js && node scripts/verify-server.js && node scripts/verify-templates.js && node scripts/verify-watermark.js && node scripts/verify-thumb.js && node scripts/verify-credentials.js && node scripts/sync-manual.js && node scripts/verify-manual-sync.js && node scripts/verify-manual-render.js && node scripts/verify-release-isolation.js"
   },
   "author": "星期衣精致洗衣",
   "license": "MIT",
