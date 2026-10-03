@@ -66,6 +66,19 @@
 -keepclassmembers class **$WhenMappings { <fields>; }
 -dontwarn kotlinx.coroutines.**
 
+# ---------- ZXing（扫码） ----------
+# 与上面的 Gson DTO 是同一类问题，务必一起理解：
+# ZXing 的 MultiFormatReader 在运行时按 BarcodeFormat 枚举挑选具体 Reader，
+# 且 Result 的元数据（ResultMetadataType）通过反射查表转成字符串。
+# R8 一旦把枚举常量或 Reader 实现类判为「无人引用」而删掉，
+# 表现不是崩溃，而是**扫什么都不出结果**——比崩溃更难查，因为日志里没有任何异常。
+# 因此这里保留整个 com.google.zxing 包（体积代价约 500KB，换离线扫码的确定性）。
+-keep class com.google.zxing.** { *; }
+-keep enum com.google.zxing.BarcodeFormat { *; }
+-keep enum com.google.zxing.ResultMetadataType { *; }
+-keep enum com.google.zxing.DecodeHintType { *; }
+-dontwarn com.google.zxing.**
+
 # Crash 时保留行号，便于定位（release 也保留，体积代价很小）
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile

@@ -111,6 +111,22 @@ class ProguardKeepRuleTest {
     }
 
     /**
+     * 扫码（ZXing）同样必须被保留，且故障形态比 Gson 更隐蔽。
+     *
+     * ZXing 的 MultiFormatReader 在运行时按 `BarcodeFormat` 枚举挑选具体 Reader。
+     * R8 若把枚举常量或未直接引用的 Reader 实现类判为「无人引用」而删掉，
+     * 表现**不是崩溃**，而是「扫任何码都没有反应、日志里一条异常都没有」——
+     * 比崩溃难查得多。
+     */
+    @Test
+    fun `ZXing 解码链被 proguard 完整保留`() {
+        val text = rules()
+        assertThat(text).contains("-keep class com.google.zxing.** { *; }")
+        assertThat(text).contains("-keep enum com.google.zxing.BarcodeFormat { *; }")
+        assertThat(text).contains("-keep enum com.google.zxing.DecodeHintType { *; }")
+    }
+
+    /**
      * 兜底：确认当前 DTO 在**未混淆**状态下确实能被 Gson 正确填充。
      *
      * 这条不测混淆（测不了），而是确保 DTO 本身的字段名与 JSON 键名一致。

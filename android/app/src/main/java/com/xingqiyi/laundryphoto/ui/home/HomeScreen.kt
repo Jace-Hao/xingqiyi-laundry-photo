@@ -22,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -59,6 +60,7 @@ fun HomeScreen(
     user: com.xingqiyi.laundryphoto.data.model.UserDto,
     thumbUrlOf: (RecordDto) -> String,
     onCapture: () -> Unit,
+    onScanCapture: () -> Unit,
     onQuery: () -> Unit,
     onLogs: () -> Unit,
     onUsers: () -> Unit,
@@ -148,27 +150,38 @@ fun HomeScreen(
             }
 
             // ---------- 快捷入口 ----------
+            // 按角色拼出可见功能再两两分行：拍照角色有 4 个入口、查询角色只有 1 个，
+            // 写死两行会在角色不同时出现半行的空位或孤零零一个卡片
             Text("常用功能", style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(Dimens.CardGap)) {
+            val actions = buildList {
                 if (role.capture) {
-                    QuickAction("衣物拍照", Icons.Default.PhotoCamera, Modifier.weight(1f), onCapture)
+                    // 扫码拍照放在第一位：扫码连拍是门店最高频的操作
+                    add(QuickItem("扫码拍照", Icons.Default.QrCodeScanner, onScanCapture))
+                    add(QuickItem("衣物拍照", Icons.Default.PhotoCamera, onCapture))
                 }
-                QuickAction("订单查询", Icons.Default.Search, Modifier.weight(1f), onQuery)
-            }
-            Spacer(Modifier.height(Dimens.CardGap))
-            Row(horizontalArrangement = Arrangement.spacedBy(Dimens.CardGap)) {
+                add(QuickItem("订单查询", Icons.Default.Search, onQuery))
                 if (role.viewStoreLogs) {
-                    QuickAction(
-                        if (role.manageUsers) "操作日志" else "本店日志",
-                        Icons.Default.History,
-                        Modifier.weight(1f),
-                        onLogs
+                    add(
+                        QuickItem(
+                            if (role.manageUsers) "操作日志" else "本店日志",
+                            Icons.Default.History,
+                            onLogs
+                        )
                     )
                 }
                 if (role.manageUsers) {
-                    QuickAction("用户管理", Icons.Default.Groups, Modifier.weight(1f), onUsers)
+                    add(QuickItem("用户管理", Icons.Default.Groups, onUsers))
                 }
+            }
+            actions.chunked(2).forEach { row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(Dimens.CardGap)) {
+                    row.forEach { item ->
+                        QuickAction(item.label, item.icon, Modifier.weight(1f), item.onClick)
+                    }
+                    if (row.size == 1) Spacer(Modifier.weight(1f))
+                }
+                Spacer(Modifier.height(Dimens.CardGap))
             }
 
             // ---------- 最近存档（仅系统管理员） ----------
@@ -227,6 +240,12 @@ fun HomeScreen(
         }
     }
 }
+
+private data class QuickItem(
+    val label: String,
+    val icon: ImageVector,
+    val onClick: () -> Unit
+)
 
 @Composable
 private fun QuickAction(

@@ -17,8 +17,9 @@ android {
         // - 通知渠道（8.0 引入）是离线补传与强制更新提示的基础，低于 26 需额外兼容分支。
         minSdk = 26
         targetSdk = 34
-        versionCode = 10301
-        versionName = "1.3.1"
+        // v1.4.0：新增「拍照扫码」（扫码 → 全屏连拍）
+        versionCode = 10400
+        versionName = "1.4.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -141,6 +142,13 @@ dependencies {
     implementation("com.squareup.retrofit2:retrofit:2.11.0")
     implementation("com.squareup.retrofit2:converter-gson:2.11.0")
     implementation("com.google.code.gson:gson:2.11.0")
+
+    // ---------- 扫码 ----------
+    // 选 ZXing 而非 ML Kit 的理由（关键，改动前请先读 BarcodeDecoder 的类注释）：
+    // ML Kit 的 barcode-scanning 依赖 Google Play Services 动态下发模型，
+    // 而本系统的门店设备大量是无 GMS 的国产平板/收银机，装上去识别直接不可用且不报错。
+    // ZXing 是纯 Java，随 APK 打包离线可用，代价仅约 600KB。
+    implementation("com.google.zxing:core:3.5.3")
 
     // ---------- 图片加载 / EXIF ----------
     implementation("io.coil-kt:coil-compose:2.6.0")

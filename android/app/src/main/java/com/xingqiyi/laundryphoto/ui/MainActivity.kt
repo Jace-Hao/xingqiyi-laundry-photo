@@ -50,6 +50,8 @@ import com.xingqiyi.laundryphoto.data.remote.SessionMonitor
 import com.xingqiyi.laundryphoto.di.AppContainer
 import com.xingqiyi.laundryphoto.sync.Notifier
 import com.xingqiyi.laundryphoto.sync.SyncManager
+import com.xingqiyi.laundryphoto.ui.burst.BurstCaptureScreen
+import com.xingqiyi.laundryphoto.ui.burst.BurstCaptureViewModel
 import com.xingqiyi.laundryphoto.ui.capture.CaptureScreen
 import com.xingqiyi.laundryphoto.ui.capture.CaptureViewModel
 import com.xingqiyi.laundryphoto.ui.detail.RecordDetailScreen
@@ -64,6 +66,8 @@ import com.xingqiyi.laundryphoto.ui.overview.OverviewScreen
 import com.xingqiyi.laundryphoto.ui.overview.OverviewViewModel
 import com.xingqiyi.laundryphoto.ui.query.QueryScreen
 import com.xingqiyi.laundryphoto.ui.query.QueryViewModel
+import com.xingqiyi.laundryphoto.ui.scan.ScanScreen
+import com.xingqiyi.laundryphoto.ui.scan.ScanViewModel
 import com.xingqiyi.laundryphoto.ui.settings.SettingsScreen
 import com.xingqiyi.laundryphoto.ui.settings.SettingsViewModel
 import com.xingqiyi.laundryphoto.ui.theme.ThemeMode
@@ -121,6 +125,12 @@ private object Routes {
     const val SETTINGS = "settings"
     const val OVERVIEW = "overview"
     const val DETAIL = "detail/{id}"
+    /** 扫码：识别衣物条码，结果作为下一页的入参 */
+    const val SCAN = "scan"
+    /** 连拍：入参为扫码得到的条码 */
+    const val BURST = "burst/{barcode}"
+    fun burst(barcode: String) = "burst/${android.net.Uri.encode(barcode)}"
+    // 扫码页与连拍页都是全屏相机页，不显示底部导航
     val BOTTOM = setOf(HOME, CAPTURE, QUERY, LOGS, SETTINGS)
 }
 
@@ -252,6 +262,7 @@ private fun AppRoot(
                     user = currentUser!!,
                     thumbUrlOf = { rec -> container.recordRepository.thumbUrl(rec) },
                     onCapture = { navController.navigate(Routes.CAPTURE) },
+                    onScanCapture = { navController.navigate(Routes.SCAN) },
                     onQuery = { navController.navigate(Routes.QUERY) },
                     onLogs = { navController.navigate(Routes.LOGS) },
                     onUsers = { navController.navigate(Routes.USERS) },
@@ -268,6 +279,39 @@ private fun AppRoot(
                     onBack = { navController.popBackStack() },
                     onSaved = {
                         // 保存成功（无论在线还是离线入队）统一回到首页，首页会显示待同步角标
+                        navController.navigate(Routes.HOME) {
+                            popUpTo(navController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    }
+                )
+            }
+
+            // ---------- 扫码（连拍流程第一步） ----------
+            composable(Routes.SCAN) {
+                val vm = viewModel { ScanViewModel() }
+                ScanScreen(
+                    vm = vm,
+                    onResult = { barcode -> navController.navigate(Routes.burst(barcode)) },
+                    onBack = { navController.popBackStack() }
+                )
+            }
+
+            // ---------- 全屏连拍（扫码成功后进入） ----------
+            composable(
+                Routes.BURST,
+                arguments = listOf(navArgument("barcode") { type = NavType.StringType })
+            ) { backStack ->
+                val barcode = backStack.arguments?.getString("barcode").orEmpty()
+                val vm = viewModel { BurstCaptureViewModel(container, barcode) }
+                BurstCaptureScreen(
+                    vm = vm,
+                    onBack = { navController.popBackStack() },
+                    onFinish = {
+                        // 与旧拍照页一致：结束后回首页，首页会显示待同步角标
                         navController.navigate(Routes.HOME) {
                             popUpTo(navController.graph.findStartDestination().id) {
                                 saveState = true

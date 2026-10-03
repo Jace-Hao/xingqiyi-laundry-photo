@@ -8,6 +8,15 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- 拍照录入（拍照账号/系统管理员可用；查询类角色不会触发申请） -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!--
+      仅 Android 9（API 28）及以下「连拍照片同时存入系统相册」时需要：
+      Android 10 起写公共相册走 MediaStore + RELATIVE_PATH，不需要任何存储权限；
+      再往上的 Android 13 又换成细粒度媒体权限，同样不适用于「自己写入」的场景。
+      因此把这条权限用 maxSdkVersion=28 封死，避免在高版本上白要一个用户看得见却用不到的权限。
+    -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
     <!-- Android 8.0+ 通知必须走渠道；离线补传、强制更新、被顶下线都依赖通知 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
