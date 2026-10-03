@@ -1552,7 +1552,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       fs.mkdirSync(dir, { recursive: true });
       return fs
         .readdirSync(dir)
-        .filter((f) => /\.(exe|zip|msi)$/i.test(f))
+        .filter((f) => /\.(exe|zip|msi|apk)$/i.test(f))
         .map((f) => {
           let size = 0;
           try {
@@ -1574,6 +1574,148 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     const name = String(fileName || '').trim();
     if (!name || name.includes('..') || /[\\/]/.test(name)) return '';
     return name;
+  }
+
+  // ---------- 移动端在线更新专用查询（桌面端 v1.2.4 起） ----------
+  // 为什么必须单独开一个接口，而不是让移动端去过滤 checkUpdates() 的返回值：
+  // checkUpdates() 只返回「版本号最高的那一个文件」且**不看扩展名**。更新文件夹里
+  // 同时放着 xxx-1.2.4.exe 与 xxx-android-1.1.0.apk 时，它返回的一定是 .exe——
+  // 移动端拿到的响应里根本没有其它文件的存在线索，所谓「客户端自己过滤」在结构上不成立。
+  // 这里只扫 .apk，并按客户端上报的 currentVersion 计算 hasUpdate。
+
+  const MOBILE_APK_VERSION_RE = /(\d+\.\d+\.\d+)/;
+  // sha256 缓存：每次检查都把 20MB 文件流式读一遍是不行的——
+  // 一个门店几十台手机同时上班打卡的那一分钟会把磁盘 IO 打满。
+  // 缓存键取 name|size|mtimeMs 三者组合：任一变化都可认为内容已变。
+  const apkShaCache = new Map();
+  const APK_SHA_CACHE_MAX = 8;
+  const APK_NOTES_READ_MAX_BYTES = 200 * 1024;   // 最多读 200KB
+  const APK_NOTES_RETURN_MAX_CHARS = 2000;       // 最多返回 2000 字符
+
+  /**
+   * 流式计算文件 sha256（带缓存）。
+   * 任何失败（文件被占用、中途被删、权限）一律返回空串：**没有哈希不阻断更新**，
+   * 由移动端降级为跳过哈希校验；这里绝不抛异常把整个 check 打成 500。
+   */
+  function apkSha256(abs, stat) {
+    const key = `${path.basename(abs)}|${stat.size}|${Math.floor(stat.mtimeMs)}`;
+    const hit = apkShaCache.get(key);
+    if (hit) return hit;
+    try {
+      const h = crypto.createHash('sha256');
+      const fd = fs.openSync(abs, 'r');
+      const buf = Buffer.allocUnsafe(64 * 1024);
+      try {
+        let n = 0;
+        while ((n = fs.readSync(fd, buf, 0, buf.length, null)) > 0) {
+          h.update(buf.subarray(0, n));
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+      const hex = h.digest('hex');
+      if (apkShaCache.size >= APK_SHA_CACHE_MAX) {
+        apkShaCache.delete(apkShaCache.keys().next().value); // Map 保持插入序：删最早一条
+      }
+      apkShaCache.set(key, hex);
+      return hex;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  /**
+   * 读取更新说明：优先同名 .md，其次同名 .json 的 notes 字段，都没有返回空串。
+   * basename 取 apk 文件名去扩展名，**禁止拼接路径**——旁挂文件名由我们自己派生，
+   * 即使 apk 名被做成奇怪的样子，也只会在同一个目录里找。
+   */
+  function readApkNotes(dir, apkName) {
+    const base = path.basename(apkName, path.extname(apkName));
+    const md = path.join(dir, base + '.md');
+    try {
+      const st = fs.statSync(md);
+      if (st.isFile()) {
+        const fd = fs.openSync(md, 'r');
+        try {
+          const buf = Buffer.allocUnsafe(Math.min(st.size, APK_NOTES_READ_MAX_BYTES));
+          fs.readSync(fd, buf, 0, buf.length, 0);
+          return { notes: buf.toString('utf8').slice(0, APK_NOTES_RETURN_MAX_CHARS), notesSource: 'md' };
+        } finally { fs.closeSync(fd); }
+      }
+    } catch (e) { /* 没有 .md 是常态，继续找 .json */ }
+    const js = path.join(dir, base + '.json');
+    try {
+      const st = fs.statSync(js);
+      if (st.isFile()) {
+        const raw = fs.readFileSync(js, 'utf8').slice(0, APK_NOTES_READ_MAX_BYTES);
+        const parsed = JSON.parse(raw);
+        const notes = parsed && typeof parsed.notes === 'string' ? parsed.notes : '';
+        return { notes: notes.slice(0, APK_NOTES_RETURN_MAX_CHARS), notesSource: notes ? 'json' : '' };
+      }
+    } catch (e) { /* json 不存在或格式不对：等同于没有说明 */ }
+    return { notes: '', notesSource: '' };
+  }
+
+  /**
+   * 移动端在线更新查询。
+   *
+   * @param {object} p  { platform, appId, currentVersion, currentCode }
+   * @returns {{supported:boolean, hasPackage:boolean, fileName:string, version:string,
+   *            size:number, sha256:string, notes:string, notesSource:string,
+   *            hasUpdate:boolean, currentVersion:string}}
+   *
+   * 契约要点：
+   * - **永远返回 supported=true**（没有 APK 是正常状态，不是错误）；移动端据此静默，不弹任何东西；
+   * - `sha256` 算不出来就用空串，移动端据此跳过哈希校验——绝不因为缺哈希阻断更新；
+   * - `size` 取不到就是 0，移动端遇到 0 跳过大小校验；
+   * - `hasUpdate` 用 **params.currentVersion**（客户端上报）与 compareVersions 比较，
+   *   与桌面端自身 appVersion 完全解耦。
+   */
+  function checkMobileUpdate(p = {}) {
+    const dir = getUpdateDir();
+    const currentVersion = String((p && p.currentVersion) || '');
+    let best = null;              // {name, version, size}
+    try {
+      const files = fs.readdirSync(dir);
+      for (const f of files) {
+        if (!/\.apk$/i.test(f)) continue;           // 只看 APK：跨端互不干扰的关键一行
+        const m = f.match(MOBILE_APK_VERSION_RE);
+        if (!m) continue;                            // 文件名不带版本号的一律忽略
+        let st = null;
+        try { st = fs.statSync(path.join(dir, f)); } catch (e) { continue; }
+        if (!st || !st.isFile()) continue;
+        if (!best || compareVersions(m[1], best.version) > 0) {
+          best = { name: f, version: m[1], size: st.size, mtimeMs: st.mtimeMs };
+        }
+      }
+    } catch (e) {
+      /* 更新文件夹不存在 / 不可读：等价于没有可用包 */
+    }
+
+    if (!best) {
+      return {
+        supported: true, hasPackage: false,
+        fileName: '', version: '', size: 0, sha256: '', notes: '', notesSource: '',
+        hasUpdate: false, currentVersion
+      };
+    }
+
+    const sha = best.size > 0
+      ? apkSha256(path.join(dir, best.name), { size: best.size, mtimeMs: best.mtimeMs })
+      : '';
+    const { notes, notesSource } = readApkNotes(dir, best.name);
+    return {
+      supported: true,
+      hasPackage: true,
+      fileName: best.name,
+      version: best.version,
+      size: best.size,
+      sha256: sha,
+      notes,
+      notesSource,
+      hasUpdate: !!currentVersion && compareVersions(best.version, currentVersion) > 0,
+      currentVersion
+    };
   }
 
   function getForceUpdate() {
@@ -2311,7 +2453,11 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       // /photo 支持 ?w= 缩略图
       thumb: true,
       // /photo 支持通过查询参数传递连接码（移动端图片加载器无法附加自定义头）
-      photoTokenQuery: true
+      photoTokenQuery: true,
+      // 移动端在线更新专用查询（system/checkMobileUpdate）：只扫 .apk，
+      // 与 checkUpdates()（只返回版本号最高的文件、不看扩展名）分开，避免桌面端 .exe 遮蔽手机版 .apk。
+      // 移动端据此免发一次注定失败的探测请求；字段缺失时仍按「直接调用」处理，不误判。
+      mobileUpdate: true
     }
   };
   function capabilities() {
@@ -2372,6 +2518,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     getUpdateDir,
     compareVersions,
     listUpdateFiles,
+    checkMobileUpdate,
     getForceUpdate,
     setForceUpdate,
     resolveUpdateFile,

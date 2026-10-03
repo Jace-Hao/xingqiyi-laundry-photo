@@ -127,6 +127,10 @@ function startServer(store, opts = {}) {
       // 能力集：移动端据此判断服务端是否支持原始上传等新特性（老服务端返回「接口不存在」即降级）
       'system/capabilities': () => store.capabilities(),
       'system/checkUpdate': () => store.checkUpdates(),
+      // 移动端在线更新查询（v1.2.4 起）：只扫更新目录里的 .apk，与上面的 checkUpdates 互不干扰。
+      // 老服务端命中不到该路由时返回「接口不存在」→ 移动端 ApiClient 抛 ApiError.Unsupported → 静默降级，
+      // 不打扰店员，也不需要额外开关。
+      'system/checkMobileUpdate': () => store.checkMobileUpdate(body),
       'system/settings': () => store.updateSystemSettings(sessionToken, body),
       'system/resetToken': () => store.resetApiToken(sessionToken),
       'system/photoPath': () => store.setPhotoPath(sessionToken, body.path),

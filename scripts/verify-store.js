@@ -1238,6 +1238,105 @@ check('条码批量改号：统一改码 + 照片随迁 + 编号重排 + 无权�
 
 fs.rmSync(renDir, { recursive: true, force: true });
 
+// ---------- 移动端在线更新查询 checkMobileUpdate（v1.2.4） ----------
+// 重点回归一条真实事故：更新目录里同时放着桌面端 .exe 与手机端 .apk 时，
+// checkUpdates() 只会返回「版本号最高的那一个」且不看扩展名，.exe 会把 .apk 遮蔽掉，
+// 导致手机端永远查不到自己的安装包。checkMobileUpdate 必须只认 .apk。
+console.log('\n[移动端更新] checkMobileUpdate');
+const updDir = path.join(tmpDir, 'mobile-updates');
+fs.mkdirSync(updDir, { recursive: true });
+const mStore = createStore({
+  dataDir: path.join(tmpDir, 'm-data'),
+  defaultPhotoDir: path.join(tmpDir, 'm-photos'),
+  updateDir: updDir,
+  appVersion: '1.2.4',
+  photoScheme: 'xqy-photo'
+});
+
+check('空目录：有包=false 且 supported=true（没有 APK 是正常状态，不是错误）', () => {
+  const r = mStore.checkMobileUpdate({ currentVersion: '1.0.0' });
+  if (r.supported !== true) throw new Error('supported 应恒为 true');
+  if (r.hasPackage !== false) throw new Error('空目录不应有包');
+  if (r.hasUpdate !== false) throw new Error('空目录不应提示有更新');
+  if (r.sha256 !== '' || r.size !== 0) throw new Error('空目录不应带 size/sha');
+});
+
+check('返回字段齐全且与移动端 DTO 契约一致', () => {
+  const r = mStore.checkMobileUpdate({});
+  for (const k of ['supported', 'hasPackage', 'fileName', 'version', 'size', 'sha256', 'notes', 'notesSource', 'hasUpdate', 'currentVersion']) {
+    if (!(k in r)) throw new Error('缺字段: ' + k);
+  }
+});
+
+check('跨端共存：桌面 .exe 版本更高也必须返回 .apk（不返回 exe）', () => {
+  fs.writeFileSync(path.join(updDir, 'xingqiyi-desktop-9.9.9.exe'), 'exe-bytes');
+  fs.writeFileSync(path.join(updDir, 'xingqiyi-android-1.1.0.apk'), 'apk-bytes');
+  const r = mStore.checkMobileUpdate({ currentVersion: '1.0.0' });
+  if (!/\.apk$/i.test(r.fileName)) throw new Error('应返回 apk，实际: ' + r.fileName);
+  if (r.version !== '1.1.0') throw new Error('版本应取 apk 的 1.1.0，实际: ' + r.version);
+  if (r.hasUpdate !== true) throw new Error('1.1.0 > 1.0.0 应提示有更新');
+});
+
+check('sha256 与 crypto 一次性计算一致', () => {
+  const crypto = require('crypto');
+  const want = crypto.createHash('sha256').update('apk-bytes').digest('hex');
+  const r = mStore.checkMobileUpdate({ currentVersion: '1.0.0' });
+  if (r.sha256 !== want) throw new Error('sha 不一致: ' + r.sha256 + ' != ' + want);
+  if (r.size !== Buffer.byteLength('apk-bytes')) throw new Error('size 不一致');
+});
+
+check('更新说明三级降级：同名 .md 优先，其次 .json，最后空串', () => {
+  fs.writeFileSync(path.join(updDir, 'xingqiyi-android-1.1.0.md'), '修复弱网断流');
+  let r = mStore.checkMobileUpdate({ currentVersion: '1.0.0' });
+  if (r.notes !== '修复弱网断流' || r.notesSource !== 'md') throw new Error('未读到 .md: ' + JSON.stringify(r));
+  fs.unlinkSync(path.join(updDir, 'xingqiyi-android-1.1.0.md'));
+  fs.writeFileSync(path.join(updDir, 'xingqiyi-android-1.1.0.json'), JSON.stringify({ notes: '来自 json' }));
+  r = mStore.checkMobileUpdate({ currentVersion: '1.0.0' });
+  if (r.notes !== '来自 json' || r.notesSource !== 'json') throw new Error('未读到 .json: ' + JSON.stringify(r));
+  fs.unlinkSync(path.join(updDir, 'xingqiyi-android-1.1.0.json'));
+  r = mStore.checkMobileUpdate({ currentVersion: '1.0.0' });
+  if (r.notes !== '' || r.notesSource !== '') throw new Error('无旁挂文件应为空');
+});
+
+check('多个 .apk 时取版本号最高者', () => {
+  fs.writeFileSync(path.join(updDir, 'xingqiyi-android-1.3.0.apk'), 'newer');
+  const r = mStore.checkMobileUpdate({ currentVersion: '1.0.0' });
+  if (r.version !== '1.3.0') throw new Error('应取 1.3.0，实际: ' + r.version);
+  fs.unlinkSync(path.join(updDir, 'xingqiyi-android-1.3.0.apk'));
+});
+
+check('同版本 / 未上报版本 → hasUpdate=false（不做无意义的重复提示）', () => {
+  if (mStore.checkMobileUpdate({ currentVersion: '1.1.0' }).hasUpdate !== false) throw new Error('同版本不应提示');
+  if (mStore.checkMobileUpdate({}).hasUpdate !== false) throw new Error('未上报版本不应提示');
+  if (mStore.checkMobileUpdate({ currentVersion: '9.9.9' }).hasUpdate !== false) throw new Error('客户端更新时不应提示');
+});
+
+check('不带版本号的 .apk 一律忽略', () => {
+  fs.writeFileSync(path.join(updDir, 'xingqiyi-latest.apk'), 'nover');
+  const r = mStore.checkMobileUpdate({ currentVersion: '1.0.0' });
+  if (r.version !== '1.1.0') throw new Error('无版本号文件应被忽略，实际: ' + r.version);
+  fs.unlinkSync(path.join(updDir, 'xingqiyi-latest.apk'));
+});
+
+check('文件名为穿越载荷时只在自己的目录里找旁挂说明（不越界）', () => {
+  // 文件名带 ../ 时 path.basename 已被 readApkNotes 兜住，这里只验证不抛异常
+  const r = mStore.checkMobileUpdate({ currentVersion: '1.0.0' });
+  if (typeof r.notes !== 'string') throw new Error('notes 应为字符串');
+});
+
+check('listUpdateFiles 也列出 .apk（桌面端下拉能选中手机包）', () => {
+  const names = mStore.listUpdateFiles().map((x) => x.name);
+  if (!names.some((n) => /\.apk$/i.test(n))) throw new Error('未列出 apk: ' + names.join(','));
+  if (!names.some((n) => /\.exe$/i.test(n))) throw new Error('未列出 exe: ' + names.join(','));
+});
+
+check('能力集声明 mobileUpdate=true（移动端据此免发一次注定失败的探测）', () => {
+  const f = mStore.capabilities().features;
+  if (f.mobileUpdate !== true) throw new Error('features.mobileUpdate 应为 true');
+});
+
+fs.rmSync(updDir, { recursive: true, force: true });
+
 console.log('\n结果：' + passed + ' 通过，' + failed + ' 失败');
 fs.rmSync(tmpDir, { recursive: true, force: true });
 process.exit(failed ? 1 : 0);

@@ -179,6 +179,47 @@ const tinyJpeg =
   // 非安装包文件不应出现在可选列表中
   fs.writeFileSync(path.join(updateDir, 'readme.txt'), 'ignore me', 'utf8');
 
+  // ---------- 移动端在线更新端到端（v1.2.4） ----------
+  // 关键回归：上面的 setup-9.9.9.exe 版本号远高于手机包。桌面端 checkUpdate 只会返回它，
+  // 而手机端必须通过 system/checkMobileUpdate 拿到自己的 .apk，否则「桌面端把手机端更新遮蔽」
+  // 会让移动端永远查不到安装包（PRD §12.1 首条事故）。
+  const mobApkName = 'xingqiyi-laundry-photo-android-1.1.0.apk';
+  const mobApkBody = 'FAKE-APK-' + 'y'.repeat(4096);
+  fs.writeFileSync(path.join(updateDir, mobApkName), mobApkBody, 'utf8');
+  fs.writeFileSync(path.join(updateDir, 'xingqiyi-laundry-photo-android-1.1.0.md'), '修复弱网断流与安装回执丢失', 'utf8');
+
+  const mobNoApkProbe = store.checkMobileUpdate({ currentVersion: '1.0.0' });
+  check('checkMobileUpdate 只认 .apk（不被高版本桌面 .exe 遮蔽）',
+    mobNoApkProbe.hasPackage === true && /\.apk$/i.test(mobNoApkProbe.fileName),
+    JSON.stringify(mobNoApkProbe));
+
+  const mobResp = await call('system/checkMobileUpdate', { currentVersion: '1.0.0' }, session);
+  check('system/checkMobileUpdate 路由可用（老服务端缺该接口时移动端静默降级）',
+    mobResp.body.ok === true, JSON.stringify(mobResp.body).slice(0, 200));
+  check('跨端共存时走 API 通道返回的是 apk 而非 exe',
+    mobResp.body.ok === true && /\.apk$/i.test(String(mobResp.body.data.fileName || '')),
+    JSON.stringify(mobResp.body.data));
+
+  const mobData = mobResp.body.data || {};
+  check('移动端响应字段齐全（与移动端 DTO 契约一致）',
+    ['supported', 'hasPackage', 'fileName', 'version', 'size', 'sha256', 'notes', 'notesSource', 'hasUpdate', 'currentVersion']
+      .every((k) => k in mobData), JSON.stringify(mobData));
+  check('移动端响应带正确 sha256（服务端流式计算）',
+    typeof mobData.sha256 === 'string' && mobData.sha256.length === 64, 'sha=' + mobData.sha256);
+  check('移动端响应读取到旁挂 .md 更新说明',
+    mobData.notesSource === 'md' && /弱网断流/.test(String(mobData.notes || '')), JSON.stringify(mobData.notes));
+  check('手机端版本低于服务端包时提示有更新', mobData.hasUpdate === true, JSON.stringify(mobData));
+  check('同版本不重复提示更新',
+    (await call('system/checkMobileUpdate', { currentVersion: '1.1.0' }, session)).body.data.hasUpdate === false);
+  check('桌面端 checkUpdate 不受影响（仍返回最高版本的 .exe）',
+    /\.exe$/i.test(String((await call('system/checkUpdate', {}, session)).body.data.latestFile || '')),
+    JSON.stringify((await call('system/checkUpdate', {}, session)).body.data));
+  check('能力集声明 mobileUpdate=true',
+    (await call('system/capabilities', {}, session)).body.data.features.mobileUpdate === true);
+  // 清理手机包，避免影响后续桌面端强推用例对 files 数量的断言
+  fs.unlinkSync(path.join(updateDir, mobApkName));
+  fs.unlinkSync(path.join(updateDir, 'xingqiyi-laundry-photo-android-1.1.0.md'));
+
   const fuEmpty = await call('system/forceUpdate', {}, session);
   check('查询强制推送设置', fuEmpty.body.ok === true && fuEmpty.body.data.enabled === false);
   check('推送设置返回安装包列表且过滤非安装包', Array.isArray(fuEmpty.body.data.files) &&
