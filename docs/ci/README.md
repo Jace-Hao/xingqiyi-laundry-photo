@@ -1,34 +1,17 @@
-# CI 工作流（待激活）
+# CI 工作流
 
-本目录存放 GitHub Actions 工作流文件的**源稿**。它们放在这里而不是
-`.github/workflows/`，是因为推送工作流文件需要 PAT 具备 `workflow` 作用域，
-当前发布用的令牌只有 `repo` 作用域，GitHub 会直接拒绝：
+工作流源文件在 `.github/workflows/desktop-release.yml`（本目录只留说明文档）。
 
-```
-! [remote rejected] main -> main
-  (refusing to allow a Personal Access Token to create or update workflow
-   `.github/workflows/desktop-release.yml` without `workflow` scope)
-```
-
-## 激活方式（任选其一）
-
-**A. 给令牌加 `workflow` 作用域**（推荐，一次到位）
-
-1. GitHub → Settings → Developer settings → Personal access tokens → 选该令牌
-2. 勾选 `workflow`，保存
-3. 把文件放到正式位置并推送：
-
-   ```bash
-   mkdir -p .github/workflows
-   git mv docs/ci/desktop-release.yml .github/workflows/desktop-release.yml
-   git commit -m "ci: 启用桌面端发布工作流"
-   git push origin main
-   ```
-
-**B. 在网页端直接新建**
-
-打开仓库的 Actions 页 → New workflow → set up a workflow yourself，
-把 yml 内容粘进去（网页端创建不受令牌作用域限制）。
+> 历史备注：推送工作流文件需要 PAT 具备 `workflow` 作用域。若你的令牌只有 `repo`
+> 作用域，GitHub 会直接拒绝推送：
+>
+> ```
+> ! [remote rejected] main -> main
+>   (refusing to allow a Personal Access Token to create or update workflow
+>    `.github/workflows/desktop-release.yml` without `workflow` scope)
+> ```
+>
+> 解决办法二选一：给令牌补勾 `workflow`，或在仓库 Actions 页用网页端新建（网页端不受令牌作用域限制）。
 
 ## 工作流说明
 
@@ -42,6 +25,12 @@
 - 上传到**本仓库**的 Release（草稿，人工确认后发布）
 
 移动端有自己仓库里的同构工作流 `android-release.yml`，两端互不干涉。
+
+## 发布说明文件
+
+Release 正文取自 `docs/desktop-release/v<版本号>-notes.md`，例如
+`docs/desktop-release/v1.2.3-notes.md`。发版前先建好这个文件，否则工作流会因为
+`body_path` 找不到而失败。
 
 ## 本地发版
 
