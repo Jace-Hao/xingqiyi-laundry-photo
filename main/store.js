@@ -1523,6 +1523,11 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     try {
       const files = fs.readdirSync(dir);
       for (const f of files) {
+        // 桌面端更新检测永远不碰手机安装包（拆库前那个老 bug 的翻版）：
+        // 原逻辑「扫全部文件、不看扩展名、按版本号取最高」，一旦桌面端版本低于手机端版本，
+        // 就会把 .apk 当成电脑安装包推给所有桌面用户。这里从代码层根治，
+        // 不依赖「桌面端版本号必须始终高于手机端」这种运维文档约定。
+        if (/\.apk$/i.test(f)) continue;
         const m = f.match(/(\d+\.\d+\.\d+)/);
         if (!m) continue;
         if (!latest || compareVersions(m[1], latest) > 0) {

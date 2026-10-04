@@ -1337,6 +1337,89 @@ check('能力集声明 mobileUpdate=true（移动端据此免发一次注定失�
 
 fs.rmSync(updDir, { recursive: true, force: true });
 
+// ---------- 桌面端选版防护：checkUpdates() 必须忽略 .apk ----------
+// 这是「拆库前老 bug」的翻版：checkUpdates() 原本「扫全部文件、不看扩展名、按版本号取最高」。
+// 现在桌面端 1.2.4 > 手机端 1.1.0 只是**碰巧**安全；一旦桌面端停在 1.2.4 而手机端发到 1.3.0，
+// 桌面端就会把 APK 当成电脑安装包推给所有电脑用户。用运维文档约定给代码 bug 打补丁是错的解法，
+// 必须从代码层根治。以下用例把这条不变量钉死。
+console.log('\n[桌面端选版] checkUpdates 忽略 .apk');
+const dUpd = path.join(tmpDir, 'desktop-pick-updates');
+fs.mkdirSync(dUpd, { recursive: true });
+const dStore = createStore({
+  dataDir: path.join(tmpDir, 'desktop-pick-data'),
+  defaultPhotoDir: path.join(tmpDir, 'desktop-pick-photos'),
+  updateDir: dUpd,
+  appVersion: '1.2.4',
+  photoScheme: 'xqy-photo'
+});
+
+function clearUpdateDir(dir) {
+  for (const f of fs.readdirSync(dir)) {
+    fs.rmSync(path.join(dir, f), { recursive: true, force: true });
+  }
+}
+
+check('只有 .apk 时桌面端不提示更新（手机包不得触发桌面端更新）', () => {
+  clearUpdateDir(dUpd);
+  // 版本号故意远高于桌面端：修复前这里会被当成「有更新且最新版」
+  fs.writeFileSync(path.join(dUpd, 'xingqiyi-android-9.9.9.apk'), 'x');
+  const u = dStore.checkUpdates();
+  if (u.latestFile !== '') throw new Error('只有 apk 时 latestFile 应为空，实际: ' + u.latestFile);
+  if (u.latestVersion !== null) throw new Error('只有 apk 时 latestVersion 应为 null，实际: ' + u.latestVersion);
+  if (u.hasUpdate !== false) throw new Error('只有 apk 时不应提示有更新');
+});
+
+check('.exe 与 .apk 共存时取 .exe', () => {
+  clearUpdateDir(dUpd);
+  fs.writeFileSync(path.join(dUpd, 'xingqiyi-setup-1.2.5.exe'), 'x');
+  fs.writeFileSync(path.join(dUpd, 'xingqiyi-android-1.1.0.apk'), 'x');
+  const u = dStore.checkUpdates();
+  if (u.latestFile !== 'xingqiyi-setup-1.2.5.exe') throw new Error('应取 .exe，实际: ' + u.latestFile);
+  if (u.hasUpdate !== true) throw new Error('1.2.5 > 1.2.4 应提示有更新');
+});
+
+check('.apk 版本远高于 .exe 时仍取 .exe（本次修复的核心回归）', () => {
+  clearUpdateDir(dUpd);
+  fs.writeFileSync(path.join(dUpd, 'xingqiyi-setup-1.2.5.exe'), 'x');
+  fs.writeFileSync(path.join(dUpd, 'xingqiyi-android-99.0.0.apk'), 'x');
+  const u = dStore.checkUpdates();
+  if (u.latestFile !== 'xingqiyi-setup-1.2.5.exe') throw new Error('高版本 apk 不得遮蔽 exe，实际: ' + u.latestFile);
+  if (u.hasUpdate !== true) throw new Error('1.2.5 > 1.2.4 应提示有更新');
+});
+
+check('system/checkUpdate 返回结构保持向后兼容（字段一个不少）', () => {
+  clearUpdateDir(dUpd);
+  fs.writeFileSync(path.join(dUpd, 'xingqiyi-setup-1.2.5.exe'), 'x');
+  const u = dStore.checkUpdates();
+  for (const k of ['currentVersion', 'latestVersion', 'latestFile', 'hasUpdate']) {
+    if (!(k in u)) throw new Error('缺字段: ' + k);
+  }
+  if (u.currentVersion !== '1.2.4') throw new Error('currentVersion 应为桌面端自身版本，实际: ' + u.currentVersion);
+});
+
+check('多个 .exe 之间仍按版本号取最高（未破坏原有行为）', () => {
+  clearUpdateDir(dUpd);
+  fs.writeFileSync(path.join(dUpd, 'xingqiyi-setup-1.2.5.exe'), 'x');
+  fs.writeFileSync(path.join(dUpd, 'xingqiyi-setup-1.2.9.exe'), 'x');
+  fs.writeFileSync(path.join(dUpd, 'xingqiyi-setup-1.2.7.exe'), 'x');
+  const u = dStore.checkUpdates();
+  if (u.latestFile !== 'xingqiyi-setup-1.2.9.exe') throw new Error('应取最高版本 1.2.9，实际: ' + u.latestFile);
+  if (u.latestVersion !== '1.2.9') throw new Error('latestVersion 应为 1.2.9，实际: ' + u.latestVersion);
+});
+
+check('.zip / .msi 桌面包照常识别（跳过只针对 .apk）', () => {
+  clearUpdateDir(dUpd);
+  fs.writeFileSync(path.join(dUpd, 'xingqiyi-1.3.0.zip'), 'x');
+  const u = dStore.checkUpdates();
+  if (u.latestFile !== 'xingqiyi-1.3.0.zip') throw new Error('应识别 .zip，实际: ' + u.latestFile);
+  clearUpdateDir(dUpd);
+  fs.writeFileSync(path.join(dUpd, 'xingqiyi-1.3.0.msi'), 'x');
+  const u2 = dStore.checkUpdates();
+  if (u2.latestFile !== 'xingqiyi-1.3.0.msi') throw new Error('应识别 .msi，实际: ' + u2.latestFile);
+});
+
+fs.rmSync(dUpd, { recursive: true, force: true });
+
 console.log('\n结果：' + passed + ' 通过，' + failed + ' 失败');
 fs.rmSync(tmpDir, { recursive: true, force: true });
 process.exit(failed ? 1 : 0);
