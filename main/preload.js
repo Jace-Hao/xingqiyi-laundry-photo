@@ -167,5 +167,43 @@ contextBridge.exposeInMainWorld('api', {
     if (typeof cb !== 'function') return () => {};
     revokedSubscribers.add(cb);
     return () => revokedSubscribers.delete(cb);
+  },
+
+  // ---------- 摄像头诊断（本机能力，绝不随客户端转发到服务器） ----------
+  // 渲染层没有 fs 权限，日志只能经这几条通道交给主进程落盘。
+  // 全部走 ipcRenderer.invoke 直连本机（不用 call()，call() 在客户端模式会把参数发到远程服务端）。
+
+  /**
+   * 写一行摄像头日志到 <userData>/logs/camera-YYYYMMDD.log。
+   *
+   * 两种调用都支持（渲染层现有代码用的是对象形式）：
+   *   cameraLog({ level, event, fields })
+   *   cameraLog(level, event, fields)
+   * @returns {Promise<{ok:boolean,message?:string,degraded?:boolean}>}
+   * 主进程侧失败不会抛回渲染层；日志目录不可写时返回 { ok: true, degraded: true }。
+   */
+  cameraLog: (levelOrPayload, event, fields) => {
+    const a = levelOrPayload;
+    // 首参是 { level|event } 形状的对象即按对象形式解析，否则按位置参数组装
+    const isPayload = a && typeof a === 'object' && ('event' in a || 'level' in a);
+    const payload = isPayload ? a : { level: a, event, fields: fields || {} };
+    return ipcRenderer.invoke('camera:log', payload);
+  },
+  /** 系统级摄像头授权状态：granted / denied / not-determined / restricted / unknown */
+  cameraAccess: () => ipcRenderer.invoke('camera:access'),
+  /** 打开系统摄像头隐私设置（仅 Windows），其它平台返回 ok:false */
+  openCameraPrivacy: () => ipcRenderer.invoke('camera:openPrivacy'),
+  /** 当前日志文件路径，供客服/现场取证 */
+  cameraLogPath: () => ipcRenderer.invoke('camera:logPath'),
+  /**
+   * 订阅窗口可见性广播：{ visible, minimized }。
+   * 由主进程 show / hide / minimize / restore 触发，渲染层以此为准决定释放/恢复摄像头，
+   * document.hidden 退化为兜底。返回取消订阅函数。
+   */
+  onWindowState: (cb) => {
+    if (typeof cb !== 'function') return () => {};
+    const fn = (_e, p) => cb(p);
+    ipcRenderer.on('app:windowState', fn);
+    return () => ipcRenderer.removeListener('app:windowState', fn);
   }
 });

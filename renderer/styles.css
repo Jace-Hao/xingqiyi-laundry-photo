@@ -1069,6 +1069,8 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: center;
+  /* 覆盖层定位基准：状态/错误提示浮在画面之上，不再被 v-if 吞掉（RC-3） */
+  position: relative;
 }
 
 .camera-box video {
@@ -1089,6 +1091,39 @@ textarea {
 
 .camera-tip .btn {
   margin-top: 12px;
+}
+
+/* 状态 / 错误覆盖层：与 <video> 是否存在无关，
+   只要不是正常出画就盖在取景区上，保证「错误必可见」（RC-3） */
+.camera-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 20px;
+  text-align: center;
+  background: rgba(20, 22, 26, 0.92);
+  color: #86909c;
+  z-index: 2;
+}
+
+.camera-overlay.error {
+  color: #f7a4a4;
+}
+
+.camera-overlay-title {
+  font-size: 14px;
+  line-height: 1.6;
+  max-width: 100%;
+  word-break: break-word;
+}
+
+.camera-overlay .btn {
+  margin-top: 4px;
+  flex-shrink: 0;
 }
 
 /* 摄像头休眠态（空闲/最小化自动释放后） */

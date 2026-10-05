@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, session, Menu, protocol, net, Tray, nativeImage, powerSaveBlocker, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, session, Menu, protocol, net, Tray, nativeImage, powerSaveBlocker, safeStorage, systemPreferences, powerMonitor } = require('electron');
 const path = require('path');
 const http = require('http');
 const https = require('https');
@@ -10,6 +10,7 @@ const { startServer } = require('./server');
 const { createCredentialStore } = require('./credentials');
 const { createThumbService, normalizeThumbSize } = require('./thumb');
 const { downloadWithFallback } = require('./update-download');
+const { createCameraLog } = require('./camera-log');
 
 app.setName('星期衣精致洗衣衣物照片系统');
 
@@ -148,6 +149,12 @@ const credentials = createCredentialStore({
   filePath: path.join(DATA_DIR, 'credentials.json'),
   safeStorage
 });
+
+// 摄像头诊断日志（RC-9）：落 <userData>/logs/camera-YYYYMMDD.log。
+// 渲染层没有 fs 权限，只能经 IPC 交给主进程写；目录不可写时模块内部静默停用，
+// 任何写失败都不会抛回调用方，拍照主流程不受影响。
+const CAMERA_LOG_DIR = path.join(app.getPath('userData'), 'logs');
+const cameraLog = createCameraLog({ dir: CAMERA_LOG_DIR });
 
 let httpServer = null;
 
@@ -1554,6 +1561,59 @@ handle('system:localIp', () => {
   return { ok: true, data: ip || '127.0.0.1' };
 });
 
+// ---------- 摄像头诊断（RC-5 / RC-9，全部本机处理，不随客户端转发到服务器） ----------
+// 四条通道都是「尽力而为」：主进程侧任何失败都只返回 ok:false + 可读文案，
+// 绝不把异常抛回渲染层打断拍照流程。
+
+/** 把系统返回的媒体权限状态收敛到契约约定的枚举内，未知值一律 unknown */
+function normalizeMediaStatus(status) {
+  const allowed = ['granted', 'denied', 'not-determined', 'restricted', 'unknown'];
+  return allowed.indexOf(status) >= 0 ? status : 'unknown';
+}
+
+// 写一行摄像头日志。渲染层调用，落盘失败不抛回（写入是异步且已降级处理）。
+handle('camera:log', (p) => {
+  const payload = p && typeof p === 'object' ? p : {};
+  const event = payload.event;
+  if (typeof event !== 'string' || !event.trim()) {
+    return { ok: false, message: '日志事件名为空' };
+  }
+  const accepted = cameraLog.write(payload.level, event, payload.fields);
+  // 目录不可写时日志已停用：返回 ok 保证界面不弹错，另给 degraded 供界面按需提示
+  return accepted ? { ok: true } : { ok: true, degraded: true };
+});
+
+// 系统级摄像头授权状态（Windows/macOS 有效；Linux 无法判定，返回 unknown）
+handle('camera:access', () => {
+  // Linux 下 Electron 无对应实现，调用会抛错或返回无意义值，直接按不可判定处理
+  if (process.platform === 'linux') return { ok: true, data: { status: 'unknown' } };
+  try {
+    const status = normalizeMediaStatus(systemPreferences.getMediaAccessStatus('camera'));
+    return { ok: true, data: { status } };
+  } catch (e) {
+    return { ok: false, message: '无法读取系统摄像头权限状态' };
+  }
+});
+
+// 打开系统摄像头隐私设置（仅 Windows）：权限被系统开关拒绝时给用户一条可执行出路
+handle('camera:openPrivacy', () => {
+  if (process.platform !== 'win32') {
+    return { ok: false, message: '当前系统不支持自动打开摄像头隐私设置' };
+  }
+  const { shell } = require('electron');
+  return shell
+    .openExternal('ms-settings:privacy-webcam')
+    .then((err) => {
+      // 系统设置窗口会抢走前台焦点，稍后夺回，避免返回软件后输入框点不动
+      setTimeout(() => ensureWindowFocus(), 600);
+      return err ? { ok: false, message: '打开系统设置失败：' + err } : { ok: true };
+    })
+    .catch((e) => ({ ok: false, message: '打开系统设置失败：' + (e && e.message ? e.message : e) }));
+});
+
+// 日志文件路径：供客服/现场取证直接打开
+handle('camera:logPath', () => ({ ok: true, data: { path: cameraLog.currentPath() } }));
+
 async function restartServerIfNeeded() {
   const cfg = store.loadConfig();
   if (cfg.mode !== 'server') return;
@@ -1649,6 +1709,28 @@ function scheduleSaveWindowState() {
   }, 400);
 }
 
+/**
+ * 广播窗口可见性状态（契约 §9.2）：载荷 { visible, minimized }，
+ * 系统休眠唤醒后额外带一个 reason 便于渲染层区分来源。
+ * 由 show / hide / minimize / restore、页面加载完成、休眠恢复/解锁触发，
+ * 渲染层据此释放或恢复摄像头。纯广播，任何异常都吞掉 ——
+ * 它只服务于体验，绝不能打断窗口主流程。
+ */
+function pushWindowState(reason) {
+  try {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (!mainWindow.webContents || mainWindow.webContents.isDestroyed()) return;
+    const payload = {
+      visible: !!mainWindow.isVisible(),
+      minimized: !!mainWindow.isMinimized()
+    };
+    if (reason) payload.reason = reason;
+    mainWindow.webContents.send('app:windowState', payload);
+  } catch (e) {
+    /* 忽略：广播失败不影响窗口与拍照 */
+  }
+}
+
 function createWindow() {
   const winState = loadWindowState();
   // 一次性消费：仅自启后创建的第一个窗口静默驻留，之后的窗口重建都正常显示
@@ -1670,8 +1752,28 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      // 关闭后台节流（RC-9 协同项）：默认开启时窗口隐藏/失焦后 Chromium 会把
+      // 定时器降到 1 次/分钟并限制渲染，取流、帧回调、重连定时器会被一起拖慢，
+      // 表现为「从托盘唤出后画面长时间黑屏」。拍照页自身的空闲休眠不受影响
+      // （那是渲染层按业务规则主动释放，见 camera-controller）。
+      backgroundThrottling: false
     }
+  });
+
+  // 窗口可见性统一广播（RC-9）：渲染层以 app:windowState 为准决定是否
+  // 释放/恢复摄像头，不再只靠 document.hidden 猜测（Electron 隐藏窗口的
+  // visibility 事件历史上有偏差，锁屏/托盘场景尤其明显）。
+  // 契约 §9.2：这四个事件的载荷严格是 { visible, minimized }，不带多余字段
+  mainWindow.on('show', () => pushWindowState());
+  mainWindow.on('hide', () => pushWindowState());
+  mainWindow.on('minimize', () => pushWindowState());
+  mainWindow.on('restore', () => pushWindowState());
+  // 页面加载完成与稍后各补推一次：渲染层在 Vue 挂载时才注册监听，
+  // 早于注册的事件会丢失，补推可保证界面拿到的是真实当前状态（幂等，无副作用）。
+  mainWindow.webContents.on('did-finish-load', () => {
+    pushWindowState();
+    setTimeout(() => pushWindowState(), 800);
   });
 
   mainWindow.once('ready-to-show', () => {
@@ -1990,9 +2092,74 @@ app.whenReady().then(async () => {
   migrateLegacyUpdateDirs();
   Menu.setApplicationMenu(null);
 
-  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
-    callback(permission === 'media');
+  // 摄像头日志初始化（建目录 + 清理 7 天前历史）。失败由模块内部静默停用，
+  // 这里不判断返回值：日志不可用绝不能影响启动与拍照。
+  try {
+    cameraLog.init();
+  } catch (e) {
+    /* 忽略 */
+  }
+
+  // ---------- 摄像头权限：check 与 request 必须成对实现（RC-5） ----------
+  // Electron 的多数 Web API 走「先 check、再 request」两步：check 被拒时根本不会
+  // 发出 request。此前只注册了 request handler，check 走默认策略（拒绝），
+  // 授权链路时通时断，现场表现为「间歇性黑屏、必须释放摄像头重开才恢复」。
+  //
+  // 两个 handler 的决策都写入摄像头日志，升级 Electron 后若 permission 字符串
+  // 有变化，可直接从日志看出是谁被拒。
+  session.defaultSession.setPermissionCheckHandler((_wc, permission, _origin, details) => {
+    // 只放行摄像头；通知、定位、MIDI、剪贴板等一律拒绝（本软件不需要）。
+    // details.mediaType 可能是 video / audio / unknown：本机只用 video，
+    // 但取不到或 unknown 时一律放行 —— 宁可放行也不能因误判导致取流被卡死。
+    const mediaType = details && details.mediaType ? details.mediaType : 'unknown';
+    const allow = permission === 'media' && mediaType !== 'audio';
+    cameraLog.write('info', 'CAM_PERMISSION_CHECK', {
+      reason: String(permission || ''),
+      // granted / mediaType 不是固定字段，走附加字段（仅原始类型入日志）
+      granted: allow,
+      mediaType
+    });
+    return allow;
   });
+
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback, details) => {
+    // 按请求的实际媒体类型判定：本机只需要 video，纯 audio 请求不放行
+    const types = details && Array.isArray(details.mediaTypes) ? details.mediaTypes : [];
+    const wantsVideo = types.length === 0 || types.indexOf('video') !== -1;
+    const allow = permission === 'media' && wantsVideo;
+    cameraLog.write('info', 'CAM_PERMISSION_REQUEST', {
+      reason: String(permission || ''),
+      granted: allow,
+      mediaTypes: types.join(',') || null
+    });
+    // 权限回调绝不能抛异常：抛出会让 getUserMedia 永久挂起
+    try {
+      callback(allow);
+    } catch (e) {
+      cameraLog.write('error', 'CAM_PERMISSION_REQUEST', {
+        reason: 'callback-failed',
+        err: { name: e && e.name, message: e && e.message }
+      });
+    }
+  });
+
+  // ---------- 系统休眠 / 锁屏（R6）----------
+  // 休眠与锁屏期间系统会回收摄像头设备，唤醒后原来的 track 通常已死。
+  // 这里不伪造 visible:false（窗口其实仍可见，伪造会让渲染层误判），
+  // 只在「恢复」时补推一次真实状态，作为渲染层重新校验画面的确定性信号；
+  // 真正的兜底仍由渲染层的 track.ended 自动重连负责（RC-2）。
+  // 四个事件都写日志，便于事后判断「黑屏」是否发生在唤醒之后。
+  const powerEvents = ['suspend', 'resume', 'lock-screen', 'unlock-screen'];
+  for (const name of powerEvents) {
+    try {
+      powerMonitor.on(name, () => {
+        cameraLog.write('info', 'CAM_WINDOW_STATE', { reason: name });
+        if (name === 'resume' || name === 'unlock-screen') pushWindowState(name);
+      });
+    } catch (e) {
+      /* 个别平台不支持某事件，忽略 */
+    }
+  }
 
   // 界面资源协议
   protocol.handle(APP_SCHEME, (request) => {
@@ -2078,6 +2245,12 @@ app.on('before-quit', () => {
   // 先停掉自动清理定时器：避免退出过程中刚好触发清理，
   // 与关闭流程并发读写 records.json 和照片文件
   stopAutoPurge();
+  // 冲刷尚未落盘的摄像头日志（同步、尽力而为，失败不影响退出）
+  try {
+    cameraLog.flushSync();
+  } catch (e) {
+    /* 忽略 */
+  }
   destroyTray();
   if (httpServer) {
     try {

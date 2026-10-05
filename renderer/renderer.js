@@ -1342,6 +1342,9 @@ const CapturePage = {
     // 摄像头按需占用：空闲自动休眠释放设备，扫码/按键/点击时唤醒。
     // 默认空闲 3 分钟释放；测试可通过 window.__xqyCamIdleMs 覆盖时长。
     const sleeping = Vue.ref(false); // 摄像头已休眠（已释放占用）
+    const camState = Vue.ref('UNINIT'); // UNINIT / STARTING / LIVE / DEGRADED / SLEEPING / ERROR
+    const camHint = Vue.ref('摄像头准备中…'); // 非错误态的取景区提示
+    const camPrivacy = Vue.ref(false); // 权限类错误：显示「去系统设置开启摄像头」
     const CAM_IDLE_DEFAULT_MS = 180000;
 
     function camIdleMs() {
@@ -1349,15 +1352,125 @@ const CapturePage = {
       return v >= 1000 ? v : CAM_IDLE_DEFAULT_MS;
     }
 
+    // ---------- 摄像头日志：优先落盘到主进程，IPC 不可用时静默降级 ----------
+    // 写日志失败绝不能影响拍照，因此整段包在 try 里
+    function camLog(level, event, fields) {
+      try {
+        if (window.api && typeof window.api.cameraLog === 'function') {
+          const p = window.api.cameraLog({ level, event, fields: fields || {} });
+          if (p && typeof p.catch === 'function') p.catch(() => {});
+          return;
+        }
+      } catch (e) {
+        /* 主进程日志通道不可用时静默降级，不抛错 */
+      }
+      try {
+        console.log('[camera]', level, event, fields || {});
+      } catch (e2) { /* 忽略 */ }
+    }
+
+    // 黑帧采样：把画面中心 size×size 画到离屏 canvas 取灰度样本（不改动出图链路）
+    function sampleFrame(video, size) {
+      try {
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        if (!vw || !vh) return null;
+        const side = Math.max(1, Math.min(size || 64, vw, vh));
+        const canvas = document.createElement('canvas');
+        canvas.width = side;
+        canvas.height = side;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, Math.floor((vw - side) / 2), Math.floor((vh - side) / 2), side, side, 0, 0, side, side);
+        return window.CameraController
+          ? window.CameraController.sampleCenterGray(ctx.getImageData(0, 0, side, side), side)
+          : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // ---------- 摄像头生命周期控制器（renderer/camera-controller.js）----------
+    // 取流 / 释放 / 重连 / 拍照闸门全部收敛到 controller：
+    // 7 个并发入口（mount、重试、切换设备、空格、扫码、窗口可见、拍照）都只是转发，
+    // 由 controller 用 startSeq 令牌保证「至多一条活跃流」（RC-1a / RC-1b）
+    const controller =
+      window.CameraController && typeof window.CameraController.createCameraController === 'function'
+        ? window.CameraController.createCameraController({
+            mediaDevices: navigator.mediaDevices,
+            videoGetter: () => videoEl.value,
+            frameSampler: sampleFrame,
+            blackFrameEnabled: () => window.__xqyBlackFrame !== false,
+            // 系统授权预检（R10）：接口不存在时不注入，controller 一律放行
+            checkAccess:
+              window.api && typeof window.api.cameraAccess === 'function'
+                ? () => window.api.cameraAccess()
+                : null,
+            openPrivacy:
+              window.api && typeof window.api.openCameraPrivacy === 'function'
+                ? () => window.api.openCameraPrivacy()
+                : null,
+            log: camLog
+          })
+        : null;
+
     let idleTimer = null;
-    let waking = false; // 唤醒进行中，防重复触发
     let wasRunningWhenHidden = false; // 因窗口隐藏而释放时，回到前台自动恢复
+    let devicesAfterAuthLoaded = false; // 授权后需重枚举一次才能拿到真实 deviceId（RC-4）
+    let offWindowState = null; // 主进程窗口可见性订阅的取消函数
+
+    const CAM_HINTS = {
+      UNINIT: '摄像头未启动',
+      STARTING: '摄像头准备中…',
+      DEGRADED: '画面中断，正在自动恢复…',
+      LIVE: '',
+      SLEEPING: '摄像头已休眠（已释放占用）',
+      ERROR: '摄像头不可用'
+    };
+
+    // controller 状态 → Vue 响应式状态：模板只消费这些 ref
+    function syncCameraState() {
+      if (!controller) return;
+      const s = controller.getState();
+      const err = controller.getError();
+      camState.value = s;
+      cameraError.value = err ? err.message : '';
+      camHint.value = err ? '' : CAM_HINTS[s] || '';
+      sleeping.value = s === 'SLEEPING';
+      // 权限被拒（系统预检判死或 gUM 报 NotAllowed）时才给出系统设置入口
+      camPrivacy.value = !!(err && (err.code === 'PERMISSION_DENIED' || err.privacy === true));
+      // stream 仅用于「画面确实在显示」的判断，与 video.srcObject 始终同一对象
+      stream.value = s === 'LIVE' || s === 'DEGRADED' ? controller.getStream() : null;
+      const res = controller.getResolution();
+      if (res && res.width) resolution.value = res.width + ' × ' + res.height;
+      if (s === 'LIVE') {
+        applyFocus(controller.getTrack());
+        startFocusPulse(controller.getTrack());
+        if (!devicesAfterAuthLoaded) {
+          devicesAfterAuthLoaded = true;
+          loadDevices(); // 授权后再枚举，deviceId / label 才有值
+        }
+        scheduleIdleSleep();
+      } else {
+        stopFocusPulse();
+      }
+    }
+
+    if (controller) {
+      controller.onStateChange(syncCameraState);
+      controller.onError(syncCameraState);
+      controller.onDevicesChange(() => {
+        loadDevices();
+      });
+    }
 
     async function loadDevices() {
       try {
         const list = await navigator.mediaDevices.enumerateDevices();
-        devices.value = list.filter((d) => d.kind === 'videoinput');
-        if (devices.value.length && !deviceId.value) deviceId.value = devices.value[0].deviceId;
+        // 未授权时 deviceId/label 为空串，必须过滤，否则切换设备会 OverconstrainedError（RC-4）
+        devices.value = list.filter((d) => d.kind === 'videoinput' && d.deviceId);
+        if (devices.value.length && !devices.value.some((d) => d.deviceId === deviceId.value)) {
+          deviceId.value = devices.value[0].deviceId;
+        }
       } catch (e) {
         /* 忽略枚举失败 */
       }
@@ -1378,7 +1491,10 @@ const CapturePage = {
       }
       const adv = {};
       if (cap.focusMode && cap.focusMode.includes('continuous')) adv.focusMode = 'continuous';
-      if (cap.focusDistance) adv.focusDistance = cap.focusDistance.min || undefined;
+      // 不再无条件取 min：多数设备 min 为 0（最近对焦距离），拍远景会永久失焦（RC-8）
+      if (cap.focusDistance && typeof cap.focusDistance.min === 'number' && cap.focusDistance.min > 0) {
+        adv.focusDistance = cap.focusDistance.min;
+      }
       if (cap.pointsOfInterest) {
         adv.pointsOfInterest = [
           {
@@ -1389,7 +1505,11 @@ const CapturePage = {
       }
       if (Object.keys(adv).length) {
         try {
-          await track.applyConstraints({ advanced: [adv] });
+          // 部分 UVC 摄像头 applyConstraints 会永不 settle，必须加超时，避免对焦流程卡死
+          await Promise.race([
+            track.applyConstraints({ advanced: [adv] }),
+            new Promise((r) => setTimeout(r, 1500))
+          ]);
         } catch (e) {
           /* 部分设备不支持，保持默认对焦 */
         }
@@ -1397,20 +1517,36 @@ const CapturePage = {
     }
 
     // 周期对焦脉冲：定时触发一次单点对焦后恢复连续对焦，
-    // 纠正部分摄像头长时间待机后出现的对焦漂移
+    // 纠正部分摄像头长时间待机后出现的对焦漂移。
+    // RC-8：仅在真正出画（LIVE）且窗口可见时执行，连续失败 2 次即停，
+    // 避免部分 UVC 摄像头在 single-shot 期间停输出造成周期黑帧。
+    let focusFail = 0;
+
     function startFocusPulse(track) {
       stopFocusPulse();
+      if (!track) return; // 只依赖 track，不再依赖 videoEl 是否已挂载
+      focusFail = 0;
       focusTimer = setInterval(async () => {
-        if (!track || track.readyState !== 'live') {
+        if (!captureAlive || !track || track.readyState !== 'live') {
           stopFocusPulse();
           return;
         }
+        if (document.hidden || camState.value !== 'LIVE') return;
         try {
-          await track.applyConstraints({ advanced: [{ focusMode: 'single-shot' }] });
+          // 对焦脉冲同样可能永不 settle，加超时跳过，避免周期黑帧或卡死
+          await Promise.race([
+            track.applyConstraints({ advanced: [{ focusMode: 'single-shot' }] }),
+            new Promise((r) => setTimeout(r, 1500))
+          ]);
           await new Promise((r) => setTimeout(r, 350));
-          await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+          await Promise.race([
+            track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }),
+            new Promise((r) => setTimeout(r, 1500))
+          ]);
+          focusFail = 0;
         } catch (e) {
-          /* 设备不支持时静默忽略 */
+          focusFail++;
+          if (focusFail >= 2) stopFocusPulse();
         }
       }, 20000);
     }
@@ -1432,102 +1568,141 @@ const CapturePage = {
     // 空闲计时：超时且未休眠时释放摄像头；有操作时重新计时
     function scheduleIdleSleep() {
       clearIdleTimer();
-      if (!captureAlive || sleeping.value || !stream.value) return;
+      if (!captureAlive || !controller) return;
+      const s = controller.getState();
+      if (s === 'SLEEPING' || s === 'UNINIT' || s === 'ERROR') return;
       idleTimer = setTimeout(() => {
-        if (captureAlive && stream.value && !document.hidden) sleepCamera('idle');
+        if (!captureAlive || document.hidden) return;
+        const st = controller.getState();
+        if (st !== 'LIVE' && st !== 'DEGRADED' && st !== 'STARTING') return;
+        if (controller.sleep('idle')) {
+          toast('摄像头空闲超时，已释放占用；扫码或按空格即可继续拍', 'info');
+        }
       }, camIdleMs());
     }
 
     function bumpActivity() {
-      if (!captureAlive || sleeping.value) return;
+      if (!captureAlive || !controller || sleeping.value) return;
       scheduleIdleSleep();
     }
 
     // 释放摄像头：停止取流并进入休眠态（空闲超时 / 窗口隐藏 / 手动释放）
+    // controller.sleep() 会作废在途 gUM，休眠期间到达的流会被 stop（RC-1a）
     function sleepCamera(reason) {
-      if (!captureAlive || sleeping.value || !stream.value) return;
-      stopCamera();
-      sleeping.value = true;
-      clearIdleTimer();
-      if (reason === 'idle') toast('摄像头空闲超时，已释放占用；扫码或按空格即可继续拍', 'info');
+      if (!controller) return;
+      controller.sleep(reason || 'manual');
     }
 
-    // 窗口最小化/隐藏时释放，回到前台自动恢复
+    // 窗口最小化 / 隐藏时释放，回到前台自动恢复
     function onVisibilityChange() {
-      if (!captureAlive) return;
+      if (!captureAlive || !controller) return;
       if (document.hidden) {
-        if (stream.value) {
+        const s = controller.getState();
+        if (s === 'LIVE' || s === 'DEGRADED' || s === 'STARTING') {
           wasRunningWhenHidden = true;
-          sleepCamera('hidden');
+          controller.sleep('hidden');
         }
-      } else if (wasRunningWhenHidden && sleeping.value) {
+      } else if (wasRunningWhenHidden) {
         wasRunningWhenHidden = false;
-        wakeCamera();
+        controller.wake();
       } else {
         wasRunningWhenHidden = false;
       }
     }
 
-    async function startCamera(id) {
-      cameraError.value = '';
-      sleeping.value = false;
-      if (stream.value) {
-        stream.value.getTracks().forEach((t) => t.stop());
-        stream.value = null;
-      }
-      try {
-        const constraints = { video: id ? { deviceId: { exact: id } } : true, audio: false };
-        const s = await navigator.mediaDevices.getUserMedia(constraints);
-        const track = s.getVideoTracks()[0];
-        // 读取摄像头能力上限，按最大分辨率重新应用约束
-        const cap = track.getCapabilities ? track.getCapabilities() : {};
-        const maxW = cap.width && cap.width.max;
-        const maxH = cap.height && cap.height.max;
-        if (maxW && maxH && track.applyConstraints) {
-          try {
-            await track.applyConstraints({ width: { ideal: maxW }, height: { ideal: maxH } });
-          } catch (e) {
-            /* 部分摄像头不支持调整，保持当前分辨率 */
-          }
+    // 主进程推送的窗口可见性（比 document.hidden 可靠；未接通时该函数不会被调用）
+    function onWindowState(ws) {
+      if (!captureAlive || !controller || !ws) return;
+      camLog('info', 'CAM_WINDOW_STATE', { reason: ws.visible === false ? 'hidden' : 'visible' });
+      if (ws.visible === false) {
+        const s = controller.getState();
+        if (s === 'LIVE' || s === 'DEGRADED' || s === 'STARTING') {
+          wasRunningWhenHidden = true;
+          controller.sleep('hidden');
         }
-        const settings = track.getSettings();
-        resolution.value = (settings.width || 0) + ' × ' + (settings.height || 0);
-        stream.value = s;
-        await Vue.nextTick();
-        if (videoEl.value) {
-          videoEl.value.srcObject = s;
-          await videoEl.value.play();
-          // 画面就绪后再次应用对焦，避免初始虚焦；并开启周期对焦脉冲
-          applyFocus(track);
-          startFocusPulse(track);
-        }
-      } catch (e) {
-        cameraError.value = '无法打开摄像头：' + (e.message || e.name);
+      } else if (wasRunningWhenHidden) {
+        wasRunningWhenHidden = false;
+        controller.wake();
       }
-      // 取流成功后重新开始空闲计时
-      if (stream.value) scheduleIdleSleep();
     }
 
-    async function wakeCamera() {
-      if (waking || !sleeping.value) return;
-      waking = true;
-      try {
-        await startCamera(deviceId.value || '');
-      } finally {
-        waking = false;
-      }
+    // 打开摄像头：所有入口（mount / 重试 / 切换设备）都只是转发给 controller。
+    // controller 内部用 startSeq 令牌保证并发只保留 1 条活跃流（RC-1b）
+    function startCamera(id) {
+      if (!controller) return Promise.resolve(false);
+      return controller.open(typeof id === 'string' ? id : deviceId.value || '');
     }
+
+    // 覆盖层「重试」：人工介入，attempt 归零后重开
+    function retryCamera() {
+      if (!controller) return;
+      camHint.value = '摄像头准备中…';
+      controller.open(deviceId.value || '');
+    }
+
+    // R10：跳转系统摄像头隐私设置；平台不支持（ok:false）时降级为文案引导
+    function openPrivacySettings() {
+      const done = controller ? controller.openPrivacySettings() : Promise.resolve(false);
+      Promise.resolve(done)
+        .then((ok) => {
+          if (!ok) toast('请在系统「隐私和安全性 → 相机」中允许本程序使用摄像头，再点「重试」', 'info');
+        })
+        .catch(() => {
+          toast('请在系统「隐私和安全性 → 相机」中允许本程序使用摄像头，再点「重试」', 'info');
+        });
+    }
+
+    // 切换摄像头：先清掉降级标志再按新 deviceId 取流
+    function switchDevice(id) {
+      if (!controller) return;
+      controller.open(id || '');
+    }
+
+    // 唤醒：扫码 / 空格 / 点击 / 窗口恢复可见都会走到这里，controller 幂等
+    function wakeCamera() {
+      if (!controller) return;
+      controller.wake();
+    }
+
+    // 拍照闸门被拦时的可执行提示（I5）
+    const CAPTURE_BLOCK_MSG = {
+      UNINIT: '摄像头未启动，请稍候或点「重试」',
+      STARTING: '摄像头正在启动，画面就绪后再拍',
+      DEGRADED: '画面中断，正在自动恢复，请稍候',
+      SLEEPING: '摄像头已休眠，正在唤醒，请稍候再按空格拍摄',
+      ERROR: '摄像头不可用，请检查设备后点「重试」',
+      LIVE: '画面未就绪，请稍候'
+    };
 
     function capture() {
       if (saving.value) return;
-      if (sleeping.value) {
-        wakeCamera();
-        toast('摄像头已休眠，正在唤醒，请稍候再按空格拍摄', 'info');
+      if (!controller) {
+        toast('摄像头模块未加载，请重启程序', 'error');
+        return;
+      }
+      const st = controller.getState();
+      if (st === 'SLEEPING') {
+        controller.wake();
+        toast(CAPTURE_BLOCK_MSG.SLEEPING, 'info');
+        return;
+      }
+      // I5：仅 LIVE 允许拍照；STARTING / DEGRADED / ERROR 一律拒绝并给出可执行提示
+      if (!controller.canCapture()) {
+        const err = controller.getError();
+        const msg = st === 'ERROR' && err ? '摄像头不可用：' + err.message : CAPTURE_BLOCK_MSG[st] || CAPTURE_BLOCK_MSG.LIVE;
+        camLog('warn', 'CAM_CAPTURE_REJECT', { reason: st, state: st });
+        toast(msg, 'error');
         return;
       }
       const v = videoEl.value;
       if (!v || !v.videoWidth) {
         toast('摄像头画面未就绪', 'error');
+        return;
+      }
+      // 黑帧检测：镜头被遮挡 / 信号中断时拒收，杜绝黑照片入库（可用 window.__xqyBlackFrame=false 关闭）
+      if (controller.isBlackFrame(v)) {
+        camLog('warn', 'CAM_CAPTURE_REJECT', { reason: 'black-frame' });
+        toast('画面异常（全黑），请检查摄像头后重拍', 'error');
         return;
       }
       // 拍摄操作说明用户正在使用摄像头，重置空闲计时，防止键盘操作路径下误休眠
@@ -1545,6 +1720,7 @@ const CapturePage = {
       drawTimeWatermark(ctx, canvas.width, canvas.height, watermarkTimeText(shotAt));
       shots.value.push(canvas.toDataURL('image/jpeg', 0.92));
       if (!resolution.value) resolution.value = v.videoWidth + ' × ' + v.videoHeight;
+      camLog('info', 'CAM_CAPTURE_OK', { res: { w: canvas.width, h: canvas.height }, queue: shots.value.length });
     }
 
     function removeShot(i) {
@@ -1787,24 +1963,32 @@ const CapturePage = {
       similarTimer = setTimeout(() => refreshBarcodeWarn(barcode.value), 250);
     });
 
-    function stopCamera() {
-      stopFocusPulse();
-      if (stream.value) {
-        stream.value.getTracks().forEach((t) => t.stop());
-        stream.value = null;
-      }
-    }
-
     Vue.onMounted(() => {
       captureAlive = true;
       window.addEventListener('keydown', onKeydown);
       window.addEventListener('pointerdown', bumpActivity, true);
       document.addEventListener('visibilitychange', onVisibilityChange);
+      // 主进程窗口可见性推送（未接通该 IPC 时静默跳过，继续依赖 document.hidden）
+      if (window.api && typeof window.api.onWindowState === 'function') {
+        try {
+          offWindowState = window.api.onWindowState(onWindowState);
+        } catch (e) {
+          offWindowState = null;
+        }
+      }
       focusBarcode();
+      if (!controller) {
+        cameraError.value = '摄像头模块未加载，请重启程序';
+        camState.value = 'ERROR';
+        return;
+      }
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        loadDevices().then(() => startCamera(''));
+        // mount 内部即以 startSeq 令牌发起取流；设备列表等出画（授权后）再枚举
+        controller.mount(() => videoEl.value);
       } else {
         cameraError.value = '当前环境不支持摄像头调用';
+        camState.value = 'ERROR';
+        camHint.value = '';
       }
     });
 
@@ -1815,14 +1999,22 @@ const CapturePage = {
       document.removeEventListener('visibilitychange', onVisibilityChange);
       clearIdleTimer();
       if (similarTimer) clearTimeout(similarTimer);
-      stopCamera();
+      stopFocusPulse();
+      if (offWindowState) {
+        try { offWindowState(); } catch (e) { /* 忽略 */ }
+        offWindowState = null;
+      }
+      // I7：controller.unmount() 返回后不存在任何 live track，
+      // 在途 gUM 的结果也会因令牌作废被 stop 并记 CAM_LEAK_GUARD
+      if (controller) controller.unmount();
     });
 
     return {
       stream, devices, deviceId, cameraError, resolution, shots,
       barcode, note, saving, barcodeCount, videoEl, barcodeEl, ready,
       barcodeWarn, applyCleaned, applySimilar, barcodeLocked, unlockBarcode,
-      sleeping, startCamera, wakeCamera, sleepCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone
+      sleeping, camState, camHint, camPrivacy,
+      startCamera, retryCamera, switchDevice, wakeCamera, sleepCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone, openPrivacySettings
     };
   },
   template: `
@@ -1839,28 +2031,29 @@ const CapturePage = {
             <span v-if="resolution && !sleeping" class="tag tag-green" style="margin-left:8px">分辨率 {{ resolution }}</span>
           </div>
           <div class="camera-box">
-            <video v-if="stream" ref="videoEl" autoplay playsinline muted></video>
-            <div v-else-if="sleeping" class="camera-tip camera-sleep">
-              <div class="camera-sleep-title">摄像头已休眠（已释放占用）</div>
-              <div class="camera-sleep-sub">空闲超时或窗口最小化时自动释放设备</div>
-              <button class="btn btn-primary" @click="wakeCamera">唤醒拍摄</button>
-              <div class="camera-sleep-sub">扫码或按空格键也会自动唤醒</div>
-            </div>
-            <div v-else class="camera-tip" :class="{ error: !!cameraError }">
-              {{ cameraError || '摄像头准备中…' }}
-              <div v-if="cameraError">
-                <button class="btn btn-primary" @click="startCamera(deviceId)">重试</button>
-              </div>
+            <video ref="videoEl" autoplay playsinline muted></video>
+            <div v-if="camState !== 'LIVE'" class="camera-overlay" :class="{ error: !!cameraError }">
+              <template v-if="camState === 'SLEEPING'">
+                <div class="camera-sleep-title">摄像头已休眠（已释放占用）</div>
+                <div class="camera-sleep-sub">空闲超时或窗口最小化时自动释放设备</div>
+                <button class="btn btn-primary" @click="wakeCamera">唤醒拍摄</button>
+              </template>
+              <template v-else>
+                <div class="camera-overlay-title">{{ cameraError || camHint }}</div>
+                <button v-if="camPrivacy" class="btn btn-primary" @click="openPrivacySettings">去系统设置开启摄像头</button>
+                <button v-if="cameraError" class="btn btn-primary" @click="retryCamera">重试</button>
+                <div v-else class="camera-sleep-sub">扫码或按空格键也会自动唤醒</div>
+              </template>
             </div>
           </div>
           <div class="camera-bar">
-            <select v-if="devices.length > 1" v-model="deviceId" @change="startCamera(deviceId)">
+            <select v-if="devices.length > 1" v-model="deviceId" @change="switchDevice(deviceId)">
               <option v-for="(d, i) in devices" :key="d.deviceId || i" :value="d.deviceId">
                 {{ d.label || ('摄像头 ' + (i + 1)) }}
               </option>
             </select>
-            <button class="btn btn-primary" :disabled="!stream" @click="capture">📸 拍照（空格）</button>
-            <button v-if="stream" class="btn btn-ghost" @click="sleepCamera('manual')">释放摄像头</button>
+            <button class="btn btn-primary" :disabled="camState !== 'LIVE'" @click="capture">📸 拍照（空格）</button>
+            <button v-if="camState !== 'SLEEPING' && camState !== 'UNINIT'" class="btn btn-ghost" @click="sleepCamera('manual')">释放摄像头</button>
           </div>
         </div>
 
