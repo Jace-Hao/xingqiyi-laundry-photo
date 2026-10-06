@@ -31,6 +31,17 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
+      - name: 注入授权密钥（来自 Secrets.LICENSE_SECRET）
+        env:
+          LICENSE_SECRET: ${{ secrets.LICENSE_SECRET }}
+        run: |
+          if [ -z "$LICENSE_SECRET" ]; then
+            echo "::error::未配置 Secrets.LICENSE_SECRET，发布包将缺少激活组件（main/license-secret.json）"
+            exit 1
+          fi
+          printf '%s' "$LICENSE_SECRET" > main/license-secret.json
+          node -e "const lic=require('./main/license.js'); if(!lic.isSecretAvailable()){console.error('授权密钥注入后校验失败');process.exit(1)}; console.log('授权密钥注入成功')"
+
       - name: 读取版本号并校验与 tag 一致
         id: ver
         shell: bash
