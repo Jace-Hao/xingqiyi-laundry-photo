@@ -34,6 +34,7 @@ jobs:
       - name: 注入授权密钥（来自 Secrets.LICENSE_SECRET）
         env:
           LICENSE_SECRET: ${{ secrets.LICENSE_SECRET }}
+        shell: bash
         run: |
           if [ -z "$LICENSE_SECRET" ]; then
             echo "::error::未配置 Secrets.LICENSE_SECRET，发布包将缺少激活组件（main/license-secret.json）"
