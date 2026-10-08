@@ -52,6 +52,7 @@ const ConfirmModal = {
   setup() {
     const s = confirmState;
     const confirmBtn = Vue.ref(null);
+    const cancelBtn = Vue.ref(null);
     function close(val) {
       const r = s.resolve;
       s.open = false;
@@ -60,28 +61,35 @@ const ConfirmModal = {
     }
     function onKey(e) {
       if (!s.open) return;
+      // 输入法组字中的 Enter 是「选词确认」，绝不能当作确认弹窗。
+      // 与灯箱键盘处理（onKeydown）保持同一套守卫写法。
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === 'Escape') {
         e.preventDefault();
+        e.stopPropagation();
         close(false);
       } else if (e.key === 'Enter') {
         e.preventDefault();
+        e.stopPropagation();
         close(true);
       }
     }
-    Vue.onMounted(() => window.addEventListener('keydown', onKey));
-    Vue.onUnmounted(() => window.removeEventListener('keydown', onKey));
+    // keydown 绑在弹窗根节点（.modal-mask）而非 window：
+    // 弹窗打开时只接管自身范围内的按键，背后的输入框用中文输入法按 Enter 选词不会误触确认。
     Vue.watch(
       () => s.open,
       (v) => {
         if (v) Vue.nextTick(() => {
-          if (confirmBtn.value && confirmBtn.value.focus) confirmBtn.value.focus();
+          // 危险态（删除类）默认焦点落在「取消」上，Enter 不会直接执行破坏性操作。
+          const target = s.danger ? cancelBtn.value : confirmBtn.value;
+          if (target && target.focus) target.focus();
         });
       }
     );
-    return { s, close, confirmBtn };
+    return { s, close, confirmBtn, cancelBtn, onKey };
   },
   template: `
-    <div v-if="s.open" class="modal-mask" @click.self="close(false)">
+    <div v-if="s.open" class="modal-mask" @click.self="close(false)" @keydown="onKey">
       <div class="modal modal-sm" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
         <div class="modal-head">
           <h3 id="confirm-title">{{ s.title }}</h3>
@@ -90,7 +98,7 @@ const ConfirmModal = {
           <p class="confirm-msg">{{ s.message }}</p>
         </div>
         <div class="modal-foot">
-          <button class="btn btn-ghost" @click="close(false)">{{ s.cancelText }}</button>
+          <button ref="cancelBtn" class="btn btn-ghost" @click="close(false)">{{ s.cancelText }}</button>
           <button ref="confirmBtn" class="btn" :class="s.danger ? 'btn-danger' : 'btn-primary'" @click="close(true)">{{ s.confirmText }}</button>
         </div>
       </div>
@@ -2215,7 +2223,10 @@ const QueryPage = {
     const detailIndex = Vue.ref(-1); // 当前预览照片在本页列表中的下标，用于左右切换
     const selected = Vue.ref([]); // 已勾选的记录 id
     const batchDeleting = Vue.ref(false);
-    const exporting = Vue.ref(false);
+    // 导出/下载互斥锁：4 个入口都会先弹系统目录选择框，并发会导致原生对话框竞态。
+    // 用操作 key 而非布尔量，按钮才能只显示自己的 loading 文案（不串台）。
+    // '' | 'today' | 'byBarcode' | 'download' | 'byDate'
+    const busy = Vue.ref('');
     const downloadingPhoto = Vue.ref(false);
 
     // 照片网格容器引用，用于测量可用宽高以计算每页数量
@@ -2388,7 +2399,7 @@ const QueryPage = {
 
     // 按条码（订单号）批量下载照片：勾选了则导出勾选记录涉及的条码，未勾选则导出当前列表全部条码
     async function exportByBarcode() {
-      if (exporting.value) return;
+      if (busy.value) return;
       const source = selected.value.length
         ? items.value.filter((r) => selected.value.includes(r.id))
         : items.value.slice();
@@ -2402,12 +2413,13 @@ const QueryPage = {
         : '当前列表中的全部 ' + barcodes.length + ' 个条码';
       const ok = await showConfirm({ title: '导出照片', message: '将按条码（订单号）分文件夹导出照片到本地目录。\n导出范围：' + scope + '。', confirmText: '继续导出' });
       if (!ok) return;
+      if (busy.value) return;
       const d = await window.api.chooseExportDir();
       if (!d.ok) {
         if (d.message && d.message !== '已取消') toast(d.message, 'error');
         return;
       }
-      exporting.value = true;
+      busy.value = 'byBarcode';
       toast('正在导出照片，数量较多时请稍候…', 'success');
       try {
         const res = await window.api.exportPhotos(props.token, { targetDir: d.data, barcodes });
@@ -2424,13 +2436,13 @@ const QueryPage = {
       } catch (e) {
         toast('导出失败：' + (e.message || e), 'error');
       } finally {
-        exporting.value = false;
+        busy.value = '';
       }
     }
 
     // 按日期范围导出照片：按条码分文件夹归档，并生成「条码+文件位置」表格
     async function exportByDate() {
-      if (exporting.value) return;
+      if (busy.value) return;
       if (!dateFrom.value || !dateTo.value) {
         toast('请先在上方选择开始日期与结束日期', 'error');
         return;
@@ -2441,12 +2453,13 @@ const QueryPage = {
       }
       const ok = await showConfirm({ title: '按日期导出', message: '导出 ' + dateFrom.value + ' 至 ' + dateTo.value + ' 期间的照片，按条码分文件夹归档，并生成归档表格。', confirmText: '继续导出' });
       if (!ok) return;
+      if (busy.value) return;
       const d = await window.api.chooseExportDir();
       if (!d.ok) {
         if (d.message && d.message !== '已取消') toast(d.message, 'error');
         return;
       }
-      exporting.value = true;
+      busy.value = 'byDate';
       toast('正在按日期导出照片，数量较多时请稍候…', 'success');
       try {
         const res = await window.api.exportPhotosByDate(props.token, {
@@ -2467,24 +2480,25 @@ const QueryPage = {
       } catch (e) {
         toast('导出失败：' + (e.message || e), 'error');
       } finally {
-        exporting.value = false;
+        busy.value = '';
       }
     }
 
     // 一键导出当日订单表格：今天录入的全部订单（不复制照片，供洗衣管家上传助手同步使用）
     async function exportToday() {
-      if (exporting.value) return;
+      if (busy.value) return;
       const now = new Date();
       const p2 = (n) => String(n).padStart(2, '0');
       const day = now.getFullYear() + '-' + p2(now.getMonth() + 1) + '-' + p2(now.getDate());
       const ok = await showConfirm({ title: '下载当日订单表', message: '生成今天（' + day + '）全部订单的「条码 + 照片位置」表格（不包含照片文件），供洗衣管家上传助手同步照片使用。', confirmText: '生成表格' });
       if (!ok) return;
+      if (busy.value) return;
       const d = await window.api.chooseExportDir();
       if (!d.ok) {
         if (d.message && d.message !== '已取消') toast(d.message, 'error');
         return;
       }
-      exporting.value = true;
+      busy.value = 'today';
       toast('正在生成当日订单表格，请稍候…', 'success');
       try {
         const res = await window.api.exportPhotosByDate(props.token, { targetDir: d.data, dateFrom: day, dateTo: day, tableOnly: true });
@@ -2506,7 +2520,7 @@ const QueryPage = {
       } catch (e) {
         toast('导出失败：' + (e.message || e), 'error');
       } finally {
-        exporting.value = false;
+        busy.value = '';
       }
     }
 
@@ -2533,7 +2547,7 @@ const QueryPage = {
 
     // 批量下载原始照片：按条码（订单号）分文件夹落盘，不生成任何清单文件（与导出区分）
     async function downloadSelected() {
-      if (exporting.value) return;
+      if (busy.value) return;
       const source = selected.value.length
         ? items.value.filter((r) => selected.value.includes(r.id))
         : items.value.slice();
@@ -2551,12 +2565,13 @@ const QueryPage = {
         confirmText: '下载原片'
       });
       if (!ok) return;
+      if (busy.value) return;
       const d = await window.api.chooseExportDir();
       if (!d.ok) {
         if (d.message && d.message !== '已取消') toast(d.message, 'error');
         return;
       }
-      exporting.value = true;
+      busy.value = 'download';
       toast('正在下载原片，数量较多时请稍候…', 'success');
       try {
         const res = await window.api.downloadPhotos(props.token, { targetDir: d.data, barcodes });
@@ -2573,7 +2588,7 @@ const QueryPage = {
       } catch (e) {
         toast('下载失败：' + (e.message || e), 'error');
       } finally {
-        exporting.value = false;
+        busy.value = '';
       }
     }
 
@@ -2596,7 +2611,18 @@ const QueryPage = {
         toast('请先勾选要删除的记录', 'error');
         return;
       }
-      const ok = await showConfirm({ title: '批量删除记录', message: '删除选中的 ' + selected.value.length + ' 条记录？\n照片将一并删除，不可恢复。', confirmText: '删除这 ' + selected.value.length + ' 条记录', danger: true });
+      // 附上前 3 个条码预览：删除不可恢复，用户按确认前必须能自查有没有删错范围
+      const picked = items.value.filter((r) => selected.value.includes(r.id));
+      const codes = [...new Set(picked.map((r) => r.barcode).filter(Boolean))];
+      const preview = codes.length
+        ? codes.slice(0, 3).join('、') + (codes.length > 3 ? '…' : '')
+        : '（所选记录没有条码）';
+      const ok = await showConfirm({
+        title: '批量删除记录',
+        message: '删除选中的 ' + selected.value.length + ' 条记录？\n涉及条码：' + preview + '，等共 ' + selected.value.length + ' 条。\n照片将一并删除，不可恢复。',
+        confirmText: '删除这 ' + selected.value.length + ' 条记录',
+        danger: true
+      });
       if (!ok) return;
       batchDeleting.value = true;
       try {
@@ -2856,7 +2882,7 @@ const QueryPage = {
       storeFilter, storeOptions, isMine, canDelete,
       page, pageSize, totalPages, loading, detail, detailIndex, gridEl,
       selected, batchDeleting, toggleSelect, selectAll, batchDelete,
-      exporting, exportByBarcode, exportByDate, exportToday,
+      busy, exportByBarcode, exportByDate, exportToday,
       downloadingPhoto, downloadPhoto, downloadSelected,
       search, reset, openDetail, remove, prev, next, goPage, fmt, rename, openRename, submitRename, renameBatch, openRenameBatch, submitRenameBatch,
       // 灯箱预览：缩放、平移、切换
@@ -2907,22 +2933,22 @@ const QueryPage = {
           </div>
           <button class="btn btn-primary" @click="search(true)">查询</button>
           <button class="btn btn-ghost" @click="reset">重置</button>
-          <button class="btn btn-ghost" :disabled="exporting" @click="exportToday" title="生成今天全部订单的「条码+照片位置」表格（不含照片），供洗衣管家上传助手同步使用">
-            {{ exporting ? '导出中…' : '⬇ 下载当日订单' }}
+          <button class="btn btn-ghost" :disabled="!!busy" @click="exportToday" title="生成今天全部订单的「条码+照片位置」表格（不含照片），供洗衣管家上传助手同步使用">
+            {{ busy === 'today' ? '生成中…' : '⬇ 下载当日订单' }}
           </button>
         </div>
 
-        <div class="batch-bar" v-if="items.length">
+        <div class="batch-bar" v-if="items.length" :aria-busy="busy ? 'true' : 'false'">
           <label v-if="canDelete" class="batch-check"><input type="checkbox" :checked="selected.length === items.length && items.length > 0" @change="selectAll" />全选本页</label>
           <span v-if="canDelete" class="pager-info">已选 {{ selected.length }} 条</span>
-          <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="exportByBarcode">
-            {{ exporting ? '导出中…' : '⬇ 按订单号批量下载' }}
+          <button class="btn btn-ghost btn-sm" :disabled="!!busy" @click="exportByBarcode" title="生成条码+照片位置清单表">
+            {{ busy === 'byBarcode' ? '导出中…' : '⬇ 导出照片 + 清单表' }}
           </button>
-          <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="downloadSelected" title="按条码分文件夹下载原始照片（不生成清单）">
-            {{ exporting ? '下载中…' : '⬇ 下载原片（按文件夹）' }}
+          <button class="btn btn-ghost btn-sm" :disabled="!!busy" @click="downloadSelected" title="只落原始照片文件，不生成任何清单">
+            {{ busy === 'download' ? '下载中…' : '⬇ 只下载原片（无清单）' }}
           </button>
-          <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="exportByDate" title="按上方日期范围导出照片，并生成条码+文件位置表格">
-            ⬇ 按日期导出
+          <button class="btn btn-ghost btn-sm" :disabled="!!busy" @click="exportByDate" title="按上方日期范围导出照片，并生成条码+文件位置表格">
+            {{ busy === 'byDate' ? '导出中…' : '⬇ 按日期导出' }}
           </button>
           <button v-if="adminMode || canDelete" class="btn btn-ghost btn-sm" :disabled="!selected.length" @click="openRenameBatch" title="把选中的多条记录统一改为同一个正确条码（照片随迁并重新编号）">
             ⇄ 批量改码
@@ -2943,7 +2969,19 @@ const QueryPage = {
             <button class="btn btn-ghost" @click="reset">清空筛选条件</button>
           </div>
           <div v-else class="record-grid">
-            <div v-for="r in items" :key="r.id" class="record-card" @click="openDetail(r)">
+            <!-- 保留 div：内含 label.card-check 与 button.btn-rename，改成 button 会产生嵌套可交互元素的非法 HTML。
+                 补 tabindex/role/键盘事件让纯键盘用户也能走通「查询→打开→下载原片」主路径。 -->
+            <div
+              v-for="r in items"
+              :key="r.id"
+              class="record-card"
+              tabindex="0"
+              role="button"
+              :aria-label="'打开订单 ' + r.barcode"
+              @click="openDetail(r)"
+              @keydown.enter="openDetail(r)"
+              @keydown.space.prevent="openDetail(r)"
+            >
               <div class="record-photo"><img :src="r.thumbUrl || r.photoUrl" loading="lazy" decoding="async" /></div>
               <div class="record-meta">
                 <div class="record-customer">{{ r.barcode }}<button v-if="adminMode || isMine(r)" class="btn-rename" title="修改此记录的条码" @click.stop="openRename(r)">改码</button></div>
@@ -2979,7 +3017,10 @@ const QueryPage = {
 
       <div v-if="rename" class="modal-mask" @click.self="rename = null">
         <div class="modal" style="max-width:420px">
-          <div class="modal-title">修改条码</div>
+          <div class="modal-head">
+            <h3>修改条码</h3>
+            <button class="modal-close" title="关闭" @click="rename = null">✕</button>
+          </div>
           <div class="modal-body">
             <div class="form-row">
               <label>原条码</label>
@@ -3000,7 +3041,10 @@ const QueryPage = {
 
       <div v-if="renameBatch" class="modal-mask" @click.self="renameBatch = null">
         <div class="modal" style="max-width:420px">
-          <div class="modal-title">批量改码</div>
+          <div class="modal-head">
+            <h3>批量改码</h3>
+            <button class="modal-close" title="关闭" @click="renameBatch = null">✕</button>
+          </div>
           <div class="modal-body">
             <div class="form-row">
               <label>已选 {{ selected.length }} 条记录，统一改为新条码 *</label>
@@ -5191,16 +5235,18 @@ const Shell = {
         <nav class="nav">
           <template v-for="g in navGroups" :key="g.name">
             <div class="nav-group-label" v-show="!collapsed">{{ g.name }}</div>
-            <div
+            <button
               v-for="p in g.items"
               :key="p.key"
+              type="button"
               class="nav-item"
               :class="{ active: active === p.key }"
               :title="collapsed ? p.label : ''"
+              :aria-current="active === p.key ? 'page' : null"
               @click="active = p.key"
             >
               <span class="nav-icon" v-html="p.icon"></span><span class="label">{{ p.label }}</span>
-            </div>
+            </button>
           </template>
         </nav>
         <div class="sidebar-foot">

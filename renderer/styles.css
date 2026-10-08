@@ -1280,6 +1280,11 @@ textarea {
   transform: translateY(-2px);
 }
 
+/* 键盘可达：卡片可聚焦后，焦点态需与 hover 同等可见（.record-card:focus-visible 见焦点环区块） */
+.record-card:focus-visible {
+  border-color: var(--primary);
+}
+
 .record-photo {
   aspect-ratio: 4 / 3;
   background: var(--divider);
@@ -1368,12 +1373,14 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 100;
+  /* 必须高于 .lightbox 的 200：灯箱内触发的确认/改码弹窗要盖在灯箱之上，
+     否则用户看不见确认框却会被 Enter 真实触发（尤其 danger 删除类）。toast 为 999，仍在最上层。 */
+  z-index: 300;
 }
 
 .modal {
   background: var(--card);
-  border-radius: 8px;
+  border-radius: var(--r-dialog);
   width: 720px;
   max-width: 92vw;
   max-height: 88vh;
@@ -2050,6 +2057,8 @@ tr:hover td {
   position: absolute;
   top: 8px;
   left: 8px;
+  /* 全局 label{margin:12px 0 6px} 会继承进来，导致勾选框整体下移 12px（同规则的 .batch-check 已重置） */
+  margin: 0;
   width: 22px;
   height: 22px;
   border-radius: 4px;
@@ -2315,7 +2324,8 @@ input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
 .nav-item:focus-visible,
-.card-check input:focus-visible {
+.card-check input:focus-visible,
+.record-card:focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
   box-shadow: none;
@@ -2500,6 +2510,15 @@ textarea:focus-visible,
 }
 
 .nav-item {
+  /* 键盘可达：nav-item 已从 div 改为 button，这里补按钮基础重置，
+     使盒模型与文字排布与改动前完全一致（视觉零变化）。 */
+  width: 100%;
+  appearance: none;
+  border: 0;
+  background: none;
+  font-family: inherit;
+  font-weight: 400;
+  text-align: left;
   display: flex;
   align-items: center;
   gap: 10px;
