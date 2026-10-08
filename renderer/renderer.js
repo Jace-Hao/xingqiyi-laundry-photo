@@ -23,6 +23,81 @@ function toast(msg, type) {
   }, 2600);
 }
 
+/* ---------- 通用确认对话框（替代 window.confirm：按钮可写动词、支持危险态、Esc/Enter/遮罩关闭） ---------- */
+// 单例状态：全应用共享同一个确认弹窗，任意组件调用 showConfirm 即可唤起。
+const confirmState = Vue.reactive({
+  open: false,
+  title: '提示',
+  message: '',
+  confirmText: '确定',
+  cancelText: '取消',
+  danger: false,
+  resolve: null
+});
+
+// 返回 Promise<boolean>：用户点确认解析为 true，取消 / Esc / 点遮罩解析为 false。
+function showConfirm(opts) {
+  return new Promise((resolve) => {
+    confirmState.title = opts && opts.title ? opts.title : '提示';
+    confirmState.message = opts && opts.message ? opts.message : '';
+    confirmState.confirmText = opts && opts.confirmText ? opts.confirmText : '确定';
+    confirmState.cancelText = opts && opts.cancelText ? opts.cancelText : '取消';
+    confirmState.danger = !!(opts && opts.danger);
+    confirmState.resolve = resolve;
+    confirmState.open = true;
+  });
+}
+
+const ConfirmModal = {
+  setup() {
+    const s = confirmState;
+    const confirmBtn = Vue.ref(null);
+    function close(val) {
+      const r = s.resolve;
+      s.open = false;
+      s.resolve = null;
+      if (r) r(val);
+    }
+    function onKey(e) {
+      if (!s.open) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close(false);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        close(true);
+      }
+    }
+    Vue.onMounted(() => window.addEventListener('keydown', onKey));
+    Vue.onUnmounted(() => window.removeEventListener('keydown', onKey));
+    Vue.watch(
+      () => s.open,
+      (v) => {
+        if (v) Vue.nextTick(() => {
+          if (confirmBtn.value && confirmBtn.value.focus) confirmBtn.value.focus();
+        });
+      }
+    );
+    return { s, close, confirmBtn };
+  },
+  template: `
+    <div v-if="s.open" class="modal-mask" @click.self="close(false)">
+      <div class="modal modal-sm" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
+        <div class="modal-head">
+          <h3 id="confirm-title">{{ s.title }}</h3>
+        </div>
+        <div class="modal-body">
+          <p class="confirm-msg">{{ s.message }}</p>
+        </div>
+        <div class="modal-foot">
+          <button class="btn btn-ghost" @click="close(false)">{{ s.cancelText }}</button>
+          <button ref="confirmBtn" class="btn" :class="s.danger ? 'btn-danger' : 'btn-primary'" @click="close(true)">{{ s.confirmText }}</button>
+        </div>
+      </div>
+    </div>
+  `
+};
+
 /* ---------- 条码纠错工具 ---------- */
 // 限定深度的编辑距离（> cap 提前退出，返回 cap+1），用于扫码误读比对
 function barcodeEditDistance(a, b, cap) {
@@ -822,7 +897,8 @@ const LoginPage = {
 
     /** 删除单个已保存账号 */
     async function removeSaved(name) {
-      if (!window.confirm('确定不再记住账号 ' + name + '？已保存的密码会一并清除。')) return;
+      const ok = await showConfirm({ title: '移除保存的账号', message: '不再记住账号『' + name + '』？\n已保存的密码会一并清除。', confirmText: '不再记住', danger: true });
+      if (!ok) return;
       try {
         const r = await window.api.removeCredential(name);
         if (r.ok) {
@@ -840,7 +916,8 @@ const LoginPage = {
 
     /** 清空全部已保存凭据 */
     async function clearSaved() {
-      if (!window.confirm('确定清空本机保存的全部账号与密码？此操作不可恢复。')) return;
+      const ok = await showConfirm({ title: '清空本机凭据', message: '清空本机保存的全部账号与密码？\n此操作不可恢复。', confirmText: '清空', danger: true });
+      if (!ok) return;
       try {
         const r = await window.api.clearCredentials();
         if (r.ok) {
@@ -1290,7 +1367,9 @@ const HomePage = {
 
       <h3 class="section-title">最近存档</h3>
       <div v-if="!recent.length" class="card empty">
-        {{ canCapture ? '还没有存档记录，去「衣物拍照」添加第一张照片吧' : '还没有存档记录' }}
+        <div class="empty-icon" aria-hidden="true"></div>
+        <div class="empty-title">{{ canCapture ? '还没有存档记录' : '暂无存档记录' }}</div>
+        <div class="empty-desc">{{ canCapture ? '去「衣物拍照」添加本店第一张衣物照片' : '本店暂时还没有衣物照片存档' }}</div>
       </div>
       <div v-else class="record-grid">
         <div v-for="r in recent" :key="r.id" class="record-card" @click="openDetail(r)">
@@ -1836,18 +1915,21 @@ const CapturePage = {
         if (warn.suspicious.length) probs.push('含有可疑字符 ' + warn.suspicious.join(' '));
         if (warn.formatIssues && warn.formatIssues.length) probs.push('不符合历史条码格式：' + warn.formatIssues.join('、'));
         if (warn.cleaned) {
-          const useClean = window.confirm(
-            '条码纠错提醒：当前条码' + probs.join('，且') + '。' +
-            '\n\n建议条码：' + warn.cleaned +
-            '\n\n【确定】使用清洗后条码保存；【取消】返回修改'
-          );
+          const useClean = await showConfirm({
+            title: '条码纠错提醒',
+            message: '当前条码' + probs.join('，且') + '。\n\n建议条码：' + warn.cleaned,
+            confirmText: '使用清洗后条码',
+            cancelText: '返回修改'
+          });
           if (!useClean) return;
           barcode.value = warn.cleaned;
         } else {
-          const go = window.confirm(
-            '条码纠错提醒：当前条码' + probs.join('，且') + '。' +
-            '\n\n【确定】仍按当前条码保存；【取消】返回修改'
-          );
+          const go = await showConfirm({
+            title: '条码纠错提醒',
+            message: '当前条码' + probs.join('，且') + '。',
+            confirmText: '仍按当前条码保存',
+            cancelText: '返回修改'
+          });
           if (!go) return;
         }
       }
@@ -2025,7 +2107,7 @@ const CapturePage = {
       </div>
 
       <div class="capture-layout">
-        <div class="card">
+        <div class="card capture-main">
           <div class="card-title">
             📷 摄像头取景
             <span v-if="resolution && !sleeping" class="tag tag-green" style="margin-left:8px">分辨率 {{ resolution }}</span>
@@ -2052,12 +2134,12 @@ const CapturePage = {
                 {{ d.label || ('摄像头 ' + (i + 1)) }}
               </option>
             </select>
-            <button class="btn btn-primary" :disabled="camState !== 'LIVE'" @click="capture">📸 拍照（空格）</button>
+            <button class="btn btn-primary btn-shutter" :disabled="camState !== 'LIVE'" @click="capture">📸 拍照（空格）</button>
             <button v-if="camState !== 'SLEEPING' && camState !== 'UNINIT'" class="btn btn-ghost" @click="sleepCamera('manual')">释放摄像头</button>
           </div>
         </div>
 
-        <div class="card">
+        <div class="card capture-side">
           <div class="card-title">🧾 存档信息</div>
 
           <label>衣物条形码 *</label>
@@ -2134,6 +2216,7 @@ const QueryPage = {
     const selected = Vue.ref([]); // 已勾选的记录 id
     const batchDeleting = Vue.ref(false);
     const exporting = Vue.ref(false);
+    const downloadingPhoto = Vue.ref(false);
 
     // 照片网格容器引用，用于测量可用宽高以计算每页数量
     const gridEl = Vue.ref(null);
@@ -2317,7 +2400,8 @@ const QueryPage = {
       const scope = selected.value.length
         ? '已勾选记录涉及的 ' + barcodes.length + ' 个条码'
         : '当前列表中的全部 ' + barcodes.length + ' 个条码';
-      if (!window.confirm('将按条码（订单号）分文件夹导出照片到本地目录。\n导出范围：' + scope + '。\n下一步请选择保存目录。')) return;
+      const ok = await showConfirm({ title: '导出照片', message: '将按条码（订单号）分文件夹导出照片到本地目录。\n导出范围：' + scope + '。', confirmText: '继续导出' });
+      if (!ok) return;
       const d = await window.api.chooseExportDir();
       if (!d.ok) {
         if (d.message && d.message !== '已取消') toast(d.message, 'error');
@@ -2355,7 +2439,8 @@ const QueryPage = {
         toast('开始日期不能晚于结束日期', 'error');
         return;
       }
-      if (!window.confirm('将导出 ' + dateFrom.value + ' 至 ' + dateTo.value + ' 期间的照片，按条码分文件夹归档，并生成归档表格。下一步请选择保存目录。')) return;
+      const ok = await showConfirm({ title: '按日期导出', message: '导出 ' + dateFrom.value + ' 至 ' + dateTo.value + ' 期间的照片，按条码分文件夹归档，并生成归档表格。', confirmText: '继续导出' });
+      if (!ok) return;
       const d = await window.api.chooseExportDir();
       if (!d.ok) {
         if (d.message && d.message !== '已取消') toast(d.message, 'error');
@@ -2392,7 +2477,8 @@ const QueryPage = {
       const now = new Date();
       const p2 = (n) => String(n).padStart(2, '0');
       const day = now.getFullYear() + '-' + p2(now.getMonth() + 1) + '-' + p2(now.getDate());
-      if (!window.confirm('将生成今天（' + day + '）全部订单的「条码 + 照片位置」表格（不包含照片文件），供洗衣管家上传助手同步照片使用。\n下一步请选择保存目录。')) return;
+      const ok = await showConfirm({ title: '下载当日订单表', message: '生成今天（' + day + '）全部订单的「条码 + 照片位置」表格（不包含照片文件），供洗衣管家上传助手同步照片使用。', confirmText: '生成表格' });
+      if (!ok) return;
       const d = await window.api.chooseExportDir();
       if (!d.ok) {
         if (d.message && d.message !== '已取消') toast(d.message, 'error');
@@ -2424,6 +2510,73 @@ const QueryPage = {
       }
     }
 
+    // 下载单张原始照片：经后端（服务端模式直接复制 / 客户端模式经 /photo 接口拉取）落盘到用户选定目录
+    async function downloadPhoto(r) {
+      if (downloadingPhoto.value) return;
+      const d = await window.api.chooseExportDir();
+      if (!d.ok) {
+        if (d.message && d.message !== '已取消') toast(d.message, 'error');
+        return;
+      }
+      downloadingPhoto.value = true;
+      toast('正在下载原片…', 'success');
+      try {
+        const res = await window.api.downloadPhoto(props.token, { photoFile: r.photoFile, targetDir: d.data });
+        if (res.ok) toast('原片已保存到所选目录', 'success');
+        else toast(res.message || '下载失败', 'error');
+      } catch (e) {
+        toast('下载失败：' + (e.message || e), 'error');
+      } finally {
+        downloadingPhoto.value = false;
+      }
+    }
+
+    // 批量下载原始照片：按条码（订单号）分文件夹落盘，不生成任何清单文件（与导出区分）
+    async function downloadSelected() {
+      if (exporting.value) return;
+      const source = selected.value.length
+        ? items.value.filter((r) => selected.value.includes(r.id))
+        : items.value.slice();
+      const barcodes = [...new Set(source.map((r) => r.barcode).filter(Boolean))];
+      if (!barcodes.length) {
+        toast('没有可下载的记录', 'error');
+        return;
+      }
+      const scope = selected.value.length
+        ? '已勾选记录涉及的 ' + barcodes.length + ' 个条码'
+        : '当前列表中的全部 ' + barcodes.length + ' 个条码';
+      const ok = await showConfirm({
+        title: '下载原片',
+        message: '将按条码（订单号）分文件夹下载原始照片到本地目录（不生成任何清单文件）。\n下载范围：' + scope + '。',
+        confirmText: '下载原片'
+      });
+      if (!ok) return;
+      const d = await window.api.chooseExportDir();
+      if (!d.ok) {
+        if (d.message && d.message !== '已取消') toast(d.message, 'error');
+        return;
+      }
+      exporting.value = true;
+      toast('正在下载原片，数量较多时请稍候…', 'success');
+      try {
+        const res = await window.api.downloadPhotos(props.token, { targetDir: d.data, barcodes });
+        if (res.ok) {
+          toast(
+            '下载完成：' + res.data.folders + ' 个文件夹、' + res.data.exported + ' 张原片' +
+            (res.data.skipped ? '，缺失跳过 ' + res.data.skipped + ' 张' : '') +
+            (res.data.failed ? '，失败 ' + res.data.failed + ' 张' : ''),
+            'success'
+          );
+        } else {
+          toast(res.message || '下载失败', 'error');
+        }
+      } catch (e) {
+        toast('下载失败：' + (e.message || e), 'error');
+      } finally {
+        exporting.value = false;
+      }
+    }
+
     function toggleSelect(r) {
       const i = selected.value.indexOf(r.id);
       if (i === -1) selected.value.push(r.id);
@@ -2443,7 +2596,8 @@ const QueryPage = {
         toast('请先勾选要删除的记录', 'error');
         return;
       }
-      if (!window.confirm('确定批量删除选中的 ' + selected.value.length + ' 条记录？照片将一并删除，不可恢复。')) return;
+      const ok = await showConfirm({ title: '批量删除记录', message: '删除选中的 ' + selected.value.length + ' 条记录？\n照片将一并删除，不可恢复。', confirmText: '删除这 ' + selected.value.length + ' 条记录', danger: true });
+      if (!ok) return;
       batchDeleting.value = true;
       try {
         const res = await window.api.deleteRecords(props.token, selected.value.slice());
@@ -2471,7 +2625,8 @@ const QueryPage = {
       const nb = String(st.newBarcode || '').trim();
       if (!nb) { toast('请输入新条码', 'error'); return; }
       if (nb === st.barcode) { toast('新条码与原条码相同', 'error'); return; }
-      if (!window.confirm('确定把条码「' + st.barcode + '」改为「' + nb + '」？\n照片将移入新条码文件夹，编号重新排列，操作会记入日志。')) return;
+      const ok = await showConfirm({ title: '修改条码', message: '把条码『' + st.barcode + '』改为『' + nb + '』？\n照片将移入新条码文件夹，编号重新排列，操作会记入日志。', confirmText: '修改条码' });
+      if (!ok) return;
       st.saving = true;
       try {
         const res = await window.api.renameBarcode(props.token, st.id, nb);
@@ -2499,7 +2654,8 @@ const QueryPage = {
       if (!st || st.saving) return;
       const nb = String(st.newBarcode || '').trim();
       if (!nb) { toast('请输入新条码', 'error'); return; }
-      if (!window.confirm('确定把选中的 ' + selected.value.length + ' 条记录统一改为「' + nb + '」？\n照片将移入新条码文件夹并重新编号，操作记入日志。')) return;
+      const ok = await showConfirm({ title: '批量改码', message: '把选中的 ' + selected.value.length + ' 条记录统一改为『' + nb + '』？\n照片将移入新条码文件夹并重新编号，操作记入日志。', confirmText: '批量改码' });
+      if (!ok) return;
       st.saving = true;
       try {
         const res = await window.api.renameBarcodeBatch(props.token, selected.value.slice(), nb);
@@ -2597,7 +2753,8 @@ const QueryPage = {
     }
 
     async function remove(r) {
-      if (!window.confirm('确定删除该存档记录？照片将一并删除，不可恢复。')) return;
+      const ok = await showConfirm({ title: '删除记录', message: '删除该存档记录？\n照片将一并删除，不可恢复。', confirmText: '删除该记录', danger: true });
+      if (!ok) return;
       const res = await window.api.deleteRecord(props.token, r.id);
       if (res.ok) {
         toast('已删除', 'success');
@@ -2700,6 +2857,7 @@ const QueryPage = {
       page, pageSize, totalPages, loading, detail, detailIndex, gridEl,
       selected, batchDeleting, toggleSelect, selectAll, batchDelete,
       exporting, exportByBarcode, exportByDate, exportToday,
+      downloadingPhoto, downloadPhoto, downloadSelected,
       search, reset, openDetail, remove, prev, next, goPage, fmt, rename, openRename, submitRename, renameBatch, openRenameBatch, submitRenameBatch,
       // 灯箱预览：缩放、平移、切换
       zoomScale, panX, panY, imgLoaded, imgNatural,
@@ -2760,6 +2918,9 @@ const QueryPage = {
           <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="exportByBarcode">
             {{ exporting ? '导出中…' : '⬇ 按订单号批量下载' }}
           </button>
+          <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="downloadSelected" title="按条码分文件夹下载原始照片（不生成清单）">
+            {{ exporting ? '下载中…' : '⬇ 下载原片（按文件夹）' }}
+          </button>
           <button class="btn btn-ghost btn-sm" :disabled="exporting" @click="exportByDate" title="按上方日期范围导出照片，并生成条码+文件位置表格">
             ⬇ 按日期导出
           </button>
@@ -2772,8 +2933,15 @@ const QueryPage = {
         </div>
 
         <div ref="gridEl" class="query-results">
-          <div v-if="loading" class="empty">加载中…</div>
-          <div v-else-if="!items.length" class="empty">暂无符合条件的存档记录</div>
+          <div v-if="loading" class="skeleton-grid" aria-busy="true">
+            <div v-for="n in 8" :key="n" class="skeleton skeleton-card"></div>
+          </div>
+          <div v-else-if="!items.length" class="empty">
+            <div class="empty-icon" aria-hidden="true"></div>
+            <div class="empty-title">没有符合条件的存档记录</div>
+            <div class="empty-desc">调整时间范围或条码关键词再试一次；刚拍完照可先刷新列表。</div>
+            <button class="btn btn-ghost" @click="reset">清空筛选条件</button>
+          </div>
           <div v-else class="record-grid">
             <div v-for="r in items" :key="r.id" class="record-card" @click="openDetail(r)">
               <div class="record-photo"><img :src="r.thumbUrl || r.photoUrl" loading="lazy" decoding="async" /></div>
@@ -2848,15 +3016,12 @@ const QueryPage = {
       </div>
 
       <div v-if="detail" class="lightbox" @click.self="closeDetail" @wheel="onWheel">
-        <!-- 顶部信息条 -->
+        <!-- 左：看图区（顶部条 + 舞台 + 底部工具，保持原有缩放/平移/切换行为） -->
+        <div class="lightbox-main">
+        <!-- 顶部信息条：只留舞台相关（条码/时间等已移至右侧信息面板） -->
         <div class="lightbox-top">
           <div class="lightbox-info">
-            <span class="lightbox-barcode">{{ detail.barcode }}</span>
-            <span class="lightbox-seq">第 {{ detail.seq }} 张</span>
-            <span v-if="adminMode || !isMine(detail)" class="lightbox-owner">{{ detail.username }}</span>
-            <span v-if="adminMode && detail.storeName" class="lightbox-owner">门店：{{ detail.storeName }}</span>
-            <span class="lightbox-time">{{ fmt(detail.createdAt) }}</span>
-            <span v-if="detail.note" class="lightbox-note" :title="detail.note">备注：{{ detail.note }}</span>
+            <span class="lightbox-barcode only-narrow">{{ detail.barcode }}</span>
             <span v-if="imgNatural.w" class="lightbox-dim">{{ imgNatural.w }}×{{ imgNatural.h }}</span>
             <span class="lightbox-zoom">{{ Math.round(zoomScale * 100) }}%</span>
             <span v-if="detailIndex >= 0" class="lightbox-pos">{{ detailIndex + 1 }} / {{ items.length }}</span>
@@ -2895,28 +3060,139 @@ const QueryPage = {
           @click.stop="nextPhoto"
         >›</button>
 
-        <!-- 底部工具条 -->
+        <!-- 底部工具条：只留缩放控制（删除与权限提示已移至右侧信息面板操作区） -->
         <div class="lightbox-bottom">
           <button class="lightbox-btn" title="缩小（-）" @click="zoomOut">－</button>
           <button class="lightbox-btn" title="实际大小（0）" @click="zoomReset">1:1</button>
           <button class="lightbox-btn" title="放大（+）" @click="zoomIn">＋</button>
           <span class="lightbox-hint">滚轮缩放 · 拖拽平移 · 双击放大 · ←/→ 切换 · Esc 关闭</span>
-          <button
-            v-if="adminMode || isMine(detail)"
-            class="lightbox-btn lightbox-danger"
-            @click="remove(detail)"
-          >删除记录</button>
-          <span v-else class="lightbox-hint">该记录由同门店同事录入，仅可查看与导出，不可删除</span>
         </div>
+        </div>
+
+        <!-- 右：信息面板 360px（<1024 隐藏，条码回落顶部条） -->
+        <aside class="lightbox-panel" @wheel.stop>
+          <div class="panel-barcode" :title="detail.barcode">{{ detail.barcode }}</div>
+          <div class="panel-tags">
+            <span class="tag tag-orange">第 {{ detail.seq }} 张</span>
+            <span v-if="adminMode || !isMine(detail)" class="tag tag-owner">{{ detail.username }}</span>
+            <span v-if="adminMode && detail.storeName" class="tag">{{ detail.storeName }}</span>
+          </div>
+          <div class="panel-rows">
+            <div class="info-row"><span>拍摄时间</span><b class="code">{{ fmt(detail.createdAt) }}</b></div>
+            <div class="info-row"><span>录入人</span><b>{{ detail.username }}</b></div>
+            <div class="info-row"><span>所属门店</span><b>{{ detail.storeName || '本店' }}</b></div>
+            <div class="info-row"><span>照片尺寸</span><b class="code">{{ imgNatural.w && imgNatural.h ? imgNatural.w + '×' + imgNatural.h : '—' }}</b></div>
+            <div v-if="detail.note" class="info-row"><span>备注</span><b :title="detail.note">{{ detail.note }}</b></div>
+          </div>
+          <div class="panel-actions">
+            <button
+              class="btn btn-primary"
+              :disabled="downloadingPhoto"
+              @click.stop="downloadPhoto(detail)"
+              title="经后端取回本张原始照片，保存到本地目录"
+            >下载原片</button>
+            <button
+              v-if="adminMode || isMine(detail)"
+              class="btn btn-ghost"
+              @click.stop="openRename(detail)"
+            >修改条码</button>
+            <button
+              v-if="adminMode || isMine(detail)"
+              class="btn btn-danger-outline"
+              @click.stop="remove(detail)"
+            >删除记录</button>
+            <span v-else class="panel-hint">该记录由同门店同事录入，仅可查看，不可删除或修改</span>
+          </div>
+        </aside>
       </div>
     </div>
   `
 };
 
+/* ---------- 设计体系 v2：外观主题状态（模块级单例） ----------
+   主题只写 <html data-theme>，深浅色切换只换一组 CSS 变量，不触碰业务组件。
+   状态放在模块级，是为了让「设置页 · 外观」与「侧栏外观按钮」始终读到同一份值，
+   同时避免外壳反复挂载时重复注册 matchMedia 监听。 */
+const THEME_KEYS = ['system', 'light', 'dark'];
+const THEME_LABEL = { system: '跟随系统', light: '浅色', dark: '深色' };
+
+function readPref(key, fallback) {
+  try {
+    const v = window.localStorage.getItem(key);
+    return v === null ? fallback : v;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function writePref(key, val) {
+  try {
+    window.localStorage.setItem(key, val);
+  } catch (e) {
+    /* 无痕模式 / 存储不可用时静默降级为单次生效 */
+  }
+}
+
+let themeStore = null;
+function useTheme() {
+  if (themeStore) return themeStore;
+
+  const theme = Vue.ref(readPref('xqy-theme', 'system'));
+  if (!THEME_KEYS.includes(theme.value)) theme.value = 'system';
+
+  function isDark() {
+    if (theme.value === 'dark') return true;
+    if (theme.value === 'light') return false;
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+
+  function applyTheme() {
+    const root = document.documentElement;
+    // system 需要显式标记，确保 CSS 变量切换到浅色分支
+    root.setAttribute('data-theme', theme.value === 'system' ? (isDark() ? 'dark' : 'light') : theme.value);
+  }
+
+  function setTheme(next) {
+    if (!THEME_KEYS.includes(next)) return;
+    theme.value = next;
+    writePref('xqy-theme', next);
+    applyTheme();
+  }
+
+  function cycleTheme() {
+    setTheme(THEME_KEYS[(THEME_KEYS.indexOf(theme.value) + 1) % THEME_KEYS.length]);
+  }
+
+  applyTheme();
+  // 跟随系统时监听系统主题变化，避免运行中不跟随
+  try {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    if (mq.addEventListener) mq.addEventListener('change', applyTheme);
+    else if (mq.addListener) mq.addListener(applyTheme);
+  } catch (e) {
+    /* 环境不支持时忽略，主题退化为手动切换 */
+  }
+
+  const themeLabel = Vue.computed(() => THEME_LABEL[theme.value] || '跟随系统');
+  const themeIcon = Vue.computed(
+    () =>
+      ({
+        system: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"/></svg>',
+        light: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.8v2.2M12 19v2.2M2.8 12h2.2M19 12h2.2M5.6 5.6 7 7M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"/></svg>',
+        dark: '<svg viewBox="0 0 24 24"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4 7 7 0 1 0 20 14.5Z"/></svg>'
+      }[theme.value] || '')
+  );
+
+  themeStore = { theme, themeLabel, themeIcon, cycleTheme, setTheme };
+  return themeStore;
+}
+
 /* ---------- 客户端 · 设置页 ---------- */
 const SettingsPage = {
   props: { user: { type: Object, required: true }, token: { type: String, required: true } },
-  setup(props) {
+  // 危险区「退出登录」只发事件，登录态重置统一交给外壳/App，避免本页直接调用接口导致界面状态不同步
+  emits: ['logout'],
+  setup(props, { emit }) {
     const oldPassword = Vue.ref('');
     const newPassword = Vue.ref('');
     const confirmPassword = Vue.ref('');
@@ -2969,66 +3245,137 @@ const SettingsPage = {
       return s + (u.role === 'storeadmin' ? '（可见本店全部记录）' : '（可见同店记录）');
     });
 
+    // ---------- 设计体系 v2：外观分区 + 二级导航 ----------
+    // 主题状态为模块级单例，与侧栏「外观」按钮共用同一份值，两处改动实时一致
+    const { theme, setTheme } = useTheme();
+    const themeOptions = [
+      { key: 'system', label: '跟随系统', desc: '随操作系统深浅色自动切换' },
+      { key: 'light', label: '浅色', desc: '门店明亮环境推荐' },
+      { key: 'dark', label: '深色', desc: '夜间或低照度环境' }
+    ];
+
+    // 二级导航：点击滚动到对应分区。不做滚动监听，省掉长列表的滚动计算开销
+    const activeSection = Vue.ref('account');
+    function goSection(key) {
+      activeSection.value = key;
+      const el = document.getElementById('sec-' + key);
+      if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    function logout() {
+      emit('logout');
+    }
+
     return {
       user: props.user, oldPassword, newPassword, confirmPassword, saving, submit, fmt, storeLabel, roleLabel,
       version, updateInfo, downloading, canAutoDownload, progressPercent, progressText,
-      downloadPackage, cancelDownload
+      downloadPackage, cancelDownload,
+      theme, themeOptions, setTheme, activeSection, goSection, logout
     };
   },
   template: `
     <div>
       <div class="page-head">
         <h2>设置</h2>
-        <p>查看账号信息并修改登录密码</p>
+        <p>查看账号信息、调整外观并修改登录密码</p>
       </div>
 
-      <div class="settings-grid">
-        <div class="card">
-          <div class="card-title">👤 账号信息</div>
-          <div class="info-row"><span>账号</span><b>{{ user.username }}</b></div>
-          <div class="info-row"><span>姓名</span><b>{{ user.name }}</b></div>
-          <div class="info-row"><span>角色</span><b>{{ roleLabel(user.role) }}</b></div>
-          <div class="info-row"><span>所属门店</span><b>{{ storeLabel }}</b></div>
-          <div class="info-row"><span>拍照权限</span><b>{{ user.permissions && user.permissions.capture ? '已开通' : '未开通' }}</b></div>
-          <div class="info-row"><span>查询权限</span><b>{{ user.permissions && user.permissions.query ? '已开通' : '未开通' }}</b></div>
-          <div class="info-row"><span>创建时间</span><b>{{ fmt(user.createdAt) }}</b></div>
-          <div class="info-row"><span>最近登录</span><b>{{ user.lastLoginAt ? fmt(user.lastLoginAt) : '-' }}</b></div>
-        </div>
+      <div class="settings-layout">
+        <!-- 左侧二级导航 200px（sticky） -->
+        <aside class="settings-nav">
+          <button class="settings-nav-item" :class="{ on: activeSection === 'account' }" @click="goSection('account')">账户与安全</button>
+          <button class="settings-nav-item" :class="{ on: activeSection === 'appearance' }" @click="goSection('appearance')">外观</button>
+          <button class="settings-nav-item" :class="{ on: activeSection === 'version' }" @click="goSection('version')">版本与更新</button>
+          <button class="settings-nav-item" :class="{ on: activeSection === 'about' }" @click="goSection('about')">关于</button>
+        </aside>
 
-        <div class="card">
-          <div class="card-title">🔒 修改密码</div>
-          <label>原密码</label>
-          <input v-model="oldPassword" type="password" placeholder="请输入原密码" />
-          <label>新密码（至少 6 位）</label>
-          <input v-model="newPassword" type="password" placeholder="请输入新密码" />
-          <label>确认新密码</label>
-          <input v-model="confirmPassword" type="password" placeholder="请再次输入新密码" />
-          <button class="btn btn-primary" :disabled="saving" @click="submit">
-            {{ saving ? '保存中…' : '保存修改' }}
-          </button>
-        </div>
+        <!-- 右侧：每分区一张卡，危险区独立红描边卡 -->
+        <div class="settings-sections">
+          <section id="sec-account" class="card">
+            <div class="card-title">👤 账号信息</div>
+            <div class="info-row"><span>账号</span><b>{{ user.username }}</b></div>
+            <div class="info-row"><span>姓名</span><b>{{ user.name }}</b></div>
+            <div class="info-row"><span>角色</span><b>{{ roleLabel(user.role) }}</b></div>
+            <div class="info-row"><span>所属门店</span><b>{{ storeLabel }}</b></div>
+            <div class="info-row"><span>拍照权限</span><b>{{ user.permissions && user.permissions.capture ? '已开通' : '未开通' }}</b></div>
+            <div class="info-row"><span>查询权限</span><b>{{ user.permissions && user.permissions.query ? '已开通' : '未开通' }}</b></div>
+            <div class="info-row"><span>创建时间</span><b>{{ fmt(user.createdAt) }}</b></div>
+            <div class="info-row"><span>最近登录</span><b>{{ user.lastLoginAt ? fmt(user.lastLoginAt) : '-' }}</b></div>
+          </section>
 
-        <div class="card">
-          <div class="card-title">⬇️ 版本与更新</div>
-          <div class="settings-version">
-            <span class="login-version-text">当前版本 <b>v{{ version || '-' }}</b></span>
-            <template v-if="downloading">
-              <div class="login-dl-progress">
-                <div class="login-dl-bar"><i :style="{ width: progressPercent + '%' }"></i></div>
-                <span>{{ progressText }}</span>
+          <section class="card">
+            <div class="card-title">🔒 修改密码</div>
+            <label>原密码</label>
+            <input v-model="oldPassword" type="password" placeholder="请输入原密码" />
+            <label>新密码（至少 6 位）</label>
+            <input v-model="newPassword" type="password" placeholder="请输入新密码" />
+            <label>确认新密码</label>
+            <input v-model="confirmPassword" type="password" placeholder="请再次输入新密码" />
+            <button class="btn btn-primary" :disabled="saving" @click="submit">
+              {{ saving ? '保存中…' : '保存修改' }}
+            </button>
+          </section>
+
+          <section id="sec-appearance" class="card">
+            <div class="card-title">🎨 外观</div>
+            <div class="theme-choices">
+              <button
+                v-for="t in themeOptions"
+                :key="t.key"
+                class="theme-choice"
+                :class="{ on: theme === t.key }"
+                @click="setTheme(t.key)"
+              >
+                <span class="theme-swatch" :class="t.key"></span>
+                <b>{{ t.label }}</b>
+                <span class="theme-desc">{{ t.desc }}</span>
+              </button>
+            </div>
+            <p class="settings-version-tip">与侧栏「外观」按钮共用同一份设置，两处改动实时一致。</p>
+          </section>
+
+          <section id="sec-version" class="card">
+            <div class="card-title">⬇️ 版本与更新</div>
+            <div class="settings-version">
+              <span class="login-version-text">当前版本 <b>v{{ version || '-' }}</b></span>
+              <template v-if="downloading">
+                <div class="login-dl-progress">
+                  <div class="login-dl-bar"><i :style="{ width: progressPercent + '%' }"></i></div>
+                  <span>{{ progressText }}</span>
+                </div>
+                <button class="btn btn-ghost btn-sm" @click="cancelDownload">取消下载</button>
+              </template>
+              <template v-else>
+                <button v-if="canAutoDownload" class="btn btn-primary btn-sm" @click="downloadPackage">
+                  ⬇️ 一键下载安装包
+                </button>
+                <button v-else-if="updateInfo" class="btn btn-ghost btn-sm" @click="downloadPackage">
+                  ⬇️ 打开下载页
+                </button>
+                <p class="settings-version-tip">下载完成后会打开安装包所在文件夹，双击安装即可覆盖升级。</p>
+              </template>
+            </div>
+          </section>
+
+          <section id="sec-about" class="card">
+            <div class="card-title">ℹ️ 关于</div>
+            <div class="info-row"><span>软件名称</span><b>星期衣精致洗衣 · 衣物照片系统</b></div>
+            <div class="info-row"><span>当前版本</span><b class="code">v{{ version || '-' }}</b></div>
+            <div class="info-row"><span>所属门店</span><b>{{ storeLabel }}</b></div>
+            <div class="info-row"><span>登录账号</span><b>{{ user.username }}</b></div>
+          </section>
+
+          <!-- 危险区：独立红描边卡，与其他设置物理隔离 -->
+          <section class="card danger-zone">
+            <div class="card-title">⚠️ 危险区</div>
+            <div class="danger-row">
+              <div>
+                <b>退出登录</b>
+                <p>退出后需要重新输入账号密码；离线未同步的照片会保留在本机。</p>
               </div>
-              <button class="btn btn-ghost btn-sm" @click="cancelDownload">取消下载</button>
-            </template>
-            <template v-else>
-              <button v-if="canAutoDownload" class="btn btn-primary btn-sm" @click="downloadPackage">
-                ⬇️ 一键下载安装包
-              </button>
-              <button v-else-if="updateInfo" class="btn btn-ghost btn-sm" @click="downloadPackage">
-                ⬇️ 打开下载页
-              </button>
-              <p class="settings-version-tip">下载完成后会打开安装包所在文件夹，双击安装即可覆盖升级。</p>
-            </template>
-          </div>
+              <button class="btn btn-danger-outline" @click="logout">退出登录</button>
+            </div>
+          </section>
         </div>
       </div>
     </div>
@@ -3088,7 +3435,11 @@ const AdminOverviewPage = {
 
       <h3 class="section-title">最近存档</h3>
       <div class="card">
-        <div v-if="o && !o.recentRecords.length" class="empty">暂无存档记录</div>
+        <div v-if="o && !o.recentRecords.length" class="empty">
+          <div class="empty-icon" aria-hidden="true"></div>
+          <div class="empty-title">暂无存档记录</div>
+          <div class="empty-desc">本店还没有衣物照片入库</div>
+        </div>
         <div v-else-if="o" class="record-grid">
           <div v-for="r in o.recentRecords" :key="r.id" class="record-card" style="cursor:default">
             <div class="record-photo"><img :src="r.thumbUrl || r.photoUrl" loading="lazy" decoding="async" /></div>
@@ -3278,7 +3629,8 @@ const AdminUsersPage = {
     }
 
     async function remove(u) {
-      if (!window.confirm('确定删除账号 ' + u.username + '？该操作不可恢复。')) return;
+      const ok = await showConfirm({ title: '删除账号', message: '删除账号『' + u.username + '』？\n该操作不可恢复。', confirmText: '删除账号', danger: true });
+      if (!ok) return;
       const r = await window.api.deleteUser(props.token, u.id);
       if (r.ok) {
         toast('账号已删除', 'success');
@@ -3581,8 +3933,15 @@ const AdminLogsPage = {
           <button class="btn btn-ghost" @click="reset">重置</button>
         </div>
 
-        <div v-if="loading" class="empty">加载中…</div>
-        <div v-else-if="!items.length" class="empty">暂无符合条件的日志</div>
+        <div v-if="loading" class="skeleton-grid" aria-busy="true">
+          <div v-for="n in 6" :key="n" class="skeleton skeleton-row"></div>
+        </div>
+        <div v-else-if="!items.length" class="empty">
+          <div class="empty-icon" aria-hidden="true"></div>
+          <div class="empty-title">没有符合条件的操作日志</div>
+          <div class="empty-desc">调整账号或操作类型再试一次。</div>
+          <button class="btn btn-ghost" @click="reset">清空筛选条件</button>
+        </div>
         <div v-else class="table-wrap">
           <table>
             <thead>
@@ -3752,10 +4111,14 @@ const AdminSystemPage = {
         const cur = retentionInfo.value.retentionDays;
         const shrinking = cur === null || parsed.value < cur;
         if (shrinking) {
-          const ok = window.confirm(
-            `将订单保留期设为 ${parsed.value} 天后，超过该期限的订单及其照片将被自动删除，且不可恢复。\n\n` +
-              `保存本身不会立即删除数据（自动清理按计划在后台执行），但你也可以点「试算」先看看会影响多少条。\n\n确定保存？`
-          );
+          const ok = await showConfirm({
+            title: '设置订单保留期',
+            danger: true,
+            message:
+              `将订单保留期设为 ${parsed.value} 天后，超过该期限的订单及其照片将被自动删除，且不可恢复。\n\n` +
+              `保存本身不会立即删除数据（自动清理按计划在后台执行），你也可以点「试算」先看看会影响多少条。`,
+            confirmText: '保存保留期'
+          });
           if (!ok) return;
         }
       }
@@ -3818,15 +4181,18 @@ const AdminSystemPage = {
         // 手动清理是刻意绕过「全删熔断」的（熔断只防无人值守的自动误删），
         // 因此当本次会清空全部订单时，单独给出更醒目的警示，避免管理员误点。
         const wipingAll = pre.data.kept === 0;
-        const ok = window.confirm(
-          (wipingAll
-            ? '⚠️ 警告：本次清理将删除【全部】订单数据，清理后系统将没有任何订单记录！\n\n'
-            : '') +
+        const ok = await showConfirm({
+          title: '清理超期订单',
+          danger: true,
+          message:
+            (wipingAll
+              ? '⚠️ 警告：本次清理将删除【全部】订单数据，清理后系统将没有任何订单记录！\n\n'
+              : '') +
             `即将永久删除 ${n} 条超期订单及其照片文件，此操作不可恢复。\n\n` +
             `保留期：${pre.data.retentionDays} 天\n截止时间点：${fmt(pre.data.cutoffIso)}\n删除后剩余：${pre.data.kept} 条\n\n` +
-            (wipingAll ? '请先确认保留期设置正确，并务必先导出备份。' : '建议先导出备份。') +
-            '\n确定立即删除？'
-        );
+            (wipingAll ? '请先确认保留期设置正确，并务必先导出备份。' : '建议先导出备份。'),
+          confirmText: '立即删除'
+        });
         if (!ok) {
           purgeResult.value = '已取消，未删除任何数据。';
           return;
@@ -4016,7 +4382,8 @@ const AdminSystemPage = {
     }
 
     async function resetToken() {
-      if (!window.confirm('重置后，所有客户端需使用新连接码重新配置。确定重置？')) return;
+      const ok = await showConfirm({ title: '重置连接配置', message: '重置后，所有客户端需使用新连接码重新配置。', confirmText: '重置连接码', danger: true });
+      if (!ok) return;
       resettingToken.value = true;
       try {
         const r = await window.api.resetApiToken(props.token);
@@ -4062,6 +4429,15 @@ const AdminSystemPage = {
     }
 
     Vue.onMounted(load);
+
+    // 设计 v2：二级导航（点击滚动到对应分区，不做滚动监听）
+    const activeSection = Vue.ref('service');
+    function goSection(key) {
+      activeSection.value = key;
+      const el = document.getElementById('sec-' + key);
+      if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
     return {
       info, localIp, portInput, savingPort, savePort,
       resettingToken, resetToken,
@@ -4074,7 +4450,9 @@ const AdminSystemPage = {
       // 订单保留期与自动清理
       retentionInfo, retentionInput, savingRetention, purging, purgeResult,
       loadRetention, saveRetention, previewPurge, purgeNow,
-      canSetRetention, retentionDisabledReason, fmt
+      canSetRetention, retentionDisabledReason, fmt,
+      // 设计 v2：二级导航（点击滚动到对应分区，不做滚动监听）
+      activeSection, goSection
     };
   },
   template: `
@@ -4084,8 +4462,18 @@ const AdminSystemPage = {
         <p>服务端口、连接码与照片保存路径（仅服务端生效）</p>
       </div>
 
-      <div v-if="info" class="settings-grid">
-        <div class="card">
+      <div v-if="info" class="settings-layout">
+        <!-- 左侧二级导航 200px（sticky） -->
+        <aside class="settings-nav">
+          <button class="settings-nav-item" :class="{ on: activeSection === 'service' }" @click="goSection('service')">服务信息</button>
+          <button class="settings-nav-item" :class="{ on: activeSection === 'storage' }" @click="goSection('storage')">存储与同步</button>
+          <button class="settings-nav-item" :class="{ on: activeSection === 'autolaunch' }" @click="goSection('autolaunch')">开机自启</button>
+          <button class="settings-nav-item" :class="{ on: activeSection === 'version' }" @click="goSection('version')">版本与更新</button>
+          <button class="settings-nav-item" :class="{ on: activeSection === 'retention' }" @click="goSection('retention')">数据保留期</button>
+        </aside>
+
+        <div class="settings-sections">
+        <section id="sec-service" class="card">
           <div class="card-title">🌐 服务信息</div>
           <div class="info-row"><span>运行模式</span><b>{{ info.mode === 'server' ? '服务端' : '客户端' }}</b></div>
           <div class="info-row"><span>本机局域网 IP</span><b>{{ localIp }}</b></div>
@@ -4114,10 +4502,10 @@ const AdminSystemPage = {
               <button class="btn btn-ghost" @click="copyFirewallCmd">复制防火墙放行命令</button>
             </div>
           </div>
-        </div>
+        </section>
 
-        <div class="card">
-          <div class="card-title">🖼️ 照片保存路径</div>
+        <section id="sec-storage" class="card">
+          <div class="card-title">🖼️ 存储与同步 · 照片保存路径</div>
           <label>保存目录（修改时自动迁移现有照片）</label>
           <input v-model="photoPathInput" placeholder="选择或输入目录路径" :disabled="remoteLocked" />
           <div style="display:flex;gap:10px;margin-top:16px">
@@ -4133,11 +4521,10 @@ const AdminSystemPage = {
           <p v-else class="setup-desc" style="margin-top:14px">
             照片按原始分辨率保存为 JPG 文件；修改路径前会先校验目标目录，避免覆盖同名文件。
           </p>
-        </div>
-      </div>
+        </section>
 
-      <div v-if="info" class="card" style="margin-top:18px">
-        <div class="card-title">🚀 开机自动启动</div>
+        <section v-if="info" id="sec-autolaunch" class="card">
+          <div class="card-title">🚀 开机自动启动</div>
         <div class="info-row">
           <span>当前状态</span>
           <b v-if="!autoLaunchInfo">未知（读取失败，可点击刷新）</b>
@@ -4171,10 +4558,10 @@ const AdminSystemPage = {
           持续为各客户端提供照片服务，避免门店断电重启后服务没起来。
           需要操作界面时点托盘图标即可打开。仅服务端电脑需要开启。
         </p>
-      </div>
+        </section>
 
-      <div v-if="info" class="card" style="margin-top:18px">
-        <div class="card-title">🗑️ 订单数据保留期</div>
+        <section v-if="info" id="sec-retention" class="card danger-zone">
+          <div class="card-title">🗑️ 危险区 · 订单数据保留期</div>
 
         <div class="info-row">
           <span>当前设置</span>
@@ -4241,10 +4628,10 @@ const AdminSystemPage = {
             {{ purgeResult }}
           </p>
         </template>
-      </div>
+        </section>
 
-      <div v-if="info" class="card" style="margin-top:18px">
-        <div class="card-title">📦 版本与更新</div>
+        <section v-if="info" id="sec-version" class="card">
+          <div class="card-title">📦 版本与更新</div>
         <div class="info-row"><span>当前版本</span><b class="code">v{{ version || '-' }}</b></div>
         <div class="info-row">
           <span>检查结果</span>
@@ -4279,10 +4666,10 @@ const AdminSystemPage = {
           <button class="btn btn-ghost" @click="openUpdatePage">前往下载页</button>
           <button v-if="info.mode === 'server'" class="btn btn-ghost" @click="openUpdateFolder">打开软件更新文件夹</button>
         </div>
-      </div>
+        </section>
 
-      <div v-if="info && info.mode === 'server'" class="card" style="margin-top:18px">
-        <div class="card-title">📣 强制推送安装包</div>
+        <section v-if="info && info.mode === 'server'" id="sec-force" class="card">
+          <div class="card-title">📣 强制推送安装包</div>
         <div class="info-row">
           <span>当前状态</span>
           <b v-if="forceInfo && forceInfo.enabled" style="color:#d97706">
@@ -4326,6 +4713,8 @@ const AdminSystemPage = {
           在上方列表选中它 → 点「开启强制推送」。客户端下次登录时会自动从服务器下载该安装包，
           下载完成后弹窗提示店员双击安装；版本号不高于客户端当前版本的不会触发。
         </p>
+        </section>
+        </div>
       </div>
     </div>
   `
@@ -4407,10 +4796,16 @@ const ManualPage = {
         文档可能未随本版更新，请以实际界面为准。
       </div>
 
-      <div v-if="loading" class="card empty">正在加载操作手册…</div>
+      <div v-if="loading" class="card">
+        <div class="skeleton skeleton-line" style="width:38%"></div>
+        <div class="skeleton skeleton-line" style="width:100%"></div>
+        <div class="skeleton skeleton-line" style="width:92%"></div>
+        <div class="skeleton skeleton-line" style="width:76%"></div>
+        <div class="empty-desc" style="margin-top:12px">正在加载操作手册…</div>
+      </div>
       <div v-else-if="error" class="card">
-        <div class="empty">{{ error }}</div>
-        <div style="text-align:center;margin-top:14px">
+        <div class="inline-alert err">
+          <span class="grow">{{ error }}</span>
           <button class="btn btn-ghost btn-sm" @click="load">重试</button>
         </div>
       </div>
@@ -4435,6 +4830,157 @@ const ManualPage = {
         <div ref="bodyEl" class="manual-body card">
           <div class="markdown" v-html="html"></div>
         </div>
+      </div>
+    </div>
+  `
+};
+
+/* ---------- 本周订单（独立侧栏页面） ----------
+   仅展示近 7 天（含今天）录入的订单清单，按条码（订单号）聚合展示基本信息，
+   纯列表、不生成也不下载任何文件（Excel/PDF 等）。数据走 records:list（带日期区间），
+   与查询页共用后端权限与可见范围裁剪。 */
+const WeeklyOrdersPage = {
+  props: {
+    token: { type: String, required: true },
+    user: { type: Object, default: null },
+    adminMode: { type: Boolean, default: false },
+    storeMode: { type: Boolean, default: false }
+  },
+  setup(props) {
+    const loading = Vue.ref(false);
+    const rows = Vue.ref([]); // 按条码聚合后的订单摘要
+    const totalPhotos = Vue.ref(0);
+    const rangeText = Vue.ref('');
+    const errMsg = Vue.ref('');
+
+    // 近 7 天（含今天）的日期区间：以今天 00:00 为终点，往前推 6 天
+    function dateRange() {
+      const now = new Date();
+      const p2 = (n) => String(n).padStart(2, '0');
+      const to = now.getFullYear() + '-' + p2(now.getMonth() + 1) + '-' + p2(now.getDate());
+      const from = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6);
+      const fromStr = from.getFullYear() + '-' + p2(from.getMonth() + 1) + '-' + p2(from.getDate());
+      return { from: fromStr, to };
+    }
+
+    async function load() {
+      loading.value = true;
+      errMsg.value = '';
+      try {
+        const { from, to } = dateRange();
+        rangeText.value = from + ' 至 ' + to + '（近 7 天，含今天）';
+        const base = { silent: true, pageSize: 100, dateFrom: from, dateTo: to };
+        const all = [];
+        let page = 1;
+        for (;;) {
+          const r = await window.api.listRecords(props.token, { ...base, page });
+          if (!r.ok) {
+            errMsg.value = r.message || '加载失败';
+            return;
+          }
+          all.push(...r.data.items);
+          if (r.data.items.length < base.pageSize || page > 500) break;
+          page++;
+        }
+        // 按条码（订单号）聚合：张数、首拍/末拍时间、录入人集合、门店
+        const map = new Map();
+        for (const r of all) {
+          const code = String(r.barcode || '未命名');
+          if (!map.has(code)) {
+            map.set(code, {
+              barcode: code,
+              count: 0,
+              first: r.createdAt,
+              last: r.createdAt,
+              users: new Set(),
+              store: r.storeName || '本店'
+            });
+          }
+          const g = map.get(code);
+          g.count++;
+          if (r.createdAt < g.first) g.first = r.createdAt;
+          if (r.createdAt > g.last) g.last = r.createdAt;
+          g.users.add(r.username);
+          if (r.storeName) g.store = r.storeName;
+        }
+        const list = [...map.values()].sort((a, b) => b.last.localeCompare(a.last));
+        for (const g of list) g.userText = [...g.users].join('、');
+        rows.value = list;
+        totalPhotos.value = all.length;
+      } catch (e) {
+        errMsg.value = '加载失败：' + (e.message || e);
+      } finally {
+        loading.value = false;
+      }
+    }
+
+    // 时间格式：YYYY-MM-DD HH:mm（与查询页一致）
+    function fmt(iso) {
+      const d = new Date(iso || '');
+      if (isNaN(d.getTime())) return '—';
+      const p2 = (n) => String(n).padStart(2, '0');
+      return (
+        d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) +
+        ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes())
+      );
+    }
+
+    Vue.onMounted(load);
+    return { loading, rows, totalPhotos, rangeText, errMsg, load, fmt };
+  },
+  template: `
+    <div>
+      <div class="page-head">
+        <h2>本周订单</h2>
+        <p>近 7 天（含今天）录入的订单清单，仅展示、不导出任何文件。</p>
+      </div>
+
+      <div v-if="errMsg" class="card">
+        <div class="empty">
+          <div class="empty-title">加载失败</div>
+          <div class="empty-desc">{{ errMsg }}</div>
+          <button class="btn btn-ghost" @click="load">重试</button>
+        </div>
+      </div>
+
+      <div v-else-if="loading" class="card">
+        <div class="empty"><div class="empty-title">正在加载本周订单…</div></div>
+      </div>
+
+      <div v-else-if="!rows.length" class="card">
+        <div class="empty">
+          <div class="empty-icon" aria-hidden="true"></div>
+          <div class="empty-title">近 7 天没有订单</div>
+          <div class="empty-desc">{{ rangeText }}，暂无符合条件的订单记录。</div>
+        </div>
+      </div>
+
+      <div v-else class="card table-wrap">
+        <div class="weekly-summary">
+          共 <b>{{ rows.length }}</b> 个订单 · <b>{{ totalPhotos }}</b> 张照片 · {{ rangeText }}
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>条形码（订单号）</th>
+              <th>照片张数</th>
+              <th>首拍时间</th>
+              <th>末拍时间</th>
+              <th>录入人</th>
+              <th>所属门店</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="g in rows" :key="g.barcode">
+              <td class="code">{{ g.barcode }}</td>
+              <td>{{ g.count }}</td>
+              <td class="code">{{ fmt(g.first) }}</td>
+              <td class="code">{{ fmt(g.last) }}</td>
+              <td>{{ g.userText }}</td>
+              <td>{{ g.store }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </div>
   `
@@ -4525,7 +5071,8 @@ const Shell = {
       logs: AdminLogsPage,
       data: QueryPage,
       system: AdminSystemPage,
-      manual: ManualPage
+      manual: ManualPage,
+      weekly: WeeklyOrdersPage
     };
 
     // 菜单图标为内联 SVG 常量（经 v-html 渲染；均为代码内固定字符串，无注入面）
@@ -4537,13 +5084,15 @@ const Shell = {
           { key: 'users', icon: '<svg viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>', label: '用户与权限' },
           { key: 'logs', icon: '<svg viewBox="0 0 24 24"><path d="M8 6.5h12M8 12h12M8 17.5h12"/><path d="M3.8 6.5h.01M3.8 12h.01M3.8 17.5h.01"/></svg>', label: '操作日志' },
           { key: 'data', icon: '<svg viewBox="0 0 24 24"><path d="M3.8 7a2 2 0 0 1 2-2h3.4l1.9 2.3h7.1a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5.8a2 2 0 0 1-2-2Z"/></svg>', label: '数据查看' },
-          { key: 'system', icon: '<svg viewBox="0 0 24 24"><path d="M4 7.2h9.2M18.2 7.2H20M4 12h2.2M11 12h9M4 16.8h9.2M18.2 16.8H20"/><circle cx="15.6" cy="7.2" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.6" cy="16.8" r="2"/></svg>', label: '系统设置' }
+          { key: 'system', icon: '<svg viewBox="0 0 24 24"><path d="M4 7.2h9.2M18.2 7.2H20M4 12h2.2M11 12h9M4 16.8h9.2M18.2 16.8H20"/><circle cx="15.6" cy="7.2" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.6" cy="16.8" r="2"/></svg>', label: '系统设置' },
+          { key: 'weekly', icon: '<svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 9h16M8 3v4M16 3v4"/></svg>', label: '本周订单' }
         ];
       } else if (isStoreAdmin) {
         list = [
           { key: 'home', icon: '<svg viewBox="0 0 24 24"><path d="M4.6 10.8 12 4.6l7.4 6.2V19a1.6 1.6 0 0 1-1.6 1.6h-3.6v-5.4h-4.4v5.4H6.2A1.6 1.6 0 0 1 4.6 19Z"/></svg>', label: '首页' },
           { key: 'logs', icon: '<svg viewBox="0 0 24 24"><path d="M8 6.5h12M8 12h12M8 17.5h12"/><path d="M3.8 6.5h.01M3.8 12h.01M3.8 17.5h.01"/></svg>', label: '本店日志' },
           { key: 'query', icon: '<svg viewBox="0 0 24 24"><path d="M3.8 7a2 2 0 0 1 2-2h3.4l1.9 2.3h7.1a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5.8a2 2 0 0 1-2-2Z"/></svg>', label: '本店订单' },
+          { key: 'weekly', icon: '<svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 9h16M8 3v4M16 3v4"/></svg>', label: '本周订单' },
           { key: 'settings', icon: '<svg viewBox="0 0 24 24"><path d="M4 7.2h9.2M18.2 7.2H20M4 12h2.2M11 12h9M4 16.8h9.2M18.2 16.8H20"/><circle cx="15.6" cy="7.2" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.6" cy="16.8" r="2"/></svg>', label: '设置' }
         ];
       } else {
@@ -4551,6 +5100,7 @@ const Shell = {
         // 拍照能力由角色派生，查询账号不显示拍照入口
         if (canCapture) list.push({ key: 'capture', icon: '<svg viewBox="0 0 24 24"><path d="M14.5 5h-5L7.8 7.6H4.6A1.6 1.6 0 0 0 3 9.2v8.2a1.6 1.6 0 0 0 1.6 1.6h14.8a1.6 1.6 0 0 0 1.6-1.6V9.2a1.6 1.6 0 0 0-1.6-1.6h-3.2Z"/><circle cx="12" cy="13.2" r="3.1"/></svg>', label: '衣物拍照' });
         list.push({ key: 'query', icon: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.4"/><path d="m19.8 19.8-3.2-3.2"/></svg>', label: '记录查询' });
+        list.push({ key: 'weekly', icon: '<svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 9h16M8 3v4M16 3v4"/></svg>', label: '本周订单' });
         list.push({ key: 'settings', icon: '<svg viewBox="0 0 24 24"><path d="M4 7.2h9.2M18.2 7.2H20M4 12h2.2M11 12h9M4 16.8h9.2M18.2 16.8H20"/><circle cx="15.6" cy="7.2" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.6" cy="16.8" r="2"/></svg>', label: '设置' });
       }
       // 操作手册对所有角色可见，统一在末尾追加：
@@ -4568,42 +5118,111 @@ const Shell = {
       toast(r.ok ? '已退出登录' : r.message || '退出失败', r.ok ? 'success' : 'error');
     }
 
+    // ---------- 设计体系 v2：主题 / 侧栏折叠 ----------
+    // 主题状态是模块级单例（与「设置页 · 外观」共用同一份值），这里只取用，
+    // 不再重复注册 matchMedia 监听，避免外壳反复挂载时监听器累积。
+    const { theme, themeLabel, themeIcon, cycleTheme } = useTheme();
+
+    const collapsed = Vue.ref(readPref('xqy-sidebar-collapsed', '0') === '1');
+    function toggleCollapsed() {
+      collapsed.value = !collapsed.value;
+      writePref('xqy-sidebar-collapsed', collapsed.value ? '1' : '0');
+    }
+    const collapseIcon = Vue.computed(
+      () =>
+        '<svg viewBox="0 0 24 24">' +
+        (collapsed.value ? '<path d="M9 6l6 6-6 6"/>' : '<path d="M15 6l-6 6 6 6"/>') +
+        '</svg>'
+    );
+
+    // ---------- 设计体系 v2：侧栏分组导航 ----------
+    // 菜单按语义分组，避免全部平铺导致扫读困难；组内保持原有顺序。
+    const GROUP_OF = {
+      home: '工作区', capture: '工作区', query: '工作区',
+      overview: '门店', logs: '门店', data: '门店', weekly: '门店',
+      users: '账户与帮助', system: '账户与帮助', settings: '账户与帮助', manual: '账户与帮助'
+    };
+    const GROUP_ORDER = ['工作区', '门店', '账户与帮助'];
+    const navGroups = Vue.computed(() => {
+      const groups = [];
+      GROUP_ORDER.forEach((name) => {
+        const items = pages.filter((p) => (GROUP_OF[p.key] || '账户与帮助') === name);
+        if (items.length) groups.push({ name, items });
+      });
+      // 兜底：GROUP_OF 未覆盖的新页面不能被丢弃，挂到「账户与帮助」之后单列
+      const covered = new Set(groups.reduce((acc, g) => acc.concat(g.items.map((i) => i.key)), []));
+      const rest = pages.filter((p) => !covered.has(p.key));
+      if (rest.length) groups.push({ name: '其他', items: rest });
+      return groups;
+    });
+
+    // ---------- 设计体系 v2：侧栏常驻状态胶囊 ----------
+    // 审查项 #2：离线/待同步状态应常驻可见，不应只能进设置页才知道。
+    const statusKind = Vue.computed(() => (!online.value ? 'err' : pending.value > 0 ? 'warn' : 'ok'));
+    const statusText = Vue.computed(() => {
+      if (!online.value) return '离线 · 待同步 ' + (pending.value || 0);
+      if (syncing.value) return '同步中…';
+      if (pending.value > 0) return '待同步 ' + pending.value;
+      // 注意：setup 内没有局部 mode 变量，必须走 props.mode；
+      // 裸写 mode 会 ReferenceError，导致整个 Shell 渲染失败（页面空白）。
+      return props.mode === 'client' ? '服务端已连接' : '本机服务端';
+    });
+
     return {
       user: props.user, mode: props.mode, isAdmin, isStoreAdmin, canCapture,
       roleText: roleLabel(role), pages, comps, active, doLogout, version,
       latestVersion, hasUpdate,
-      online, pending, syncing, doSync
+      online, pending, syncing, doSync,
+      theme, themeLabel, themeIcon, cycleTheme,
+      collapsed, toggleCollapsed, collapseIcon, navGroups,
+      statusKind, statusText
     };
   },
   template: `
     <div class="shell">
-      <aside class="sidebar">
+      <aside class="sidebar" :class="{ collapsed: collapsed }">
         <div class="brand">
           <img class="logo-brand" src="./assets/logo.png" alt="星期衣" />
-          <div>
+          <div v-show="!collapsed">
             <div class="brand-name">星期衣精致洗衣</div>
             <div class="brand-sub">衣物照片系统 · {{ isAdmin ? '管理端' : (isStoreAdmin ? '门店管理' : '客户端') }}</div>
           </div>
         </div>
         <nav class="nav">
-          <div
-            v-for="p in pages"
-            :key="p.key"
-            class="nav-item"
-            :class="{ active: active === p.key }"
-            @click="active = p.key"
-          >
-            <span class="nav-icon" v-html="p.icon"></span>{{ p.label }}
-          </div>
+          <template v-for="g in navGroups" :key="g.name">
+            <div class="nav-group-label" v-show="!collapsed">{{ g.name }}</div>
+            <div
+              v-for="p in g.items"
+              :key="p.key"
+              class="nav-item"
+              :class="{ active: active === p.key }"
+              :title="collapsed ? p.label : ''"
+              @click="active = p.key"
+            >
+              <span class="nav-icon" v-html="p.icon"></span><span class="label">{{ p.label }}</span>
+            </div>
+          </template>
         </nav>
         <div class="sidebar-foot">
+          <div class="status-pill" :class="statusKind" :title="statusText">
+            <span class="status-dot" :class="{ pulse: syncing }"></span>
+            <span class="status-text" v-show="!collapsed">{{ statusText }}</span>
+          </div>
           <div class="user-chip">
             <div class="avatar">{{ (user.name || user.username).charAt(0) }}</div>
-            <div>
+            <div class="user-meta" v-show="!collapsed">
               <div class="user-name">{{ user.name || user.username }}</div>
               <div class="user-role">{{ roleText }} · {{ mode === 'client' ? '已连接服务器' : '本机服务端' }}</div>
             </div>
           </div>
+          <button class="sidebar-collapse" @click="toggleCollapsed" :title="collapsed ? '展开侧栏' : '收起侧栏'">
+            <span class="nav-icon" v-html="collapseIcon"></span>
+            <span class="collapse-label">{{ collapsed ? '展开侧栏' : '收起侧栏' }}</span>
+          </button>
+          <button class="sidebar-collapse" @click="cycleTheme" :title="'外观：' + themeLabel">
+            <span class="nav-icon" v-html="themeIcon"></span>
+            <span class="collapse-label">外观 · {{ themeLabel }}</span>
+          </button>
           <button class="btn btn-ghost btn-block" @click="doLogout">退出登录</button>
           <div class="sidebar-version">版本 v{{ version || '-' }}<template v-if="latestVersion"> · 最新 v{{ latestVersion }}<span v-if="hasUpdate" class="tag tag-orange" style="margin-left:4px;font-size:10px">有更新</span></template></div>
         </div>
@@ -4627,6 +5246,7 @@ const Shell = {
           :admin-mode="isAdmin"
           :store-mode="isStoreAdmin"
           @goto="active = $event"
+          @logout="doLogout"
         ></component>
       </main>
     </div>
@@ -4918,6 +5538,7 @@ const app = createApp({
         <shell v-else-if="user" :user="user" :token="token" :mode="sysInfo ? sysInfo.mode : ''" @logout="onLogout"></shell>
         <login-page v-else :sys-info="sysInfo" :revoked-msg="revokedMsg" @login="onLogin" @server-saved="onServerSaved"></login-page>
       </div>
+      <confirm-modal></confirm-modal>
     </div>
   `
 });
@@ -4925,4 +5546,5 @@ const app = createApp({
 app.component('login-page', LoginPage);
 app.component('setup-page', SetupPage);
 app.component('shell', Shell);
+app.component('confirm-modal', ConfirmModal);
 app.mount('#app');
