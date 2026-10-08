@@ -13,13 +13,23 @@ function toast(msg, type) {
     el = document.createElement('div');
     el.id = 'app-toast';
     el.className = 'toast';
+    // 读屏器播报：role=status + aria-live=polite（不打断当前输入）。
+    // 播报文本必须放在子元素里，且显隐用 classList 切换 —— 整体覆写 className 会抹掉 show 类导致不播报。
+    el.setAttribute('role', 'status');
+    el.setAttribute('aria-live', 'polite');
+    el.setAttribute('aria-atomic', 'true');
+    const span = document.createElement('span');
+    el.appendChild(span);
     document.body.appendChild(el);
   }
-  el.textContent = msg;
-  el.className = 'toast show ' + (type || 'success');
+  const text = el.firstElementChild || el;
+  if (text.textContent !== msg) text.textContent = msg;
+  el.classList.add('show');
+  el.classList.remove('success', 'error', 'warn');
+  el.classList.add(type || 'success');
   clearTimeout(toastState.timer);
   toastState.timer = setTimeout(() => {
-    el.className = 'toast';
+    el.classList.remove('show');
   }, 2600);
 }
 
@@ -2203,7 +2213,9 @@ const QueryPage = {
     adminMode: { type: Boolean, default: false },
     // 门店管理员视图：可见本店全部订单，但无账号管理与全店筛选能力
     storeMode: { type: Boolean, default: false },
-    user: { type: Object, default: null }
+    user: { type: Object, default: null },
+    // 「本周订单」等页面的带参跳转：非空时填入条码并自动搜索一次
+    prefillBarcode: { type: String, default: '' }
   },
   setup(props) {
     const keyword = Vue.ref('');
@@ -2850,13 +2862,30 @@ const QueryPage = {
       }
     }
 
+    // 带参跳转消费：填入条码并立即搜一次。
+    // onMounted 处理「从别的页跳进来」的首次挂载；watch 处理「已在查询页时再次跳转」
+    // （管理员的 data 与 query 指向同一个 QueryPage，key 相同时组件不会重新挂载）。
+    function applyPrefill(code) {
+      const v = String(code || '').trim();
+      if (!v) return false;
+      keyword.value = '';
+      barcodeFilter.value = v;
+      dateFrom.value = '';
+      dateTo.value = '';
+      userIdFilter.value = 'all';
+      storeFilter.value = 'all';
+      page.value = 1;
+      return true;
+    }
+
     Vue.onMounted(() => {
       loadUsers();
       // 首屏必须先按容器尺寸算出每页数量再查询。
       // 此前的写法把 recalcPageSize 放在 nextTick 里、而 search 同步执行，
       // 导致首次查询仍用初始的 12 张，之后虽改了 pageSize 却不再重查（页面大小变化不生效）。
       recalcPageSize();
-      search(true);
+      // 带参跳转优先：填入条码后搜这一次，避免先搜一遍全量再被覆盖（闪一次无关结果）
+      if (!applyPrefill(props.prefillBarcode)) search(true);
       // 布局可能在挂载后才稳定，补算一次；数量有变化则重新查询
       Vue.nextTick(() => {
         const before = pageSize.value;
@@ -2868,6 +2897,14 @@ const QueryPage = {
       document.addEventListener('mousemove', onDocMouseMove);
       document.addEventListener('mouseup', onDocMouseUp);
     });
+
+    // 组件未卸载时再次收到带参跳转（Shell 的 prefill 每次跳转都是新对象）
+    Vue.watch(
+      () => props.prefillBarcode,
+      (v) => {
+        if (applyPrefill(v)) search(true);
+      }
+    );
 
     Vue.onBeforeUnmount(() => {
       window.removeEventListener('resize', onResize);
@@ -4890,7 +4927,9 @@ const WeeklyOrdersPage = {
     adminMode: { type: Boolean, default: false },
     storeMode: { type: Boolean, default: false }
   },
-  setup(props) {
+  // 「去处理」跳转：把条码带给查询页，店长不必记下条码再手动重输一遍
+  emits: ['goto'],
+  setup(props, { emit }) {
     const loading = Vue.ref(false);
     const rows = Vue.ref([]); // 按条码聚合后的订单摘要
     const totalPhotos = Vue.ref(0);
@@ -4969,8 +5008,14 @@ const WeeklyOrdersPage = {
       );
     }
 
+    // 「去处理」：切到记录查询页并带上本单条码。
+    // 管理员角色下查询页的菜单 key 是 data（非 query），两处都指向 QueryPage，需按角色选 key。
+    function goProcess(barcode) {
+      emit('goto', props.adminMode ? 'data' : 'query', barcode);
+    }
+
     Vue.onMounted(load);
-    return { loading, rows, totalPhotos, rangeText, errMsg, load, fmt };
+    return { loading, rows, totalPhotos, rangeText, errMsg, load, fmt, goProcess };
   },
   template: `
     <div>
@@ -4999,7 +5044,7 @@ const WeeklyOrdersPage = {
         </div>
       </div>
 
-      <div v-else class="card table-wrap">
+      <div v-else class="table-wrap">
         <div class="weekly-summary">
           共 <b>{{ rows.length }}</b> 个订单 · <b>{{ totalPhotos }}</b> 张照片 · {{ rangeText }}
         </div>
@@ -5016,8 +5061,10 @@ const WeeklyOrdersPage = {
           </thead>
           <tbody>
             <tr v-for="g in rows" :key="g.barcode">
-              <td class="code">{{ g.barcode }}</td>
-              <td>{{ g.count }}</td>
+              <td class="code">
+                <button type="button" class="barcode-jump" :title="'去记录查询处理 ' + g.barcode" @click="goProcess(g.barcode)">{{ g.barcode }}</button>
+              </td>
+              <td class="code">{{ g.count }}</td>
               <td class="code">{{ fmt(g.first) }}</td>
               <td class="code">{{ fmt(g.last) }}</td>
               <td>{{ g.userText }}</td>
@@ -5128,8 +5175,8 @@ const Shell = {
           { key: 'users', icon: '<svg viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>', label: '用户与权限' },
           { key: 'logs', icon: '<svg viewBox="0 0 24 24"><path d="M8 6.5h12M8 12h12M8 17.5h12"/><path d="M3.8 6.5h.01M3.8 12h.01M3.8 17.5h.01"/></svg>', label: '操作日志' },
           { key: 'data', icon: '<svg viewBox="0 0 24 24"><path d="M3.8 7a2 2 0 0 1 2-2h3.4l1.9 2.3h7.1a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5.8a2 2 0 0 1-2-2Z"/></svg>', label: '数据查看' },
-          { key: 'system', icon: '<svg viewBox="0 0 24 24"><path d="M4 7.2h9.2M18.2 7.2H20M4 12h2.2M11 12h9M4 16.8h9.2M18.2 16.8H20"/><circle cx="15.6" cy="7.2" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.6" cy="16.8" r="2"/></svg>', label: '系统设置' },
-          { key: 'weekly', icon: '<svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 9h16M8 3v4M16 3v4"/></svg>', label: '本周订单' }
+          { key: 'weekly', icon: '<svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 9h16M8 3v4M16 3v4"/></svg>', label: '本周订单' },
+          { key: 'system', icon: '<svg viewBox="0 0 24 24"><path d="M4 7.2h9.2M18.2 7.2H20M4 12h2.2M11 12h9M4 16.8h9.2M18.2 16.8H20"/><circle cx="15.6" cy="7.2" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.6" cy="16.8" r="2"/></svg>', label: '系统设置' }
         ];
       } else if (isStoreAdmin) {
         list = [
@@ -5155,6 +5202,19 @@ const Shell = {
     })();
 
     const active = Vue.ref(pages[0].key);
+
+    // 带参跳转：本页（如「本周订单」）发 goto 时附带条码，由查询页消费后填入并搜索。
+    // 只在跳转当刻有值，消费后立即清空，避免下次进入查询页又被旧条码预填。
+    const prefill = Vue.ref(null);
+    function onGoto(key, payload) {
+      active.value = key;
+      const code = typeof payload === 'string' ? payload.trim() : '';
+      if (!code) return;
+      prefill.value = { barcode: code };
+      Vue.nextTick(() => {
+        prefill.value = null;
+      });
+    }
 
     async function doLogout() {
       const r = await window.api.logout(props.token);
@@ -5214,7 +5274,7 @@ const Shell = {
 
     return {
       user: props.user, mode: props.mode, isAdmin, isStoreAdmin, canCapture,
-      roleText: roleLabel(role), pages, comps, active, doLogout, version,
+      roleText: roleLabel(role), pages, comps, active, onGoto, prefill, doLogout, version,
       latestVersion, hasUpdate,
       online, pending, syncing, doSync,
       theme, themeLabel, themeIcon, cycleTheme,
@@ -5291,7 +5351,8 @@ const Shell = {
           :token="token"
           :admin-mode="isAdmin"
           :store-mode="isStoreAdmin"
-          @goto="active = $event"
+          :prefill-barcode="prefill ? prefill.barcode : null"
+          @goto="onGoto"
           @logout="doLogout"
         ></component>
       </main>

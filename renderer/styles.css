@@ -96,6 +96,16 @@
   /* 等宽字体：条码 / 单号 / 时间，防扫读串行 */
   --font-mono: "JetBrains Mono", "Roboto Mono", Consolas, "SFMono-Regular", monospace;
 
+  /* 登录 / 首次配置页背景（暗色下整页不再发白）。
+     光晕透明度必须比浅色低，否则深底上会整体发灰；两个光晕分别拆成令牌便于暗色单独下调。 */
+  --auth-glow-warm: rgba(255, 125, 0, 0.1);
+  --auth-glow-cool: var(--primary-ring);
+  --auth-base: linear-gradient(142deg, #eef4ff 0%, #dfe9ff 48%, #eaf0fb 100%);
+  --auth-bg:
+    radial-gradient(720px 380px at 82% 8%, var(--auth-glow-warm), transparent 62%),
+    radial-gradient(860px 520px at 12% 92%, var(--auth-glow-cool), transparent 66%),
+    var(--auth-base);
+
   --ease: cubic-bezier(0.22, 0.8, 0.3, 1);
 
   color-scheme: light;
@@ -150,6 +160,11 @@
   --shadow-3: 0 4px 12px rgba(0, 0, 0, 0.5);
   --shadow-4: 0 12px 32px rgba(0, 0, 0, 0.6);
 
+  /* 登录 / 配置页背景：深色底 + 光晕透明度下调（沿用浅色同款光晕会发灰） */
+  --auth-glow-warm: rgba(255, 125, 0, 0.05);
+  --auth-glow-cool: rgba(124, 147, 255, 0.1);
+  --auth-base: linear-gradient(142deg, #12161c 0%, #171d26 48%, #141a22 100%);
+
   color-scheme: dark;
 }
 
@@ -193,6 +208,19 @@ body {
 
 ::-webkit-scrollbar-thumb:hover {
   background: #a9aeb8;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+/* 暗色下滚动条 thumb 若是浅色硬编码会成为刺眼亮条，改用与暗色边框/文本相称的深灰 */
+[data-theme="dark"] ::-webkit-scrollbar-thumb {
+  background: #39414c;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+  background: #4a5462;
   border: 3px solid transparent;
   background-clip: content-box;
 }
@@ -366,10 +394,7 @@ textarea {
   color: var(--accent-orange);
 }
 
-.tag-owner {
-  background: #e8fffb;
-  color: #0aa5a5;
-}
+/* 注：.tag-owner 的旧硬编码青色已由下方 v2 覆盖层接管（含暗色），基础层不再重复声明 */
 
 /* ---------- Toast ---------- */
 .toast {
@@ -411,10 +436,7 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: center;
-  background:
-    radial-gradient(720px 380px at 82% 8%, rgba(255, 125, 0, 0.1), transparent 62%),
-    radial-gradient(860px 520px at 12% 92%, rgba(22, 93, 255, 0.16), transparent 66%),
-    linear-gradient(142deg, #eef4ff 0%, #dfe9ff 48%, #eaf0fb 100%);
+  background: var(--auth-bg);
 }
 
 .login-card {
@@ -598,8 +620,8 @@ textarea {
 /* 风险与不可用提示：用橙色引起注意，但不用红色——红色在本系统表示错误/失败 */
 .login-cred-tip.warn {
   color: var(--gold-deep);
-  background: #fff7e8;
-  border: 1px solid #ffd6a6;
+  background: var(--warning-soft);
+  border: 1px solid var(--warning-line);
   border-radius: 6px;
   padding: 8px 10px;
 }
@@ -644,9 +666,9 @@ textarea {
 .manual-version-warn {
   margin-bottom: 14px;
   padding: 10px 14px;
-  border: 1px solid #ffd6a6;
+  border: 1px solid var(--warning-line);
   border-radius: 6px;
-  background: #fff7e8;
+  background: var(--warning-soft);
   color: var(--gold-deep);
   font-size: 13px;
   line-height: 1.6;
@@ -845,7 +867,7 @@ textarea {
 }
 
 .markdown table.md-table tbody tr:nth-child(even) {
-  background: #fafbfc;
+  background: var(--divider);
 }
 
 /* ---------- 整体布局 ---------- */
@@ -1845,10 +1867,7 @@ tr:hover td {
   display: flex;
   align-items: center;
   justify-content: center;
-  background:
-    radial-gradient(720px 380px at 82% 8%, rgba(255, 125, 0, 0.1), transparent 62%),
-    radial-gradient(860px 520px at 12% 92%, rgba(22, 93, 255, 0.16), transparent 66%),
-    linear-gradient(142deg, #eef4ff 0%, #dfe9ff 48%, #eaf0fb 100%);
+  background: var(--auth-bg);
   overflow-y: auto;
 }
 
@@ -2154,8 +2173,8 @@ tr:hover td {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  background: #fff7e8;
-  border: 1px solid #ffd6a6;
+  background: var(--warning-soft);
+  border: 1px solid var(--warning-line);
   border-radius: 8px;
   color: var(--gold-deep);
   font-size: 13.5px;
@@ -2241,10 +2260,10 @@ tr:hover td {
 .barcode-warn {
   margin-top: 8px;
   padding: 10px 12px;
-  border: 1px solid var(--accent-orange);
+  border: 1px solid var(--warning-line);
   border-radius: 6px;
-  background: #fff7e8;
-  color: #b35400;
+  background: var(--warning-soft);
+  color: var(--gold-deep);
   font-size: 13px;
   line-height: 1.6;
 }
@@ -2518,6 +2537,7 @@ textarea:focus-visible,
   background: none;
   font-family: inherit;
   font-weight: 400;
+  line-height: inherit;
   text-align: left;
   display: flex;
   align-items: center;
@@ -2874,7 +2894,34 @@ textarea:focus-visible,
 }
 .weekly-summary b {
   color: var(--text);
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+}
+
+/* 本周订单：条码单元格内的「去处理」跳转链接。
+   本页此前是只读孤岛，看到异常单只能记下条码再手动切页重输，这里把跳转做进单元格。 */
+.barcode-jump {
+  border: 0;
+  background: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  font-family: var(--font-mono);
+  color: var(--primary);
+  cursor: pointer;
+  text-align: left;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.15s var(--ease);
+}
+
+.barcode-jump:hover {
+  border-bottom-color: var(--primary);
+}
+
+.barcode-jump:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: 2px;
 }
 
 /* ---------- 响应式断点 ----------
