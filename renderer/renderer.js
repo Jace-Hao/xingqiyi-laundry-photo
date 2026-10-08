@@ -79,6 +79,11 @@ const ConfirmModal = {
         e.stopPropagation();
         close(false);
       } else if (e.key === 'Enter') {
+        // Enter 必须遵循「激活当前焦点按钮」的原生语义，不能无条件确认。
+        // 危险态（danger:true）打开时焦点落在「取消」上，若此处仍 close(true)，
+        // 用户看到焦点框在「取消」却执行了删除，视觉提示与实际行为直接矛盾，比不做焦点分流更糟。
+        // 焦点在取消按钮上时直接返回，交给该按钮自身的 @click="close(false)" 处理。
+        if (e.target === cancelBtn.value) return;
         e.preventDefault();
         e.stopPropagation();
         close(true);
@@ -2425,7 +2430,6 @@ const QueryPage = {
         : '当前列表中的全部 ' + barcodes.length + ' 个条码';
       const ok = await showConfirm({ title: '导出照片', message: '将按条码（订单号）分文件夹导出照片到本地目录。\n导出范围：' + scope + '。', confirmText: '继续导出' });
       if (!ok) return;
-      if (busy.value) return;
       const d = await window.api.chooseExportDir();
       if (!d.ok) {
         if (d.message && d.message !== '已取消') toast(d.message, 'error');
@@ -2465,7 +2469,6 @@ const QueryPage = {
       }
       const ok = await showConfirm({ title: '按日期导出', message: '导出 ' + dateFrom.value + ' 至 ' + dateTo.value + ' 期间的照片，按条码分文件夹归档，并生成归档表格。', confirmText: '继续导出' });
       if (!ok) return;
-      if (busy.value) return;
       const d = await window.api.chooseExportDir();
       if (!d.ok) {
         if (d.message && d.message !== '已取消') toast(d.message, 'error');
@@ -2504,7 +2507,6 @@ const QueryPage = {
       const day = now.getFullYear() + '-' + p2(now.getMonth() + 1) + '-' + p2(now.getDate());
       const ok = await showConfirm({ title: '下载当日订单表', message: '生成今天（' + day + '）全部订单的「条码 + 照片位置」表格（不包含照片文件），供洗衣管家上传助手同步照片使用。', confirmText: '生成表格' });
       if (!ok) return;
-      if (busy.value) return;
       const d = await window.api.chooseExportDir();
       if (!d.ok) {
         if (d.message && d.message !== '已取消') toast(d.message, 'error');
@@ -2577,7 +2579,6 @@ const QueryPage = {
         confirmText: '下载原片'
       });
       if (!ok) return;
-      if (busy.value) return;
       const d = await window.api.chooseExportDir();
       if (!d.ok) {
         if (d.message && d.message !== '已取消') toast(d.message, 'error');
@@ -2629,9 +2630,13 @@ const QueryPage = {
       const preview = codes.length
         ? codes.slice(0, 3).join('、') + (codes.length > 3 ? '…' : '')
         : '（所选记录没有条码）';
+      // 只选 1 条时「，等共 1 条」是冗余的，直接以条码结尾即可
+      const scopeLine = selected.value.length === 1
+        ? '涉及条码：' + preview + '。'
+        : '涉及条码：' + preview + '，等共 ' + selected.value.length + ' 条。';
       const ok = await showConfirm({
         title: '批量删除记录',
-        message: '删除选中的 ' + selected.value.length + ' 条记录？\n涉及条码：' + preview + '，等共 ' + selected.value.length + ' 条。\n照片将一并删除，不可恢复。',
+        message: '删除选中的 ' + selected.value.length + ' 条记录？\n' + scopeLine + '\n照片将一并删除，不可恢复。',
         confirmText: '删除这 ' + selected.value.length + ' 条记录',
         danger: true
       });
@@ -5508,6 +5513,14 @@ const app = createApp({
       });
     }
 
+    // 弹窗打开时把背景内容设为 inert：背景内的按钮/输入框/卡片会一并移出焦点序列与 Tab 顺序，
+    // 键盘用户不会在弹窗开着时「迷失」到背景（实测背景仍有 38 个可聚焦元素）。
+    // inert 是「存在即生效」的属性，必须绑 null 来移除、绑 '' 来添加，不能绑 false（那会渲染成 inert="false" 反而生效）。
+    // 承载容器是页面内容那一层；<confirm-modal> 与各根级弹窗是它的兄弟节点，自身不受影响。
+    const bgInert = Vue.computed(() =>
+      confirmState.open || updateModal.value || forceModal.value ? '' : null
+    );
+
     Vue.onUnmounted(() => {
       if (removeForceListener) removeForceListener();
       if (removeRevokedListener) removeRevokedListener();
@@ -5545,7 +5558,7 @@ const app = createApp({
       onSetupDone, onServerSaved, onLogin, onLogout,
       openUpdateModal, closeUpdateNotice, openReleasePage, downloadNow, cancelDownload,
       forceModal, installing, runInstaller, openInstallerFolder, fmtSize,
-      revokedMsg
+      revokedMsg, bgInert
     };
   },
   template: `
@@ -5630,7 +5643,7 @@ const app = createApp({
           </div>
         </div>
       </div>
-      <div style="flex:1;min-height:0">
+      <div style="flex:1;min-height:0" :inert="bgInert">
         <div v-if="!ready" style="height:100%;display:flex;align-items:center;justify-content:center;color:#64748b">
           正在启动…
         </div>

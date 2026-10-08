@@ -97,9 +97,11 @@
   --font-mono: "JetBrains Mono", "Roboto Mono", Consolas, "SFMono-Regular", monospace;
 
   /* 登录 / 首次配置页背景（暗色下整页不再发白）。
-     光晕透明度必须比浅色低，否则深底上会整体发灰；两个光晕分别拆成令牌便于暗色单独下调。 */
+     注意：冷光晕必须写显式 rgba(22,93,255,0.16)，不能用 var(--primary-ring)——
+     后者是 rgba(53,87,224,0.2)，会把浅色模式背景的冷光晕从 0.16 漂到 0.20、蓝色发灰，
+     造成「视觉零变化」的承诺落空。暗色分支另设更低透明度（深底上光晕过强会整体发灰）。 */
   --auth-glow-warm: rgba(255, 125, 0, 0.1);
-  --auth-glow-cool: var(--primary-ring);
+  --auth-glow-cool: rgba(22, 93, 255, 0.16);
   --auth-base: linear-gradient(142deg, #eef4ff 0%, #dfe9ff 48%, #eaf0fb 100%);
   --auth-bg:
     radial-gradient(720px 380px at 82% 8%, var(--auth-glow-warm), transparent 62%),
@@ -1450,6 +1452,17 @@ textarea {
 .modal-body {
   padding: 20px;
   overflow-y: auto;
+}
+
+/* 弹窗内的表单项行（改码 / 批量改码等弹窗在用）。
+   此前样式表里没有这个类，行距全靠全局 label{margin:12px 0 6px} 撑着，
+   导致行与行之间没有成组间距、label 与输入框贴得过近。 */
+.form-row {
+  margin-bottom: var(--sp-4);
+}
+
+.form-row label {
+  margin: 0 0 6px;
 }
 
 /* 确认弹窗文案：保留换行、用次级文本色，与弹窗层级一致 */
@@ -2943,7 +2956,11 @@ textarea:focus-visible,
   .sidebar .nav-group-label,
   .sidebar .nav-item span.label,
   .sidebar .user-chip .user-meta,
-  .sidebar .sidebar-version {
+  .sidebar .sidebar-version,
+  /* 漏掉这一条会导致侧栏被响应式收成 64px 时，「收起侧栏」「外观 · 跟随系统」
+     「退出登录」的文字竖排挤成一列溢出。.sidebar.collapsed .collapse-label 只在
+     用户手动折叠时生效，响应式自动收窄不触发该类，故此处必须单独隐藏。 */
+  .sidebar .collapse-label {
     display: none;
   }
 
