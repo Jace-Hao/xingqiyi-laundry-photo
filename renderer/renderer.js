@@ -2244,6 +2244,11 @@ const QueryPage = {
     // 用操作 key 而非布尔量，按钮才能只显示自己的 loading 文案（不串台）。
     // '' | 'today' | 'byBarcode' | 'download' | 'byDate'
     const busy = Vue.ref('');
+    // 「弹窗待确认」窗口的互斥锁：busy 要到确认弹窗与目录选择之后才置位，
+    // 而 showConfirm 是模块级单例（第二次调用会覆盖 confirmState.resolve，
+    // 令前一个 Promise 永不 resolve、其函数体永久挂在 await 上，表现为点击被静默丢弃）。
+    // 故用这个与 busy 分离的标志，覆盖「弹窗待确认 → 选目录 → 执行」整段窗口。
+    const confirming = Vue.ref(false);
     const downloadingPhoto = Vue.ref(false);
 
     // 照片网格容器引用，用于测量可用宽高以计算每页数量
@@ -2416,7 +2421,7 @@ const QueryPage = {
 
     // 按条码（订单号）批量下载照片：勾选了则导出勾选记录涉及的条码，未勾选则导出当前列表全部条码
     async function exportByBarcode() {
-      if (busy.value) return;
+      if (busy.value || confirming.value) return;
       const source = selected.value.length
         ? items.value.filter((r) => selected.value.includes(r.id))
         : items.value.slice();
@@ -2428,37 +2433,45 @@ const QueryPage = {
       const scope = selected.value.length
         ? '已勾选记录涉及的 ' + barcodes.length + ' 个条码'
         : '当前列表中的全部 ' + barcodes.length + ' 个条码';
-      const ok = await showConfirm({ title: '导出照片', message: '将按条码（订单号）分文件夹导出照片到本地目录。\n导出范围：' + scope + '。', confirmText: '继续导出' });
-      if (!ok) return;
-      const d = await window.api.chooseExportDir();
-      if (!d.ok) {
-        if (d.message && d.message !== '已取消') toast(d.message, 'error');
-        return;
-      }
-      busy.value = 'byBarcode';
-      toast('正在导出照片，数量较多时请稍候…', 'success');
+      // 从这里开始直到函数结束统一由 try/finally 收口：
+      // 用户取消、目录选择失败、接口异常等所有返回路径都必须复位 confirming，
+      // 否则按钮会永久置灰（与 busy 复位是同一类陷阱）。
+      confirming.value = true;
       try {
-        const res = await window.api.exportPhotos(props.token, { targetDir: d.data, barcodes });
-        if (res.ok) {
-          toast(
-            '导出完成：' + res.data.folders + ' 个文件夹、' + res.data.exported + ' 张照片' +
-            (res.data.skipped ? '，缺失跳过 ' + res.data.skipped + ' 张' : '') +
-            (res.data.failed ? '，失败 ' + res.data.failed + ' 张' : ''),
-            'success'
-          );
-        } else {
-          toast(res.message || '导出失败', 'error');
+        const ok = await showConfirm({ title: '导出照片', message: '将按条码（订单号）分文件夹导出照片到本地目录。\n导出范围：' + scope + '。', confirmText: '继续导出' });
+        if (!ok) return;
+        const d = await window.api.chooseExportDir();
+        if (!d.ok) {
+          if (d.message && d.message !== '已取消') toast(d.message, 'error');
+          return;
         }
-      } catch (e) {
-        toast('导出失败：' + (e.message || e), 'error');
+        busy.value = 'byBarcode';
+        toast('正在导出照片，数量较多时请稍候…', 'success');
+        try {
+          const res = await window.api.exportPhotos(props.token, { targetDir: d.data, barcodes });
+          if (res.ok) {
+            toast(
+              '导出完成：' + res.data.folders + ' 个文件夹、' + res.data.exported + ' 张照片' +
+              (res.data.skipped ? '，缺失跳过 ' + res.data.skipped + ' 张' : '') +
+              (res.data.failed ? '，失败 ' + res.data.failed + ' 张' : ''),
+              'success'
+            );
+          } else {
+            toast(res.message || '导出失败', 'error');
+          }
+        } catch (e) {
+          toast('导出失败：' + (e.message || e), 'error');
+        } finally {
+          busy.value = '';
+        }
       } finally {
-        busy.value = '';
+        confirming.value = false;
       }
     }
 
     // 按日期范围导出照片：按条码分文件夹归档，并生成「条码+文件位置」表格
     async function exportByDate() {
-      if (busy.value) return;
+      if (busy.value || confirming.value) return;
       if (!dateFrom.value || !dateTo.value) {
         toast('请先在上方选择开始日期与结束日期', 'error');
         return;
@@ -2467,74 +2480,84 @@ const QueryPage = {
         toast('开始日期不能晚于结束日期', 'error');
         return;
       }
-      const ok = await showConfirm({ title: '按日期导出', message: '导出 ' + dateFrom.value + ' 至 ' + dateTo.value + ' 期间的照片，按条码分文件夹归档，并生成归档表格。', confirmText: '继续导出' });
-      if (!ok) return;
-      const d = await window.api.chooseExportDir();
-      if (!d.ok) {
-        if (d.message && d.message !== '已取消') toast(d.message, 'error');
-        return;
-      }
-      busy.value = 'byDate';
-      toast('正在按日期导出照片，数量较多时请稍候…', 'success');
+      confirming.value = true;
       try {
-        const res = await window.api.exportPhotosByDate(props.token, {
-          targetDir: d.data,
-          dateFrom: dateFrom.value,
-          dateTo: dateTo.value
-        });
-        if (res.ok) {
-          toast(
-            '导出完成：' + res.data.folders + ' 个条码文件夹、' + res.data.exported + ' 张照片，表格已生成' +
-            (res.data.skipped ? '，缺失跳过 ' + res.data.skipped + ' 张' : '') +
-            (res.data.failed ? '，失败 ' + res.data.failed + ' 张' : ''),
-            'success'
-          );
-        } else {
-          toast(res.message || '导出失败', 'error');
+        const ok = await showConfirm({ title: '按日期导出', message: '导出 ' + dateFrom.value + ' 至 ' + dateTo.value + ' 期间的照片，按条码分文件夹归档，并生成归档表格。', confirmText: '继续导出' });
+        if (!ok) return;
+        const d = await window.api.chooseExportDir();
+        if (!d.ok) {
+          if (d.message && d.message !== '已取消') toast(d.message, 'error');
+          return;
         }
-      } catch (e) {
-        toast('导出失败：' + (e.message || e), 'error');
-      } finally {
-        busy.value = '';
-      }
-    }
-
-    // 一键导出当日订单表格：今天录入的全部订单（不复制照片，供洗衣管家上传助手同步使用）
-    async function exportToday() {
-      if (busy.value) return;
-      const now = new Date();
-      const p2 = (n) => String(n).padStart(2, '0');
-      const day = now.getFullYear() + '-' + p2(now.getMonth() + 1) + '-' + p2(now.getDate());
-      const ok = await showConfirm({ title: '下载当日订单表', message: '生成今天（' + day + '）全部订单的「条码 + 照片位置」表格（不包含照片文件），供洗衣管家上传助手同步照片使用。', confirmText: '生成表格' });
-      if (!ok) return;
-      const d = await window.api.chooseExportDir();
-      if (!d.ok) {
-        if (d.message && d.message !== '已取消') toast(d.message, 'error');
-        return;
-      }
-      busy.value = 'today';
-      toast('正在生成当日订单表格，请稍候…', 'success');
-      try {
-        const res = await window.api.exportPhotosByDate(props.token, { targetDir: d.data, dateFrom: day, dateTo: day, tableOnly: true });
-        if (res.ok) {
-          if (res.data.tableOnly) {
-            toast('当日订单表格已生成：' + res.data.barcodes + ' 个条码、' + res.data.photos + ' 张照片记录，已保存到所选目录', 'success');
-          } else {
-            // 旧版服务端不支持仅表格模式：回退为完整导出
+        busy.value = 'byDate';
+        toast('正在按日期导出照片，数量较多时请稍候…', 'success');
+        try {
+          const res = await window.api.exportPhotosByDate(props.token, {
+            targetDir: d.data,
+            dateFrom: dateFrom.value,
+            dateTo: dateTo.value
+          });
+          if (res.ok) {
             toast(
               '导出完成：' + res.data.folders + ' 个条码文件夹、' + res.data.exported + ' 张照片，表格已生成' +
               (res.data.skipped ? '，缺失跳过 ' + res.data.skipped + ' 张' : '') +
               (res.data.failed ? '，失败 ' + res.data.failed + ' 张' : ''),
               'success'
             );
+          } else {
+            toast(res.message || '导出失败', 'error');
           }
-        } else {
-          toast(res.message || '导出失败', 'error');
+        } catch (e) {
+          toast('导出失败：' + (e.message || e), 'error');
+        } finally {
+          busy.value = '';
         }
-      } catch (e) {
-        toast('导出失败：' + (e.message || e), 'error');
       } finally {
-        busy.value = '';
+        confirming.value = false;
+      }
+    }
+
+    // 一键导出当日订单表格：今天录入的全部订单（不复制照片，供洗衣管家上传助手同步使用）
+    async function exportToday() {
+      if (busy.value || confirming.value) return;
+      const now = new Date();
+      const p2 = (n) => String(n).padStart(2, '0');
+      const day = now.getFullYear() + '-' + p2(now.getMonth() + 1) + '-' + p2(now.getDate());
+      confirming.value = true;
+      try {
+        const ok = await showConfirm({ title: '下载当日订单表', message: '生成今天（' + day + '）全部订单的「条码 + 照片位置」表格（不包含照片文件），供洗衣管家上传助手同步照片使用。', confirmText: '生成表格' });
+        if (!ok) return;
+        const d = await window.api.chooseExportDir();
+        if (!d.ok) {
+          if (d.message && d.message !== '已取消') toast(d.message, 'error');
+          return;
+        }
+        busy.value = 'today';
+        toast('正在生成当日订单表格，请稍候…', 'success');
+        try {
+          const res = await window.api.exportPhotosByDate(props.token, { targetDir: d.data, dateFrom: day, dateTo: day, tableOnly: true });
+          if (res.ok) {
+            if (res.data.tableOnly) {
+              toast('当日订单表格已生成：' + res.data.barcodes + ' 个条码、' + res.data.photos + ' 张照片记录，已保存到所选目录', 'success');
+            } else {
+              // 旧版服务端不支持仅表格模式：回退为完整导出
+              toast(
+                '导出完成：' + res.data.folders + ' 个条码文件夹、' + res.data.exported + ' 张照片，表格已生成' +
+                (res.data.skipped ? '，缺失跳过 ' + res.data.skipped + ' 张' : '') +
+                (res.data.failed ? '，失败 ' + res.data.failed + ' 张' : ''),
+                'success'
+              );
+            }
+          } else {
+            toast(res.message || '导出失败', 'error');
+          }
+        } catch (e) {
+          toast('导出失败：' + (e.message || e), 'error');
+        } finally {
+          busy.value = '';
+        }
+      } finally {
+        confirming.value = false;
       }
     }
 
@@ -2561,7 +2584,7 @@ const QueryPage = {
 
     // 批量下载原始照片：按条码（订单号）分文件夹落盘，不生成任何清单文件（与导出区分）
     async function downloadSelected() {
-      if (busy.value) return;
+      if (busy.value || confirming.value) return;
       const source = selected.value.length
         ? items.value.filter((r) => selected.value.includes(r.id))
         : items.value.slice();
@@ -2573,35 +2596,40 @@ const QueryPage = {
       const scope = selected.value.length
         ? '已勾选记录涉及的 ' + barcodes.length + ' 个条码'
         : '当前列表中的全部 ' + barcodes.length + ' 个条码';
-      const ok = await showConfirm({
-        title: '下载原片',
-        message: '将按条码（订单号）分文件夹下载原始照片到本地目录（不生成任何清单文件）。\n下载范围：' + scope + '。',
-        confirmText: '下载原片'
-      });
-      if (!ok) return;
-      const d = await window.api.chooseExportDir();
-      if (!d.ok) {
-        if (d.message && d.message !== '已取消') toast(d.message, 'error');
-        return;
-      }
-      busy.value = 'download';
-      toast('正在下载原片，数量较多时请稍候…', 'success');
+      confirming.value = true;
       try {
-        const res = await window.api.downloadPhotos(props.token, { targetDir: d.data, barcodes });
-        if (res.ok) {
-          toast(
-            '下载完成：' + res.data.folders + ' 个文件夹、' + res.data.exported + ' 张原片' +
-            (res.data.skipped ? '，缺失跳过 ' + res.data.skipped + ' 张' : '') +
-            (res.data.failed ? '，失败 ' + res.data.failed + ' 张' : ''),
-            'success'
-          );
-        } else {
-          toast(res.message || '下载失败', 'error');
+        const ok = await showConfirm({
+          title: '下载原片',
+          message: '将按条码（订单号）分文件夹下载原始照片到本地目录（不生成任何清单文件）。\n下载范围：' + scope + '。',
+          confirmText: '下载原片'
+        });
+        if (!ok) return;
+        const d = await window.api.chooseExportDir();
+        if (!d.ok) {
+          if (d.message && d.message !== '已取消') toast(d.message, 'error');
+          return;
         }
-      } catch (e) {
-        toast('下载失败：' + (e.message || e), 'error');
+        busy.value = 'download';
+        toast('正在下载原片，数量较多时请稍候…', 'success');
+        try {
+          const res = await window.api.downloadPhotos(props.token, { targetDir: d.data, barcodes });
+          if (res.ok) {
+            toast(
+              '下载完成：' + res.data.folders + ' 个文件夹、' + res.data.exported + ' 张原片' +
+              (res.data.skipped ? '，缺失跳过 ' + res.data.skipped + ' 张' : '') +
+              (res.data.failed ? '，失败 ' + res.data.failed + ' 张' : ''),
+              'success'
+            );
+          } else {
+            toast(res.message || '下载失败', 'error');
+          }
+        } catch (e) {
+          toast('下载失败：' + (e.message || e), 'error');
+        } finally {
+          busy.value = '';
+        }
       } finally {
-        busy.value = '';
+        confirming.value = false;
       }
     }
 
@@ -2924,7 +2952,7 @@ const QueryPage = {
       storeFilter, storeOptions, isMine, canDelete,
       page, pageSize, totalPages, loading, detail, detailIndex, gridEl,
       selected, batchDeleting, toggleSelect, selectAll, batchDelete,
-      busy, exportByBarcode, exportByDate, exportToday,
+      busy, confirming, exportByBarcode, exportByDate, exportToday,
       downloadingPhoto, downloadPhoto, downloadSelected,
       search, reset, openDetail, remove, prev, next, goPage, fmt, rename, openRename, submitRename, renameBatch, openRenameBatch, submitRenameBatch,
       // 灯箱预览：缩放、平移、切换
@@ -2975,21 +3003,21 @@ const QueryPage = {
           </div>
           <button class="btn btn-primary" @click="search(true)">查询</button>
           <button class="btn btn-ghost" @click="reset">重置</button>
-          <button class="btn btn-ghost" :disabled="!!busy" @click="exportToday" title="生成今天全部订单的「条码+照片位置」表格（不含照片），供洗衣管家上传助手同步使用">
+          <button class="btn btn-ghost" :disabled="!!busy || confirming" @click="exportToday" title="生成今天全部订单的「条码+照片位置」表格（不含照片），供洗衣管家上传助手同步使用">
             {{ busy === 'today' ? '生成中…' : '⬇ 下载当日订单' }}
           </button>
         </div>
 
-        <div class="batch-bar" v-if="items.length" :aria-busy="busy ? 'true' : 'false'">
+        <div class="batch-bar" v-if="items.length" :aria-busy="(busy || confirming) ? 'true' : 'false'">
           <label v-if="canDelete" class="batch-check"><input type="checkbox" :checked="selected.length === items.length && items.length > 0" @change="selectAll" />全选本页</label>
           <span v-if="canDelete" class="pager-info">已选 {{ selected.length }} 条</span>
-          <button class="btn btn-ghost btn-sm" :disabled="!!busy" @click="exportByBarcode" title="生成条码+照片位置清单表">
+          <button class="btn btn-ghost btn-sm" :disabled="!!busy || confirming" @click="exportByBarcode" title="生成条码+照片位置清单表">
             {{ busy === 'byBarcode' ? '导出中…' : '⬇ 导出照片 + 清单表' }}
           </button>
-          <button class="btn btn-ghost btn-sm" :disabled="!!busy" @click="downloadSelected" title="只落原始照片文件，不生成任何清单">
+          <button class="btn btn-ghost btn-sm" :disabled="!!busy || confirming" @click="downloadSelected" title="只落原始照片文件，不生成任何清单">
             {{ busy === 'download' ? '下载中…' : '⬇ 只下载原片（无清单）' }}
           </button>
-          <button class="btn btn-ghost btn-sm" :disabled="!!busy" @click="exportByDate" title="按上方日期范围导出照片，并生成条码+文件位置表格">
+          <button class="btn btn-ghost btn-sm" :disabled="!!busy || confirming" @click="exportByDate" title="按上方日期范围导出照片，并生成条码+文件位置表格">
             {{ busy === 'byDate' ? '导出中…' : '⬇ 按日期导出' }}
           </button>
           <button v-if="adminMode || canDelete" class="btn btn-ghost btn-sm" :disabled="!selected.length" @click="openRenameBatch" title="把选中的多条记录统一改为同一个正确条码（照片随迁并重新编号）">
