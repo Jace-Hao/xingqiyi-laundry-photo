@@ -1229,6 +1229,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     '登录', '登录失败', '退出登录', '修改密码', '重置密码',
     '新增条码', '新增存档照片', '修改条码', '离线存档', '删除存档', '批量删除存档',
     '查询记录', '查看记录', '批量导出照片', '按日期导出照片',
+    '下载原片', '批量下载原片',
     '新增用户', '修改用户', '删除用户',
     '修改备注',
     '查询日志', '修改端口', '重置连接码', '修改照片路径',
@@ -2274,6 +2275,104 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     };
   }
 
+  // ---------- 原片下载（接入后端，而非仅前端处理） ----------
+  // 与导出（exportPhotos / exportPhotosByDate）的区别：下载只把原始照片文件复制到用户选定目录，
+  // 不生成任何汇总表格/清单，语义更贴近「取回原片」而非「归档导出」。
+  // 服务端模式下直接 fs.copyFileSync；客户端模式由主进程经 /photo 接口拉取后落盘（见 main.js）。
+
+  /**
+   * 下载单张原始照片到用户指定目录（保留照片文件原名）。
+   * @param {string} token 会话令牌（要求查询权限）
+   * @param {{ photoFile: string, targetDir: string }} p
+   * @returns {{ savedTo: string, targetDir: string }}
+   */
+  function downloadPhoto(token, p = {}) {
+    const me = requireSessionPermission(token, 'query');
+    const photoFile = String((p && p.photoFile) || '').trim();
+    if (!photoFile) throw new Error('缺少照片标识');
+    const targetDir = path.resolve(String((p && p.targetDir) || '').trim());
+    if (!targetDir) throw new Error('请先选择保存目录');
+    const src = resolvePhotoFile(photoFile);
+    if (!src) throw new Error('照片路径非法');
+    if (!fs.existsSync(src)) throw new Error('照片文件不存在或已被删除');
+    fs.mkdirSync(targetDir, { recursive: true });
+    const rawName = path.basename(photoFile) || 'photo_' + Date.now() + '.jpg';
+    const safeName = rawName.replace(/[\\/:*?"<>|]/g, '_');
+    const dst = path.join(targetDir, safeName);
+    fs.copyFileSync(src, dst);
+    const barcode = String(photoFile).split('/').filter(Boolean)[0] || '未知';
+    appendLog({
+      ...logBase(me),
+      module: isSysAdmin(me) ? '数据管理' : '记录查询',
+      action: '下载原片',
+      detail: `下载单张原始照片：条码「${barcode}」→ ${dst}`,
+      result: '成功'
+    });
+    return { savedTo: dst, targetDir };
+  }
+
+  /**
+   * 批量下载原始照片，按条码（订单号）分文件夹复制到用户指定目录。
+   * 不生成 CSV 归档清单；其余筛选/权限/分组逻辑与 exportPhotos 一致。
+   * @param {string} token
+   * @param {{ barcodes?: string[], targetDir: string }} p
+   */
+  function downloadPhotos(token, p = {}) {
+    const me = requireSessionPermission(token, 'query');
+    const targetDir = path.resolve(String((p && p.targetDir) || '').trim());
+    if (!targetDir) throw new Error('请先选择保存目录');
+    let barcodes = Array.isArray(p.barcodes)
+      ? [...new Set(p.barcodes.map((x) => String(x || '').trim()).filter(Boolean))]
+      : [];
+    let records = loadRecords();
+    // 非系统管理员的可下载范围：本人 + 同门店可见的存档（与导出一致）
+    if (!isSysAdmin(me)) records = records.filter((r) => canViewRecord(me, r));
+    if (barcodes.length) {
+      const set = new Set(barcodes.map((b) => b.toLowerCase()));
+      records = records.filter((r) => set.has(String(r.barcode || '').toLowerCase()));
+    } else {
+      barcodes = [...new Set(records.map((r) => String(r.barcode || '')))];
+    }
+    if (!records.length) throw new Error('没有符合条件的存档记录，无法下载');
+
+    const photoDir = getPhotoDir();
+    let exported = 0;
+    let skipped = 0;
+    let failed = 0;
+    let folderCount = 0;
+    for (const code of barcodes) {
+      const group = records.filter((r) => String(r.barcode || '') === code);
+      if (!group.length) continue;
+      const safeCode = code.replace(/[\\/:*?"<>|]/g, '_').slice(0, 64) || '未命名';
+      const dir = path.join(targetDir, safeCode);
+      fs.mkdirSync(dir, { recursive: true });
+      folderCount++;
+      group.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+      for (const r of group) {
+        const src = path.join(photoDir, r.photoFile);
+        const ext = path.extname(r.photoFile) || '.jpg';
+        const name = `${fmtPhotoTime(r.createdAt)}_第${r.seq}张${ext}`;
+        try {
+          fs.copyFileSync(src, path.join(dir, name));
+          exported++;
+        } catch (e) {
+          if (fs.existsSync(src)) failed++;
+          else skipped++;
+        }
+      }
+    }
+    appendLog({
+      ...logBase(me),
+      module: isSysAdmin(me) ? '数据管理' : '记录查询',
+      action: '批量下载原片',
+      detail:
+        `按条码文件夹批量下载原始照片：${folderCount} 个文件夹、${exported} 张` +
+        `${skipped ? `，照片文件缺失跳过 ${skipped} 张` : ''}${failed ? `，下载失败 ${failed} 张` : ''} → ${targetDir}`,
+      result: '成功'
+    });
+    return { exported, skipped, failed, folders: folderCount, targetDir };
+  }
+
   // ---------- 移动端补充能力（配套移动端 App，首见于桌面端 v1.2.3） ----------
   // 以下四个方法为 Android 客户端新增，桌面端不调用，属于纯增量，不影响既有流程。
 
@@ -2492,6 +2591,8 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     deleteRecords,
     exportPhotos,
     exportPhotosByDate,
+    downloadPhoto,
+    downloadPhotos,
     listUsers,
     createUser,
     updateUser,

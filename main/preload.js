@@ -72,6 +72,8 @@ contextBridge.exposeInMainWorld('api', {
   deleteRecords: (token, ids) => call('records:deleteBatch', { ids }, token),
   exportPhotos: (token, payload) => call('records:exportPhotos', payload, token),
   exportPhotosByDate: (token, payload) => call('records:exportPhotosByDate', payload, token),
+  downloadPhoto: (token, payload) => call('records:downloadPhoto', payload, token),
+  downloadPhotos: (token, payload) => call('records:downloadPhotos', payload, token),
 
   // 用户管理（只传原始类型参数，对象在桥接层内组装）
   listUsers: (token) => call('users:list', undefined, token),

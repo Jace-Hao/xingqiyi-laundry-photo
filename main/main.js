@@ -319,6 +319,8 @@ function localCall(route, body, token) {
     'records/deleteBatch': () => store.deleteRecords(token, b.ids),
     'records/exportPhotos': () => store.exportPhotos(token, b),
     'records/exportPhotosByDate': () => store.exportPhotosByDate(token, b),
+    'records/downloadPhoto': () => store.downloadPhoto(token, b),
+    'records/downloadPhotos': () => store.downloadPhotos(token, b),
     'records/barcodes': () => store.listBarcodes(token),
     'records/renameBarcode': () => store.renameRecordBarcode(token, b.id, b.barcode),
     'records/renameBarcodeBatch': () => store.renameRecordsBarcode(token, b.ids, b.barcode),
@@ -770,6 +772,119 @@ handle('records:exportPhotosByDate', async (p, token) => {
   const cfg = store.loadConfig();
   if (cfg.mode === 'client') return clientExportPhotosByDate(p, token);
   return dispatch('records/exportPhotosByDate', p, token);
+});
+
+// 客户端模式：下载单张原始照片——经服务端 /photo 接口拉取后落盘（保留原文件名）
+async function clientDownloadPhoto(p, sessionToken) {
+  const fs = require('fs');
+  const photoFile = String((p && p.photoFile) || '').trim();
+  if (!photoFile) return { ok: false, message: '缺少照片标识' };
+  const targetDir = String((p && p.targetDir) || '').trim();
+  if (!targetDir) return { ok: false, message: '请先选择保存目录' };
+  fs.mkdirSync(targetDir, { recursive: true });
+  const cfg = store.loadConfig();
+  const url =
+    cfg.serverUrl + '/photo?f=' + encodeURIComponent(photoFile) + '&token=' + encodeURIComponent(cfg.serverToken);
+  try {
+    const resp = await net.fetch(url);
+    if (!resp.ok) return { ok: false, message: '照片下载失败（服务端返回 ' + resp.status + '）' };
+    const buf = Buffer.from(await resp.arrayBuffer());
+    const rawName = path.basename(photoFile) || 'photo_' + Date.now() + '.jpg';
+    const safeName = rawName.replace(/[\\/:*?"<>|]/g, '_');
+    const dst = path.join(targetDir, safeName);
+    fs.writeFileSync(dst, buf);
+    return { ok: true, data: { savedTo: dst, targetDir } };
+  } catch (e) {
+    return { ok: false, message: '照片下载失败：' + (e.message || e) };
+  }
+}
+
+// 客户端模式：批量下载原始照片——按条码分文件夹落盘，不生成任何清单文件
+async function clientDownloadPhotos(p, sessionToken) {
+  const fs = require('fs');
+  const targetDir = String((p && p.targetDir) || '').trim();
+  if (!targetDir) return { ok: false, message: '请先选择保存目录' };
+  const barcodes = Array.isArray(p.barcodes)
+    ? [...new Set(p.barcodes.map((x) => String(x || '').trim()).filter(Boolean))]
+    : [];
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  // 拉取符合条件的全部记录（分页聚合），用于按条码分组
+  const cfg = store.loadConfig();
+  const photoUrl = (file) =>
+    cfg.serverUrl + '/photo?f=' + encodeURIComponent(file) + '&token=' + encodeURIComponent(cfg.serverToken);
+  const base = { silent: true, pageSize: 100 };
+  const all = [];
+  let page = 1;
+  for (;;) {
+    const r = await dispatch('records/list', { ...base, page }, sessionToken);
+    if (!r.ok) return r;
+    all.push(...r.data.items);
+    if (r.data.items.length < base.pageSize || page > 500) break;
+    page++;
+  }
+  const groups = new Map();
+  if (barcodes.length) {
+    const set = new Set(barcodes.map((b) => b.toLowerCase()));
+    for (const r of all) {
+      if (!set.has(String(r.barcode || '').toLowerCase())) continue;
+      if (!groups.has(r.barcode)) groups.set(r.barcode, []);
+      groups.get(r.barcode).push(r);
+    }
+  } else {
+    for (const r of all) {
+      if (!groups.has(r.barcode)) groups.set(r.barcode, []);
+      groups.get(r.barcode).push(r);
+    }
+  }
+  const totalCount = [...groups.values()].reduce((a, l) => a + l.length, 0);
+  if (!totalCount) return { ok: false, message: '没有符合条件的存档记录，无法下载' };
+
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmtTime = (iso) => {
+    const d = new Date(iso || '');
+    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}`;
+  };
+  let exported = 0;
+  let skipped = 0;
+  let failed = 0;
+  let folderCount = 0;
+  for (const [code, list] of groups) {
+    const safeCode = code.replace(/[\\/:*?"<>|]/g, '_').slice(0, 64) || '未命名';
+    const dir = path.join(targetDir, safeCode);
+    fs.mkdirSync(dir, { recursive: true });
+    folderCount++;
+    list.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+    for (const r of list) {
+      const ext = path.extname(r.photoFile) || '.jpg';
+      const name = `${fmtTime(r.createdAt)}_第${r.seq}张${ext}`;
+      try {
+        const resp = await net.fetch(photoUrl(r.photoFile));
+        if (!resp.ok) {
+          skipped++;
+          continue;
+        }
+        const buf = Buffer.from(await resp.arrayBuffer());
+        fs.writeFileSync(path.join(dir, name), buf);
+        exported++;
+      } catch (e) {
+        failed++;
+      }
+    }
+  }
+  return { ok: true, data: { exported, skipped, failed, folders: folderCount, targetDir } };
+}
+
+handle('records:downloadPhoto', async (p, token) => {
+  const cfg = store.loadConfig();
+  if (cfg.mode === 'client') return clientDownloadPhoto(p, token);
+  return dispatch('records/downloadPhoto', p, token);
+});
+
+handle('records:downloadPhotos', async (p, token) => {
+  const cfg = store.loadConfig();
+  if (cfg.mode === 'client') return clientDownloadPhotos(p, token);
+  return dispatch('records/downloadPhotos', p, token);
 });
 
 handle('users:list', (_p, token) => dispatch('users/list', undefined, token));
