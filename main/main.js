@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, session, Menu, protocol, net, Tray, nativeImage, powerSaveBlocker, safeStorage, systemPreferences, powerMonitor } = require('electron');
+const { app, BrowserWindow, screen, ipcMain, session, Menu, protocol, net, Tray, nativeImage, powerSaveBlocker, safeStorage, systemPreferences, powerMonitor } = require('electron');
 const path = require('path');
 const http = require('http');
 const https = require('https');
@@ -319,6 +319,7 @@ function localCall(route, body, token) {
     'records/deleteBatch': () => store.deleteRecords(token, b.ids),
     'records/exportPhotos': () => store.exportPhotos(token, b),
     'records/exportPhotosByDate': () => store.exportPhotosByDate(token, b),
+    'records/exportWeeklyOrders': () => store.exportWeeklyOrders(token, b),
     'records/downloadPhoto': () => store.downloadPhoto(token, b),
     'records/downloadPhotos': () => store.downloadPhotos(token, b),
     'records/barcodes': () => store.listBarcodes(token),
@@ -713,7 +714,9 @@ async function clientExportPhotosByDate(p, sessionToken) {
     groups.get(code).push(r);
   }
 
-  const rows = [['条码', '文件位置']];
+  // 表头必须 3 列，与服务端 store.js 的 exportPhotosByDate 完全一致：
+  // 此前这里只有 ['条码','文件位置'] 而数据行 push 了 3 个值，Excel 打开后表头与数据整体错列
+  const rows = [['条码', '照片数量', '文件位置']];
   let exported = 0;
   let skipped = 0;
   let failed = 0;
@@ -741,16 +744,17 @@ async function clientExportPhotosByDate(p, sessionToken) {
         const buf = Buffer.from(await resp.arrayBuffer());
         fs.writeFileSync(dst, buf);
         exported++;
-        rows.push([code, dst]);
       } catch (e) {
         failed++;
       }
     }
+    // 非仅表格模式同样按条码汇总成一行（数量 + 相对条码目录），
+    // 与服务端 store.js:2245 的 rows.push([code, copied, dir]) 对齐；
+    // 旧的逐张 rows.push([code, dst]) 会让同一条码出现多行且与新表头错列
+    rows.push([code, list.length, dir]);
   }
 
-  const csv = rows.map((row) => row.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
-  const csvPath = path.join(targetDir, `导出清单_${dateFrom}_${dateTo}.csv`);
-  fs.writeFileSync(csvPath, '\ufeff' + csv, 'utf8');
+  const csvPath = store.writeCsv(path.join(targetDir, `导出清单_${dateFrom}_${dateTo}.csv`), rows);
 
   return {
     ok: true,
@@ -772,6 +776,77 @@ handle('records:exportPhotosByDate', async (p, token) => {
   const cfg = store.loadConfig();
   if (cfg.mode === 'client') return clientExportPhotosByDate(p, token);
   return dispatch('records/exportPhotosByDate', p, token);
+});
+
+/**
+ * 客户端模式：本周订单表格导出。
+ * 数据经 records/list 分页拉取（服务端已按可见范围裁剪），此后与服务端模式共用同一份
+ * 聚合实现（store.weeklySummaryRows / weeklyDetailRows，第二参数 absolute=false 表示
+ * 「照片文件夹位置」只给相对目录——照片在服务器电脑上，客户端拿不到绝对路径）。
+ * 与既有 clientExportPhotosByDate 一致：客户端模式不写操作日志（logged:false）——
+ * server.js 的路由表里没有对应接口，为了让日志能落盘而扩大改动面不值得。
+ *
+ * @param {{targetDir:string, dateFrom:string, dateTo:string, mode?:string, filters?:object}} p
+ * @param {string} sessionToken
+ * @returns {Promise<{ok:boolean, data?:object, message?:string}>}
+ */
+async function clientExportWeeklyOrders(p, sessionToken) {
+  const targetDir = String((p && p.targetDir) || '').trim();
+  if (!targetDir) return { ok: false, message: '请先选择保存目录' };
+  const dateFrom = String((p && p.dateFrom) || '').trim();
+  const dateTo = String((p && p.dateTo) || '').trim();
+  if (!dateFrom || !dateTo) return { ok: false, message: '请选择开始与结束日期' };
+  if (dateFrom > dateTo) return { ok: false, message: '开始日期不能晚于结束日期' };
+  const mode = String((p && p.mode) || 'summary') === 'detail' ? 'detail' : 'summary';
+
+  // 1. 分页拉全量（与 clientExportPhotosByDate 的分页循环完全同款）
+  const base = { silent: true, pageSize: 100, dateFrom, dateTo };
+  const all = [];
+  let page = 1;
+  for (;;) {
+    const r = await dispatch('records/list', { ...base, page }, sessionToken);
+    if (!r.ok) return r;
+    all.push(...r.data.items);
+    if (r.data.items.length < base.pageSize || page > 500) break;
+    page++;
+  }
+  if (!all.length) return { ok: false, message: '当前筛选条件下没有订单，无法导出' };
+  // 数据量保护：聚合与写盘都是同步操作，全量太大时会长时间阻塞主进程
+  if (all.length > 20000) return { ok: false, message: '数据量过大，请收窄日期范围或先用筛选缩小范围' };
+
+  // 2. 按所选条件重算一遍（复用 store 的谓词与聚合函数，严禁在客户端另写一份列定义）
+  const list = store.applyWeeklyFilters(all, p && p.filters);
+  if (!list.length) return { ok: false, message: '当前筛选条件下没有订单，无法导出' };
+
+  const rows = mode === 'detail'
+    ? store.weeklyDetailRows(list, false)
+    : store.weeklySummaryRows(list, false);
+
+  // 3. 落盘（复用共用的 writeCsv：BOM + CRLF + RFC4180 + 同名覆盖）
+  const fileName = (mode === 'detail' ? '本周订单明细_' : '本周订单_') + dateFrom + '_至_' + dateTo + '.csv';
+  const csvPath = store.writeCsv(path.join(targetDir, fileName), rows);
+
+  const barcodes = new Set(list.map((r) => String(r.barcode || '未命名')));
+  return {
+    ok: true,
+    data: {
+      csvPath,
+      orders: barcodes.size,
+      photos: list.length,
+      mode,
+      dateFrom,
+      dateTo,
+      targetDir,
+      // 客户端模式无服务端日志（设计文档 §5.3），渲染层据此在成功 toast 里明示
+      logged: false
+    }
+  };
+}
+
+handle('records:exportWeeklyOrders', async (p, token) => {
+  const cfg = store.loadConfig();
+  if (cfg.mode === 'client') return clientExportWeeklyOrders(p, token);
+  return dispatch('records/exportWeeklyOrders', p, token);
 });
 
 // 客户端模式：下载单张原始照片——经服务端 /photo 接口拉取后落盘（保留原文件名）
@@ -1761,27 +1836,82 @@ let mainWindow = null;
 const WINDOW_STATE_FILE = path.join(app.getPath('userData'), 'window-state.json');
 const DEFAULT_WINDOW = { width: 1300, height: 860, isMaximized: true };
 
-function loadWindowState() {
+/**
+ * 基于主屏可用区（workArea）按比例计算还原态尺寸并居中。
+ * workArea 是 Electron 返回的 DIP 矩形，已扣除任务栏并已含系统 DPI 缩放，
+ * 与「按屏幕可用分辨率自动计算尺寸与位置」的要求一一对应。
+ *   宽 0.86 —— 留出左右各约 7% 余量，用户仍能看清窗口边框与其他窗口；
+ *   高 0.90 —— 桌面端标题栏与底部任务栏之外几乎全部可用，再高会让窗口棱角贴上屏幕边缘。
+ *   宽上限 2560 —— 3440 带鱼屏上不必铺满（与卡片集合「元素级留白可读」是同一取舍）。
+ *
+ * @returns {{width:number, height:number, x:number|undefined, y:number|undefined}}
+ */
+function computeRestoreBounds() {
   try {
-    const fs = require('fs');
-    const state = JSON.parse(fs.readFileSync(WINDOW_STATE_FILE, 'utf8'));
-    // 尺寸需落在合理范围内，避免显示器变化后窗口过小或跑出屏幕
-    const width = Number(state.width) >= 800 ? Number(state.width) : DEFAULT_WINDOW.width;
-    const height = Number(state.height) >= 600 ? Number(state.height) : DEFAULT_WINDOW.height;
-    // 打开即最大化：固定为最大化（不再区分上次是否手动还原过；
-    // 如需恢复「记住手动还原状态」的旧行为，改为解析 state.isMaximized 即可）
-    const isMaximized = true;
+    const wa = screen.getPrimaryDisplay().workArea;
+    const width = Math.min(Math.max(Math.round(wa.width * 0.86), 1024), Math.min(wa.width, 2560));
+    const height = Math.min(Math.max(Math.round(wa.height * 0.90), 680), wa.height);
     return {
       width,
       height,
-      x: Number.isFinite(state.x) ? state.x : undefined,
-      y: Number.isFinite(state.y) ? state.y : undefined,
-      isMaximized
+      x: Math.round(wa.x + (wa.width - width) / 2),
+      y: Math.round(wa.y + (wa.height - height) / 2)
     };
   } catch (e) {
-    // 首次运行或状态文件损坏，返回默认最大化状态
-    return Object.assign({}, DEFAULT_WINDOW);
+    // 无显示器环境（如无头验证脚本）不应拖垮启动
+    return { width: DEFAULT_WINDOW.width, height: DEFAULT_WINDOW.height, x: undefined, y: undefined };
   }
+}
+
+/**
+ * 越界收敛：把历史保存的 bounds 夹回主屏 workArea。
+ * 若它与任何显示器的 workArea 重叠面积不足自身 1/4（用户把显示器拔了、坐标被手改成 5000），
+ * 返回 null，由调用方回退到 computeRestoreBounds() 的居中结果。
+ *
+ * @param {{x:number, y:number, width:number, height:number}} b
+ * @returns {{width:number, height:number, x:number, y:number}|null}
+ */
+function fitBoundsToDisplay(b) {
+  try {
+    const displays = screen.getAllDisplays();
+    const wa = screen.getPrimaryDisplay().workArea;
+    const overlap = (r) =>
+      Math.max(0, Math.min(r.x + r.width, b.x + b.width) - Math.max(r.x, b.x)) *
+      Math.max(0, Math.min(r.y + r.height, b.y + b.height) - Math.max(r.y, b.y));
+    if (!displays.some((d) => overlap(d.workArea) > (b.width * b.height) / 4)) return null;
+    // 旧尺寸大于当前 workArea 时自动收敛；过小的历史值也不会被原样放过
+    const width = Math.min(Math.max(b.width, 1024), wa.width);
+    const height = Math.min(Math.max(b.height, 680), wa.height);
+    return {
+      width,
+      height,
+      x: Math.min(Math.max(b.x, wa.x), wa.x + wa.width - width),
+      y: Math.min(Math.max(b.y, wa.y), wa.y + wa.height - height)
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+function loadWindowState() {
+  // 打开即最大化：固定为最大化（保留既有语义与注释，切勿改为解析 state.isMaximized）
+  const isMaximized = true;
+  // 还原态基准：按主屏 workArea 重新计算，而不是沿用 DEFAULT_WINDOW 的固定 1300×860。
+  // 首次运行（或状态文件损坏）时直接给出贴合屏幕的落点，用户按「还原」不会掉进小窗。
+  const base = computeRestoreBounds();
+  let state = null;
+  try {
+    const fs = require('fs');
+    state = JSON.parse(fs.readFileSync(WINDOW_STATE_FILE, 'utf8'));
+  } catch (e) {
+    state = null;
+  }
+  if (!state) return { ...base, isMaximized };
+  const width = Number(state.width) >= 800 ? Number(state.width) : base.width;
+  const height = Number(state.height) >= 600 ? Number(state.height) : base.height;
+  if (!Number.isFinite(state.x) || !Number.isFinite(state.y)) return { ...base, isMaximized };
+  const fit = fitBoundsToDisplay({ x: state.x, y: state.y, width, height });
+  return fit ? { ...fit, isMaximized } : { ...base, isMaximized };
 }
 
 // 保存窗口状态；最大化时用还原态尺寸记录，避免退出后下次打开变成小窗

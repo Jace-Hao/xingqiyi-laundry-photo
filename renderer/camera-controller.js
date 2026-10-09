@@ -45,9 +45,9 @@
     blackVariance: 4,
     // 悬挂兜底：play() / applyConstraints 部分 UVC 摄像头会永不 settle，
     // 若不加超时，控制器会卡在 STARTING 且无错误提示（与「黑屏只能重开」同族症状）
-    attachTimeoutMs: 3000,
-    applyConstraintMs: 1500,
-    accessGateMs: 1500
+    attachTimeoutMs: 2000,
+    applyConstraintMs: 1000,
+    accessGateMs: 1000
   };
 
   /* ---------- 纯计算辅助（可被单测直接调用） ---------- */
@@ -59,16 +59,25 @@
     var varMax = th.variance == null ? DEFAULTS.blackVariance : th.variance;
     var n = samples && samples.length ? samples.length : 0;
     if (!n) return { mean: null, variance: null, black: false, samples: 0 };
+    // 脏数据（NaN/非有限值）不得被 || 0 强转成 0 误判纯黑：只统计有限样本
+    var finite = 0;
     var sum = 0;
-    for (var i = 0; i < n; i++) sum += Number(samples[i]) || 0;
-    var mean = sum / n;
+    for (var i = 0; i < n; i++) {
+      var v = Number(samples[i]);
+      if (!isFinite(v)) continue;
+      sum += v; finite++;
+    }
+    if (!finite) return { mean: null, variance: null, black: false, samples: 0 };
+    var mean = sum / finite;
     var acc = 0;
     for (var j = 0; j < n; j++) {
-      var d = (Number(samples[j]) || 0) - mean;
+      var vj = Number(samples[j]);
+      if (!isFinite(vj)) continue;
+      var d = vj - mean;
       acc += d * d;
     }
-    var variance = acc / n;
-    return { mean: mean, variance: variance, black: mean < meanMax && variance < varMax, samples: n };
+    var variance = acc / finite;
+    return { mean: mean, variance: variance, black: mean < meanMax && variance < varMax, samples: finite };
   }
 
   // 从 ImageData 结构里取中心 size×size 的灰度样本（不触碰 DOM，纯数组运算）
@@ -230,18 +239,34 @@
     /* ---------- 定时器 ---------- */
 
     function waitMs(ms) {
-      return new Promise(function (resolve) {
-        var w = { resolve: resolve, id: null };
+      var w = { resolve: null, id: null, promise: null, cancelled: false };
+      w.promise = new Promise(function (resolve) {
+        w.resolve = resolve;
         w.id = st(function () {
           var i = waiters.indexOf(w);
           if (i >= 0) waiters.splice(i, 1);
           var t = timers.indexOf(w.id);
           if (t >= 0) timers.splice(t, 1);
+          w.id = null;
           resolve(true);
         }, ms);
         timers.push(w.id);
         waiters.push(w);
       });
+      // 取消：立即清除底层定时器并从 timers 摘掉，避免 Promise.race 落败一侧的
+      // 计时器成为悬挂定时（实测会导致空闲期残留 2 个 pending 定时器）。
+      w.cancel = function () {
+        if (w.cancelled) return;
+        w.cancelled = true;
+        if (w.id != null) {
+          try { ct(w.id); } catch (e) {}
+          var t = timers.indexOf(w.id);
+          if (t >= 0) timers.splice(t, 1);
+          w.id = null;
+        }
+        try { w.resolve(false); } catch (e) {}
+      };
+      return w;
     }
 
     function clearTimers() {
@@ -430,7 +455,13 @@
     function startDegradedWatch(mySeq) {
       clearDegradedWatch();
       degradedTimer = st(function () {
+        var firedId = degradedTimer;
         degradedTimer = null;
+        // 回调触发时把自身 id 从 timers 数组摘掉，避免数组随闪断次数单调增长（D2 泄漏）
+        if (firedId != null) {
+          var ti = timers.indexOf(firedId);
+          if (ti >= 0) timers.splice(ti, 1);
+        }
         if (mySeq !== seq || !alive) return;
         if (state !== STATES.DEGRADED) return;
         log('warn', 'CAM_DEGRADED', { seq: seq, reason: 'watch-timeout', attempt: attempt });
@@ -463,10 +494,12 @@
       if (maxW && maxH) {
         try {
           // 部分 UVC 摄像头 applyConstraints 会永不 settle，必须加超时，超时则跳过提分辨率直接出画
+          var acw = waitMs(cfg.applyConstraintMs);
           await Promise.race([
             track.applyConstraints({ width: { ideal: maxW }, height: { ideal: maxH } }),
-            waitMs(cfg.applyConstraintMs)
+            acw.promise
           ]);
+          acw.cancel();
         } catch (e) {
           /* 部分摄像头不支持调整，保持当前分辨率 */
         }
@@ -486,7 +519,7 @@
         if (!alive || mySeq !== seq) return 'stale';
         if (frameReady(el)) return 'ok';
         if (now() >= deadline) return 'timeout';
-        await waitMs(cfg.framePollMs);
+        await waitMs(cfg.framePollMs).promise;
       }
     }
 
@@ -506,10 +539,12 @@
       try {
         if (typeof el.play === 'function') {
           // P1-1：play() 永不 settle 时必须超时兜底，否则永久 STARTING 且无错误提示
+          var atw = waitMs(cfg.attachTimeoutMs);
           await Promise.race([
             el.play(),
-            waitMs(cfg.attachTimeoutMs).then(function () { return Promise.reject(new Error('attach-timeout')); })
+            atw.promise.then(function () { return Promise.reject(new Error('attach-timeout')); })
           ]);
+          atw.cancel();
         }
       } catch (e2) {
         try { el.srcObject = null; } catch (e3) {}
@@ -662,7 +697,7 @@
         }
         var delay = cfg.backoffMs[Math.min(attempt - 1, cfg.backoffMs.length - 1)];
         log('warn', 'CAM_RETRY', { seq: mySeq, attempt: attempt, reason: r.code, delayMs: delay });
-        await waitMs(delay);
+        await waitMs(delay).promise;
         if (!alive || mySeq !== seq) return false;
       }
       } catch (e) {
@@ -711,7 +746,9 @@
       var res = null;
       try {
         // P2-1：预检 IPC 挂起时超时放行，不得让界面永久停在「准备中」
-        res = await Promise.race([checkAccess(), waitMs(cfg.accessGateMs)]);
+        var agw = waitMs(cfg.accessGateMs);
+        res = await Promise.race([checkAccess(), agw.promise]);
+        agw.cancel();
       } catch (e) {
         return null; // 接口异常不得阻断取流
       }
@@ -819,9 +856,9 @@
       openPromise = null;
       setState(STATES.UNINIT, 'unmount');
       setError(null);
-      listeners.state.length = 0;
-      listeners.error.length = 0;
-      listeners.devices.length = 0;
+      // 注意：不在 unmount 清空 listeners —— 订阅者（渲染层）自行通过 on() 返回的
+      // 反订阅函数管理生命周期；控制器清空会导致「复用同一 controller 做
+      // mount/unmount/mount」时界面状态永久停在旧值（G 类缺陷）。
       return true;
     }
 

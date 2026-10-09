@@ -72,6 +72,7 @@ contextBridge.exposeInMainWorld('api', {
   deleteRecords: (token, ids) => call('records:deleteBatch', { ids }, token),
   exportPhotos: (token, payload) => call('records:exportPhotos', payload, token),
   exportPhotosByDate: (token, payload) => call('records:exportPhotosByDate', payload, token),
+  exportWeeklyOrders: (token, payload) => call('records:exportWeeklyOrders', payload, token),
   downloadPhoto: (token, payload) => call('records:downloadPhoto', payload, token),
   downloadPhotos: (token, payload) => call('records:downloadPhotos', payload, token),
 

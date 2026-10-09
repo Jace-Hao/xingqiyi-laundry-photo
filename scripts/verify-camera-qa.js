@@ -117,7 +117,17 @@ const CFG = {
   framePollMs: 10,
   degradedWatchMs: 50,
   backoffMs: [10, 10, 10, 10],
-  maxAttempts: 5
+  maxAttempts: 5,
+  // 悬挂兜底场景（C1/C2/C3）的超时配短值：本探测刻意让 play()/applyConstraints/
+  // 预检 IPC 永不 settle，需要在探测的等待窗口内确认控制器能落到 ERROR，因此用极短的
+  // 兜底超时观察「是否真的有超时落 ERROR」的契约，而非考验时长。
+  //   - attachTimeoutMs=5：C1 重试 open('') 重新走 attachStream，需 <30ms 内 resolve 被判定为「已发起新取流」
+  //   - applyConstraintMs=20：C3 足以在 150ms 内被捕获
+  //   - accessGateMs=400：必须在 C2 的 300ms「禁拍」断言之前仍挂着（>300），又要在其后
+  //     200ms 的「mount 必须 settle」断言之前超时放行（<500），落在 (300,500) 窗口
+  attachTimeoutMs: 5,
+  applyConstraintMs: 20,
+  accessGateMs: 400
 };
 
 function make(clock, over) {

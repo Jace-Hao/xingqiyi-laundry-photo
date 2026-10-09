@@ -1057,11 +1057,22 @@ textarea {
 }
 
 .main {
-  flex: 1;
+  flex: 1 1 auto;
+  /* min-width:0 —— 本次「铺满」能否成立的关键前提。
+     .main 是 .shell（display:flex）的 flex 子项。flex 子项的自动最小尺寸
+     （automatic minimum size）默认是 min-content：只要内部存在
+     ① 宽表格（table 的最小内容宽度等于所有列自然宽度之和）、② grid 子项的 min-width:auto、
+     ③ 长串不可断文本，.main 就会被顶到比 flex 容器分配给它的宽度更宽，
+     表现为「视口右侧多出一条横向滚动条 + 看不见的空白带」。
+     置 0 后 .main 严格收敛为 flex 容器分配的宽度，溢出由自身的 overflow-y:auto
+     与 .table-wrap 的 overflow-x:auto 消化。 */
+  min-width: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 24px;
-  /* #8 超宽屏：内容最大宽 1440、左对齐，避免 ≥1920 下内容过度拉伸/与侧栏拉开空档 */
-  max-width: 1440px;
+  /* 已删除 max-width:1440px —— 这是 ≥1920 显示器右侧留白的唯一根因。
+     富余宽度改由「容器铺满 + 表格列延展 + 拍照取景区扩张 + 卡片集合元素级留白」吸收。
+     回滚方式：把 max-width:1440px 加回来即可恢复旧行为（其余改动独立可回滚）。 */
 }
 
 /* ---------- 页面通用 ---------- */
@@ -1096,10 +1107,25 @@ textarea {
 }
 
 /* ---------- 客户端首页 ---------- */
+/* 固定数量集合：N 列均分 + 整行容器上限。
+   为什么不用 repeat(auto-fill, minmax(300px,1fr))：auto-fill 会先按 300px
+   铺出远多于卡片数的轨道（3440 下 10 条），随后「最大化轨道」步骤会把剩余空间
+   均摊给全部 10 条轨道，每条被压到约 301px，且轨道数随宽度跳变会产生突变。
+   minmax(0,·) 与 .main 的 min-width:0 同理，允许窄屏收缩不顶宽父容器。 */
 .stat-row {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 16px;
+  max-width: 1472px; /* 480×3 + 16×2 */
+}
+
+/* 窄屏降级：窗口 ≤1219px 时内容区不足以容纳 3 张 ≥300px 的卡片，
+   降到 2 列，保证每张卡片仍 ≥300px（设计 §3.4 列宽区间下限）。
+   1219 的切点使 3 列仅在「内容宽 ≥ 980 → 3×300+32 间隙」以上才生效。 */
+@media (max-width: 1219px) {
+  .stat-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .stat-card {
@@ -1126,9 +1152,10 @@ textarea {
 
 .quick-row {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
   margin-top: 16px;
+  max-width: 1056px; /* 520×2 + 16 */
 }
 
 .quick-card {
@@ -1163,11 +1190,31 @@ textarea {
 }
 
 /* ---------- 拍照页 ---------- */
+/* 默认（窄屏 / 矮屏 / 高 DPI 小视口）一律单列堆叠：取景区在上、存档信息在下。
+   低于 1440 或高度不足 780 时，双栏的「minmax(0,1fr) + 320px 侧栏」会把取景区压到
+   比单列更窄（1024–1439 是老机大头，单列反而能给出最宽的取景区），故一律单列。 */
 .capture-layout {
   display: grid;
-  grid-template-columns: 1.35fr 1fr;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
   align-items: start;
+}
+
+/* ≥1440 宽 且 ≥780 高才双栏。
+   为什么是 1440：低于此宽度时 minmax(0,1fr)+320px 会把取景区压到 <820px，不如单列；
+                  ≥1440 时双栏已能给出 ≥776px 且右侧信息栏不拥挤。
+   为什么是 780： ① 1366×768@100% 的视口高约 728 < 780 → 保持单列；
+                  ② 1920×1080@125% 的视口高约 825 > 780 → 双栏（用 820 会因任务栏高度
+                     差异在 821~828 之间抖动，故下调到 780 留出余量）。
+   注意：比较的是 CSS 视口（DIP），1920 物理屏 @150% 的视口只有 1280，会正确落到单列。 */
+@media (min-width: 1440px) and (min-height: 780px) {
+  .capture-layout {
+    /* 侧栏 clamp(320, 26%, 380)：
+       - 320px 下限：保证条码输入框 + 备注 textarea + 缩略图队列不挤成一团
+       - 26%：中等宽度（1440~1900）时侧栏适当收窄，把空间让给取景区
+       - 380px 上限：超宽屏锁死，防止信息栏跟着拉宽反向蚕食取景区 */
+    grid-template-columns: minmax(0, 1fr) clamp(320px, 26%, 380px);
+  }
 }
 
 /* 取景区保持深色：相机画面需要暗环境衬托 */
@@ -1175,7 +1222,20 @@ textarea {
   background: #14161a;
   border-radius: 8px;
   overflow: hidden;
-  aspect-ratio: 4 / 3;
+  width: 100%;
+  /* 比例来源改为摄像头真实分辨率：由 renderer.js 在 loadedmetadata 时写入 --cam-ar
+     （形如 "1280 / 720"）。未取到流时由 var() 的兜底值回退到 4/3。
+     取代旧的固定 aspect-ratio:4/3 —— 那样在 16:9 摄像头上容器被锁成 4:3，
+     画面上下必然出现黑边。 */
+  aspect-ratio: var(--cam-ar, 4 / 3);
+  /* 高度上限不再写死 68vh：由 renderer.js 按实测的「可用高度」写入 --cam-max-h。
+     68vh 之所以偏，是因为它没有扣除 .page-head / .card padding / .camera-bar 的实际占用，
+     窗口任务栏高度不同还会进一步放大误差。改实测后与窗口状态完全解耦。
+     注：aspect-ratio 与 max-height 同时生效且高度受限时，容器比例会宽于视频比例，
+     contain 会在左右留下与容器同色（#14161a）的背景条 —— 这是刻意选择：
+     若改为「按可用高度反算宽度」保证严格零黑边，1366 下取景区宽度会从 1038 掉到约 635
+     （占比 61%），违反单列 ≥90% 的要求，而两种方案的视频渲染像素完全相同。 */
+  max-height: var(--cam-max-h, 68vh);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1247,6 +1307,22 @@ textarea {
   font-size: 12px;
   color: #86909c;
   margin-top: 6px;
+}
+
+/* 错误态的按钮组：「去系统设置开启摄像头」与「重试」可同时出现（权限被拒场景），
+   设备数 >1 时还会多出一个下拉用于切换摄像头。 */
+.camera-overlay-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+  /* 与既有 .camera-box .btn 同理：overlay 本体是 pointer-events:none
+     （保证条码输入框始终可点，审查 #7 的结论不得回退），子元素需显式恢复。 */
+  pointer-events: auto;
+}
+
+.camera-dev-switch {
+  min-height: 36px;
 }
 
 .camera-bar {
@@ -1397,6 +1473,10 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: center;
+  /* 响应式内边距：杜绝弹窗贴边 / 矮屏被切。
+     配合 .modal 的 max-height:88vh，最多占用 88vh + 3vh×2 = 94vh < 100vh，
+     因此 top ≥ 0 且 bottom ≤ innerHeight 恒成立（不会再出现按钮被切到视口外）。 */
+  padding: max(16px, 3vh) max(16px, 3vw);
   /* 必须高于 .lightbox 的 200：灯箱内触发的确认/改码弹窗要盖在灯箱之上，
      否则用户看不见确认框却会被 Enter 真实触发（尤其 danger 删除类）。toast 为 999，仍在最上层。 */
   z-index: 300;
@@ -1405,7 +1485,12 @@ textarea {
 .modal {
   background: var(--card);
   border-radius: var(--r-dialog);
-  width: 720px;
+  /* 取代固定 720px：宽度随视口线性缩放。
+     56vw   —— 比例项，1920 下正好 1075px
+     680px  —— 下限。最小窗口 1024 时 56vw 仅 573px，不设下限确认框/改码框会明显变窄
+     1200px —— 上限。防止 3440 带鱼屏上出现信息密度极低的巨型对话框
+     92vw 仍是硬兜底：任何未来误改 clamp 都不会溢出视口。 */
+  width: clamp(680px, 56vw, 1200px);
   max-width: 92vw;
   max-height: 88vh;
   display: flex;
@@ -1415,7 +1500,10 @@ textarea {
 }
 
 .modal-sm {
-  width: 480px;
+  /* 分档兜底：34vw + 520px 上限。
+     1024 最小窗口 → 348px 被下限抬到 440px；1529 及以上一律封顶 520px。
+     均与 92vw 兜底不冲突（1024 下 92vw = 942px）。 */
+  width: clamp(440px, 34vw, 520px);
 }
 
 .modal-head {
@@ -1451,6 +1539,12 @@ textarea {
 
 .modal-body {
   padding: 20px;
+  /* 补 flex 收缩：.modal 是 flex 列容器，.modal-body 没有 flex 时只按内容高度参与布局，
+     超高内容会把 .modal-head / .modal-foot 顶出 88vh 之外（「按钮要滚动才能点到」根因）。
+     flex:1 1 auto 让它吃满剩余高度；min-height:0 取消 flex 子项的自动最小尺寸，
+     是 overflow-y:auto 真正生效的前提。 */
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
 }
 
@@ -1816,9 +1910,10 @@ tr:hover td {
 /* ---------- 设置页 ---------- */
 .settings-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
   align-items: start;
+  max-width: 1280px; /* 640×2 + 16 */
 }
 
 .settings-grid .btn {
@@ -2898,8 +2993,26 @@ textarea:focus-visible,
   padding: 9px 12px;
 }
 
-/* 本周订单：表格上方的统计摘要条 */
+/* ---------- 本周订单：筛选条与汇总 / 导出工具条 ---------- */
+.weekly-filter {
+  margin-bottom: 0;
+}
+
+.weekly-filter input {
+  width: 240px;
+}
+
+.weekly-filter select {
+  width: 170px;
+}
+
+/* 汇总行改为「左统计 + 右导出」弹性行；窄屏自动换行不截断 */
 .weekly-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
   padding: 12px 16px;
   font-size: 13px;
   color: var(--text-sub);
@@ -2909,6 +3022,19 @@ textarea:focus-visible,
   color: var(--text);
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+}
+
+.weekly-export {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+@media (max-width: 767px) {
+  .weekly-export {
+    margin-left: 0;
+  }
 }
 
 /* 本周订单：条码单元格内的「去处理」跳转链接。
@@ -2938,13 +3064,10 @@ textarea:focus-visible,
 }
 
 /* ---------- 响应式断点 ----------
-   ≥1440：三区；1024–1439：隐藏第三区；768–1023：侧栏收起；<768：紧凑 */
-@media (max-width: 1439px) {
-  .settings-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
+   ≥1440：三区；1024–1439：隐藏第三区；768–1023：侧栏收起；<768：紧凑
+   注：此处原有的 `@media (max-width:1439px) { .settings-grid { repeat(2, minmax(0,1fr)) } }`
+   已删除 —— 基础规则的 repeat(2, minmax(0,1fr)) 已完全覆盖该场景（与概览保持一致）。
+   拍照页的断点见文件末尾（.capture-layout 双栏分支）。 */
 @media (max-width: 1023px) {
   .sidebar {
     width: 64px;
@@ -3353,32 +3476,12 @@ textarea:focus-visible,
   }
 }
 
-/* ---------- 拍照页：单焦点（设计 v2 · P3） ---------- */
-@media (min-width: 1024px) {
-  /* 取景器吃满主区，表单收窄为 380px 侧栏：一屏只有一个焦点 */
-  .capture-layout {
-    grid-template-columns: minmax(0, 1fr) 380px;
-    align-items: stretch;
-  }
-
-  .capture-main {
-    display: flex;
-    flex-direction: column;
-  }
-
-  .capture-main .camera-box {
-    flex: 1 1 auto;
-    aspect-ratio: auto;
-    min-height: 420px;
-    max-height: 68vh;
-  }
-}
-
-@media (max-width: 1023px) {
-  .capture-layout {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
+/* ---------- 拍照页断点 ----------
+   此处原有一段 `@media (min-width:1024px)`（双栏 380px 侧栏 + min-height:420px +
+   max-height:68vh）与 `@media (max-width:1023px)`（单列）的覆盖，已整体删除：
+   基础规则已改为单列，双栏分支改为 `@media (min-width:1440px) and (min-height:780px)`
+   （见文件前部「拍照页」一节）。旧断点会让 1024–1439 的机器被锁死在 380px 侧栏上，
+   取景区只能拿到 642px（占比 59.5%），正是本次要消除的老机痛点。 */
 
 /* 快门键加大：戴手套也要一次点中（审查 #9：主按钮 ≥44） */
 .btn-shutter {

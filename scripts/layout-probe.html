@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>布局探针</title>
+  <!-- 直接加载产品真实样式表，保证测量的是线上 CSS -->
+  <link rel="stylesheet" href="../renderer/styles.css" />
+  <style>
+    /* 探针页面自身不加任何会干扰测量的样式，只保证 body 无默认 margin 不干扰 */
+    html, body { margin: 0; padding: 0; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">星期衣</div>
+      <nav class="nav"></nav>
+    </aside>
+    <main class="main" id="main">
+      <div class="page-head"><h2>衣物拍照</h2><p>提示行</p></div>
+      <div class="stat-row" id="statRow">
+        <div class="stat-card"><div class="num">1</div><div class="lbl">今日</div></div>
+        <div class="stat-card"><div class="num">2</div><div class="lbl">本周</div></div>
+        <div class="stat-card"><div class="num">3</div><div class="lbl">累计</div></div>
+      </div>
+      <div class="capture-layout" id="captureLayout">
+        <div class="card capture-main">
+          <div class="card-title">📷 摄像头取景</div>
+          <div class="camera-box" id="cameraBox" style="--cam-ar: 1280 / 720; --cam-max-h: 744px;">
+            <video></video>
+          </div>
+          <div class="camera-bar">
+            <button class="btn btn-primary btn-shutter">📸 拍照（空格）</button>
+          </div>
+        </div>
+        <div class="card capture-side"><div class="card-title">🧾 存档信息</div></div>
+      </div>
+      <div class="settings-grid" id="settingsGrid">
+        <div class="card"><div class="card-title">A</div></div>
+        <div class="card"><div class="card-title">B</div></div>
+      </div>
+      <!-- 一张超宽 table，用于验证 .main 的 min-width:0 是否真的让内容不被顶宽 -->
+      <div class="table-wrap">
+        <table id="wideTable" style="width:100%">
+          <thead><tr><th>列1 很长很长很长很长很长很长很长很长</th><th>列2</th><th>列3</th><th>列4</th><th>列5</th><th>列6</th><th>列7</th><th>列8</th><th>列9</th><th>列10</th><th>列11</th><th>列12</th></tr></thead>
+          <tbody><tr><td>值</td><td>值</td><td>值</td><td>值</td><td>值</td><td>值</td><td>值</td><td>值</td><td>值</td><td>值</td><td>值</td><td>值</td></tr></tbody>
+        </table>
+      </div>
+      <div class="quick-row" id="quickRow">
+        <div class="quick-card"><div class="t">拍摄</div><div class="d">连线如果一个、自己拍摄</div></div>
+        <div class="quick-card"><div class="t">查询</div><div class="d">查衣物照片</div></div>
+      </div>
+    </main>
+  </div>
+
+  <div class="lightbox" id="lightbox" style="position:fixed;inset:0"></div>
+  <div class="modal-mask" id="mask">
+    <div class="modal" id="modal">
+      <div class="modal-head"><h3>标题</h3></div>
+      <div class="modal-body" id="modalBody">
+        <div style="height:3000px">超高内容，用于验证 body 是否内部滚动而不是把 foot 顶出 88vh</div>
+      </div>
+      <div class="modal-foot"><button class="btn btn-primary">确定</button></div>
+    </div>
+  </div>
+  <div class="toast" id="toast"><span>t</span></div>
+
+  <script>
+    // 测量入口：由宿主进程通过 executeJavaScript 调用
+    window.measure = function () {
+      const q = (s) => document.querySelector(s);
+      const main = q('.main');
+      const mr = main.getBoundingClientRect();
+      const cs = (el, p) => getComputedStyle(el).getPropertyValue(p);
+      const sidebar = q('.sidebar');
+      const sidebarW = Math.round(sidebar.getBoundingClientRect().width);
+      const layout = q('.capture-layout');
+      const box = q('.camera-box');
+      // 探针把 --cam-max-h 抬到很大，使取景区在本测里不被高度裁剪，
+      // 从而能干净地验证「声明的 aspect-ratio 是否等于 --cam-ar」；
+      // 真实应用里高度由 measureCameraMaxH() 实测（会裁剪，属设计 §4.2 既定取舍）。
+      box.style.setProperty('--cam-max-h', Math.round(window.innerHeight * 0.6) + 'px');
+      const boxR = box.getBoundingClientRect();
+      const cols = cs(layout, 'grid-template-columns').trim().split(/\s+/);
+      const modal = q('.modal');
+      const modalR = modal.getBoundingClientRect();
+      const modalSm = document.createElement('div');
+      const atCenter = document.elementFromPoint(
+        Math.round(modalR.left + modalR.width / 2),
+        Math.round(modalR.top + modalR.height / 2)
+      );
+      // 独立测 .modal-sm：临时套一个类做离屏测量，避免污染上面的 .modal
+      const probe = document.createElement('div');
+      probe.className = 'modal modal-sm';
+      probe.style.position = 'absolute';
+      probe.style.left = '-99999px';
+      probe.style.top = '0';
+      document.body.appendChild(probe);
+      const modalSmW = probe.getBoundingClientRect().width;
+      probe.remove();
+      const foot = q('.modal-foot').getBoundingClientRect();
+      const bodyEl = q('#modalBody');
+      return {
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        sidebarW: sidebarW,
+        mainOuterW: Math.round(mr.width * 100) / 100,
+        mainRightGap: Math.round((window.innerWidth - mr.right) * 100) / 100,
+        mainContentW: Math.round((mr.width - parseFloat(cs(main, 'padding-left')) - parseFloat(cs(main, 'padding-right'))) * 100) / 100,
+        docScrollWidth: document.documentElement.scrollWidth,
+        docScrollHeight: document.documentElement.scrollHeight,
+        mainHasHScroll: main.scrollWidth > main.clientWidth + 2,
+        statRowCols: cs(q('.stat-row'), 'grid-template-columns').trim().split(/\s+/).length,
+        statTrackW: Math.round(q('.stat-row').firstElementChild.getBoundingClientRect().width),
+        quickTrackW: Math.round(q('.quick-row').firstElementChild.getBoundingClientRect().width),
+        settingsCols: cs(q('.settings-grid'), 'grid-template-columns').trim().split(/\s+/).length,
+        captureCols: cols,
+        captureColCount: cols.length,
+        cameraBoxW: Math.round(boxR.width * 100) / 100,
+        cameraBoxH: Math.round(boxR.height * 100) / 100,
+        cameraBoxRatio: Math.round((boxR.width / boxR.height) * 1000) / 1000,
+        cameraAspectCss: cs(box, 'aspect-ratio').trim(),
+        cameraMaxHCss: cs(box, 'max-height').trim(),
+        cameraObjectFit: cs(box.querySelector('video'), 'object-fit').trim(),
+        captureRatio: Math.round((boxR.width / (mr.width - parseFloat(cs(main, 'padding-left')) - parseFloat(cs(main, 'padding-right')))) * 1000) / 1000,
+        modalW: Math.round(modalR.width * 100) / 100,
+        modalH: Math.round(modalR.height * 100) / 100,
+        modalTop: Math.round(modalR.top),
+        modalBottom: Math.round(modalR.bottom),
+        modalFootBottom: Math.round(foot.bottom),
+        modalBodyScrollable: bodyEl.scrollHeight > bodyEl.clientHeight + 2,
+        modalSmW: Math.round(modalSmW * 100) / 100,
+        zLightbox: cs(q('#lightbox'), 'z-index'),
+        zMask: cs(q('#mask'), 'z-index'),
+        zToast: cs(q('#toast'), 'z-index'),
+        maskPadding: cs(q('#mask'), 'padding'),
+        hitInsideModal: !!(atCenter && atCenter.closest && atCenter.closest('.modal')),
+      };
+    };
+  </script>
+</body>
+</html>

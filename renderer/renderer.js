@@ -34,7 +34,8 @@ function toast(msg, type) {
 }
 
 /* ---------- 通用确认对话框（替代 window.confirm：按钮可写动词、支持危险态、Esc/Enter/遮罩关闭） ---------- */
-// 单例状态：全应用共享同一个确认弹窗，任意组件调用 showConfirm 即可唤起。
+// 单例状态：全应用共享同一个确认弹窗。为防止「弹窗未关闭时再次调用 showConfirm 覆盖
+// confirmState.resolve，导致前一次 await 永久挂死（静默消失）」，这里用队列保存待确认项，逐个弹出。
 const confirmState = Vue.reactive({
   open: false,
   title: '提示',
@@ -45,16 +46,29 @@ const confirmState = Vue.reactive({
   resolve: null
 });
 
+// 等待确认的项队列：每项 { opts, resolve }。并发调用 showConfirm 时入队，按序弹出。
+const confirmQueue = [];
+
+// 取队首渲染到 confirmState；队列空则不开弹窗（close 已负责置 open=false）。
+function flushConfirmQueue() {
+  const next = confirmQueue.shift();
+  if (!next) return;
+  const opts = next.opts || {};
+  confirmState.title = opts.title || '提示';
+  confirmState.message = opts.message || '';
+  confirmState.confirmText = opts.confirmText || '确定';
+  confirmState.cancelText = opts.cancelText || '取消';
+  confirmState.danger = !!opts.danger;
+  confirmState.resolve = next.resolve;
+  confirmState.open = true;
+}
+
 // 返回 Promise<boolean>：用户点确认解析为 true，取消 / Esc / 点遮罩解析为 false。
+// 若弹窗已打开，本次请求进入队列，待当前弹窗关闭后自动弹出，避免覆盖 resolve 导致挂死。
 function showConfirm(opts) {
   return new Promise((resolve) => {
-    confirmState.title = opts && opts.title ? opts.title : '提示';
-    confirmState.message = opts && opts.message ? opts.message : '';
-    confirmState.confirmText = opts && opts.confirmText ? opts.confirmText : '确定';
-    confirmState.cancelText = opts && opts.cancelText ? opts.cancelText : '取消';
-    confirmState.danger = !!(opts && opts.danger);
-    confirmState.resolve = resolve;
-    confirmState.open = true;
+    confirmQueue.push({ opts, resolve });
+    if (!confirmState.open) flushConfirmQueue();
   });
 }
 
@@ -68,6 +82,8 @@ const ConfirmModal = {
       s.open = false;
       s.resolve = null;
       if (r) r(val);
+      // 当前弹窗关闭后立即弹出队列中的下一个待确认项（若有），实现并发确认按序处理。
+      flushConfirmQueue();
     }
     function onKey(e) {
       if (!s.open) return;
@@ -1424,6 +1440,103 @@ const HomePage = {
   `
 };
 
+/* ---------- 摄像头错误态 UI 映射 ----------
+   键取自 renderer/camera-controller.js 各 setError() 调用点产出的 error.code（已逐项核实）。
+   渲染层只按 code 决定「标题 / 次级说明 / 按钮组合」，controller 里不得出现任何中文 UI 文案。
+
+   为什么不用 error.fatal / error.recoverable：
+     - fatal 到不了渲染层 —— failOpen() / abandon() 在 setError() 时只透传
+       {code, message, recoverable}，fatal 字段被丢弃；
+     - recoverable 语义与 UI 需求不一致 —— PERMISSION_DENIED 在 classifyError 路径下
+       recoverable:false，但用户改完系统权限后**必须**能点「重试」，否则只能重启软件。
+   因此不可重试的集合由本表的 showRetry 显式表达，目前只有 SECURITY / UNSUPPORTED。 */
+const CAM_ERR_UI = {
+  PERMISSION_DENIED: {
+    title: '摄像头权限被拒绝，无法取景',
+    sub: '请到 Windows「设置 → 隐私和安全性 → 相机」允许本程序访问摄像头，保存后回到本页点「重试」。',
+    showRetry: true,
+    showPrivacy: true
+  },
+  NO_DEVICE: {
+    title: '未检测到摄像头设备',
+    sub: '请确认摄像头已插好、在「设备管理器」中未被禁用；外接摄像头请换一个 USB 口后再试。',
+    showRetry: true,
+    showPrivacy: false
+  },
+  DEVICE_BUSY: {
+    title: '摄像头被其他程序占用或未就绪',
+    sub: '相机、企业微信、钉钉、腾讯会议等可能正在使用它；请关闭后重试，也可换一个摄像头。',
+    showRetry: true,
+    showPrivacy: false
+  },
+  OPEN_TIMEOUT: {
+    title: '摄像头初始化超时（超过 8 秒没有响应）',
+    sub: '多为设备被占用或驱动未就绪，请重试；反复失败请重启本程序或电脑。',
+    showRetry: true,
+    showPrivacy: false
+  },
+  PLAY_TIMEOUT: {
+    title: '摄像头画面播放超时',
+    sub: '取流成功但画面迟迟未出，通常是驱动未就绪或被其他程序占用，请关闭占用程序后重试。',
+    showRetry: true,
+    showPrivacy: false
+  },
+  PLAY_FAIL: {
+    title: '摄像头画面播放失败',
+    sub: '画面未能启动，可能被其他程序抢占，请关闭占用程序或换一个摄像头后重试。',
+    showRetry: true,
+    showPrivacy: false
+  },
+  NO_FRAME: {
+    title: '摄像头未输出画面',
+    sub: '设备已连接但没有帧数据，请检查连接线与 USB 供电后重试。',
+    showRetry: true,
+    showPrivacy: false
+  },
+  NO_TRACK: {
+    title: '摄像头未返回视频轨道',
+    sub: '设备可能被禁用或驱动异常，请在「设备管理器」中确认后重试。',
+    showRetry: true,
+    showPrivacy: false
+  },
+  RETRY_EXHAUSTED: {
+    title: '摄像头信号中断，自动重连未成功',
+    sub: '请检查摄像头连接线与 USB 供电，然后重试；长期失败请联系维护并提供摄像头日志。',
+    showRetry: true,
+    showPrivacy: false
+  },
+  FLAP_STORM: {
+    title: '摄像头反复中断，已停止自动重连',
+    sub: '短时间内多次闪断，多为接触不良或供电不足，请检查线路后手动重试。',
+    showRetry: true,
+    showPrivacy: false
+  },
+  OVERCONSTRAINED: {
+    title: '当前摄像头不支持所选参数，已自动降级重试',
+    sub: '若仍失败，请在上方的设备下拉中换一个摄像头试试。',
+    showRetry: true,
+    showPrivacy: false
+  },
+  SECURITY: {
+    title: '当前环境不允许调用摄像头',
+    sub: '通常是运行环境的版本或安全策略限制，请联系设备安装方处理。',
+    showRetry: false,
+    showPrivacy: false
+  },
+  UNSUPPORTED: {
+    title: '当前环境不支持摄像头调用',
+    sub: '缺少必要的浏览器接口，请联系设备安装方升级运行环境。',
+    showRetry: false,
+    showPrivacy: false
+  },
+  UNKNOWN: {
+    title: '无法打开摄像头',
+    sub: '请重试；若持续失败请联系维护并提供摄像头日志路径。',
+    showRetry: true,
+    showPrivacy: false
+  }
+};
+
 /* ---------- 客户端 · 拍照页（最大分辨率 + 空格拍摄 + 连拍批量保存） ---------- */
 const CapturePage = {
   props: { token: { type: String, required: true } },
@@ -1447,7 +1560,19 @@ const CapturePage = {
     const camState = Vue.ref('UNINIT'); // UNINIT / STARTING / LIVE / DEGRADED / SLEEPING / ERROR
     const camHint = Vue.ref('摄像头准备中…'); // 非错误态的取景区提示
     const camPrivacy = Vue.ref(false); // 权限类错误：显示「去系统设置开启摄像头」
+    // 错误码（controller.getError().code），驱动错误态 UI 的按钮组合（见 CAM_ERR_UI）
+    const camErrCode = Vue.ref('');
     const CAM_IDLE_DEFAULT_MS = 180000;
+    // 取景区几何自适应：由 JS 实测后写入 .camera-box 的行内 CSS 变量，
+    // 取代原来写死的 aspect-ratio:4/3 与 max-height:68vh
+    const camAr = Vue.ref(''); // --cam-ar，形如 '1280 / 720'
+    const camMaxH = Vue.ref(0); // --cam-max-h，单位 px
+
+    // 错误态 UI：按错误码取为我们预先定义好的文案与按钮组合，取不到时一律回退 UNKNOWN
+    const camErr = Vue.computed(() => {
+      const c = camErrCode.value;
+      return (c && CAM_ERR_UI[c]) || null;
+    });
 
     function camIdleMs() {
       const v = Number(window.__xqyCamIdleMs);
@@ -1529,6 +1654,61 @@ const CapturePage = {
       ERROR: '摄像头不可用'
     };
 
+    // ---------- 取景区几何自适应 ----------
+    // 可用高度 = 视口底 − 取景区顶 − 操作条 − 卡片内边距 − 呼吸余量。
+    // 之所以用 rect.top 而不是把上面各元素高度累加：rect.top 由前置兄弟元素决定，
+    // 与本元素自身高度无关，因此可以反复调用而自洽（不会自我放大）。
+    // 全部量都是 CSS px(=DIP)，DPI 缩放由浏览器自动换算，无需乘除任何系数。
+    function measureCameraMaxH() {
+      const v = videoEl.value;
+      if (!v) return 0;
+      const box = v.closest('.camera-box');
+      const card = box ? box.closest('.card') : null;
+      // .camera-bar 是 .camera-box 的兄弟节点（同在 .capture-main / .card 内）
+      const bar = card ? card.querySelector('.camera-bar') : null;
+      if (!box || !bar) return 0;
+      const RESERVE = 16; // 下方呼吸余量，避免操作条紧贴视口底部
+      const barH = bar.offsetHeight; // ≈48（.btn-shutter min-height:48）
+      const barMt = parseFloat(getComputedStyle(bar).marginTop) || 12; // .camera-bar margin-top:12
+      const padB = card ? parseFloat(getComputedStyle(card).paddingBottom) || 20 : 20; // .card padding:20
+      const h = window.innerHeight - box.getBoundingClientRect().top - barH - barMt - padB - RESERVE;
+      // 下限 300：再矮就没有取景意义，宁可让 .main 出现纵向滚动
+      return Math.max(300, Math.round(h));
+    }
+
+    // DOM 变更后要在下一帧测量，否则拿到的是改动前的布局
+    function syncCamMetrics() {
+      Vue.nextTick(() => {
+        try {
+          camMaxH.value = measureCameraMaxH();
+        } catch (e) {
+          camMaxH.value = 0; // 测量失败时退回 var() 的 68vh 兜底
+        }
+      });
+    }
+
+    // 摄像头真实宽高比：必须在 loadedmetadata（或流就绪）之后才能读到 videoWidth/videoHeight
+    function onVideoMeta() {
+      const v = videoEl.value;
+      if (!v || !v.videoWidth || !v.videoHeight) return;
+      camAr.value = v.videoWidth + ' / ' + v.videoHeight;
+      syncCamMetrics();
+    }
+
+    let camResizeTimer = null;
+    function onWindowResize() {
+      if (camResizeTimer) clearTimeout(camResizeTimer);
+      camResizeTimer = setTimeout(() => {
+        camResizeTimer = null;
+        syncCamMetrics();
+      }, 120);
+    }
+    let camRO = null; // ResizeObserver：侧栏折叠 / 主题切换 / 双栏断档切换等回流
+    let camPostTimer = null; // 最大化 / 还原后 Chromium 尺寸稳定需要若干帧，延后再测一次
+
+    // 同一错误码只弹一次 toast，避免摄像头闪断（FLAP_STORM 类）时反复打扰
+    let lastToastCode = '';
+
     // controller 状态 → Vue 响应式状态：模板只消费这些 ref
     function syncCameraState() {
       if (!controller) return;
@@ -1536,7 +1716,19 @@ const CapturePage = {
       const err = controller.getError();
       camState.value = s;
       cameraError.value = err ? err.message : '';
+      camErrCode.value = err && err.code ? err.code : '';
       camHint.value = err ? '' : CAM_HINTS[s] || '';
+      // 错误首次出现时额外弹一次 toast：取景区可能因窗口较小而滚出视口，
+      // 用户看不到覆盖层就不知道为什么拍不了照（同一错误码幂等，避免闪断风暴反复弹窗）
+      if (camErrCode.value && s === 'ERROR') {
+        if (lastToastCode !== camErrCode.value) {
+          lastToastCode = camErrCode.value;
+          const ui = CAM_ERR_UI[camErrCode.value] || CAM_ERR_UI.UNKNOWN;
+          toast(ui.title + '｜' + ui.sub, 'error');
+        }
+      } else if (s === 'LIVE') {
+        lastToastCode = ''; // 恢复正常后解除幂等锁，下次同类错误仍能提示
+      }
       sleeping.value = s === 'SLEEPING';
       // 权限被拒（系统预检判死或 gUM 报 NotAllowed）时才给出系统设置入口
       camPrivacy.value = !!(err && (err.code === 'PERMISSION_DENIED' || err.privacy === true));
@@ -2094,7 +2286,27 @@ const CapturePage = {
         cameraError.value = '当前环境不支持摄像头调用';
         camState.value = 'ERROR';
         camHint.value = '';
+        camErrCode.value = 'UNSUPPORTED';
       }
+      // ---------- 取景区尺寸实测：挂载后立即首测 + 注册三个重算时机 ----------
+      syncCamMetrics();
+      if (videoEl.value && typeof videoEl.value.addEventListener === 'function') {
+        videoEl.value.addEventListener('loadedmetadata', onVideoMeta);
+      }
+      window.addEventListener('resize', onWindowResize);
+      // ResizeObserver 覆盖 resize 事件不触发的回流（侧栏折叠、主题切换、断点切换）
+      if (typeof ResizeObserver === 'function') {
+        try {
+          camRO = new ResizeObserver(() => syncCamMetrics());
+          const mainEl = videoEl.value && videoEl.value.closest ? videoEl.value.closest('.capture-main') : null;
+          if (mainEl) camRO.observe(mainEl);
+          else camRO.observe(document.body);
+        } catch (e) {
+          camRO = null;
+        }
+      }
+      // 最大化 / 还原后 Chromium 的视口尺寸要过几帧才稳定，补测一次修正 --cam-max-h
+      camPostTimer = setTimeout(syncCamMetrics, 260);
     });
 
     Vue.onUnmounted(() => {
@@ -2109,6 +2321,23 @@ const CapturePage = {
         try { offWindowState(); } catch (e) { /* 忽略 */ }
         offWindowState = null;
       }
+      // 取景区几何自适应监听器必须全部回收，否则卸载后继续测量会拿到已移除的节点
+      if (videoEl.value && typeof videoEl.value.removeEventListener === 'function') {
+        videoEl.value.removeEventListener('loadedmetadata', onVideoMeta);
+      }
+      window.removeEventListener('resize', onWindowResize);
+      if (camResizeTimer) {
+        clearTimeout(camResizeTimer);
+        camResizeTimer = null;
+      }
+      if (camPostTimer) {
+        clearTimeout(camPostTimer);
+        camPostTimer = null;
+      }
+      if (camRO) {
+        try { camRO.disconnect(); } catch (e) { /* 忽略 */ }
+        camRO = null;
+      }
       // I7：controller.unmount() 返回后不存在任何 live track，
       // 在途 gUM 的结果也会因令牌作废被 stop 并记 CAM_LEAK_GUARD
       if (controller) controller.unmount();
@@ -2118,7 +2347,7 @@ const CapturePage = {
       stream, devices, deviceId, cameraError, resolution, shots,
       barcode, note, saving, barcodeCount, videoEl, barcodeEl, ready,
       barcodeWarn, applyCleaned, applySimilar, barcodeLocked, unlockBarcode,
-      sleeping, camState, camHint, camPrivacy,
+      sleeping, camState, camHint, camPrivacy, camErr, camErrCode, camAr, camMaxH,
       startCamera, retryCamera, switchDevice, wakeCamera, sleepCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone, openPrivacySettings
     };
   },
@@ -2135,7 +2364,11 @@ const CapturePage = {
             📷 摄像头取景
             <span v-if="resolution && !sleeping" class="tag tag-green" style="margin-left:8px">分辨率 {{ resolution }}</span>
           </div>
-          <div class="camera-box">
+          <!-- --cam-ar / --cam-max-h 由 JS 实测后写入（见 setup 的 measureCameraMaxH / onVideoMeta）。
+               --cam-ar 必须始终输出合法值：空字符串会让整条 aspect-ratio 声明变成
+               invalid at computed-value time，var() 的 fallback 也救不回来，会退化成 auto。 -->
+          <div class="camera-box"
+               :style="{ '--cam-ar': camAr || '4 / 3', '--cam-max-h': (camMaxH > 0 ? camMaxH + 'px' : '68vh') }">
             <video ref="videoEl" autoplay playsinline muted></video>
             <div v-if="camState !== 'LIVE'" class="camera-overlay" :class="{ error: !!cameraError }">
               <template v-if="camState === 'SLEEPING'">
@@ -2144,10 +2377,19 @@ const CapturePage = {
                 <button class="btn btn-primary" @click="wakeCamera">唤醒拍摄</button>
               </template>
               <template v-else>
-                <div class="camera-overlay-title">{{ cameraError || camHint }}</div>
-                <button v-if="camPrivacy" class="btn btn-primary" @click="openPrivacySettings">去系统设置开启摄像头</button>
-                <button v-if="cameraError" class="btn btn-primary" @click="retryCamera">重试</button>
+                <div class="camera-overlay-title">{{ camErr ? camErr.title : (cameraError || camHint) }}</div>
+                <div v-if="camErr" class="camera-sleep-sub">{{ camErr.sub }}</div>
                 <div v-else class="camera-sleep-sub">扫码或按空格键也会自动唤醒</div>
+                <div class="camera-overlay-actions">
+                  <button v-if="camErr && camErr.showPrivacy" class="btn btn-primary" @click="openPrivacySettings">去系统设置开启摄像头</button>
+                  <button v-if="camErr && camErr.showRetry" class="btn btn-primary" @click="retryCamera">重试</button>
+                  <select v-if="camErr && camErr.showRetry && devices.length > 1"
+                          class="camera-dev-switch"
+                          :value="deviceId"
+                          @change="switchDevice($event.target.value)">
+                    <option v-for="(d, i) in devices" :key="d.deviceId || i" :value="d.deviceId">{{ d.label || ('摄像头 ' + (i + 1)) }}</option>
+                  </select>
+                </div>
               </template>
             </div>
           </div>
@@ -4950,9 +5192,11 @@ const ManualPage = {
 };
 
 /* ---------- 本周订单（独立侧栏页面） ----------
-   仅展示近 7 天（含今天）录入的订单清单，按条码（订单号）聚合展示基本信息，
-   纯列表、不生成也不下载任何文件（Excel/PDF 等）。数据走 records:list（带日期区间），
-   与查询页共用后端权限与可见范围裁剪。 */
+   近 7 天（含今天）录入的订单清单，按条码（订单号）聚合展示基本信息，
+   可按筛选条件导出 CSV 表格（聚合 8 列 / 明细 9 列，仅表格、不复制照片文件）。
+   数据走 records:list（带日期区间），与查询页共用后端权限与可见范围裁剪。
+   导出的 CSV 必须由主进程生成：页面 rows 只有聚合结果（缺 id / photoFile / 逐张 createdAt / seq），
+   做不出明细模式，且权限裁剪只在主进程——故这里只下传筛选条件与条码集合。 */
 const WeeklyOrdersPage = {
   props: {
     token: { type: String, required: true },
@@ -4968,6 +5212,22 @@ const WeeklyOrdersPage = {
     const totalPhotos = Vue.ref(0);
     const rangeText = Vue.ref('');
     const errMsg = Vue.ref('');
+    // 当前实际加载的日期区间：导出时必须原样下推给主进程，
+    // 否则主进程会用一个不同的区间重算，导出结果与页面看到的对不上
+    const curRange = Vue.ref({ from: '', to: '' });
+
+    // ---------- 本地筛选 ----------
+    const keyword = Vue.ref(''); // 条码 / 录入人 / 门店 / 备注
+    const userFilter = Vue.ref('all');
+    const storeFilter = Vue.ref('all');
+
+    // ---------- 导出 ----------
+    const exportMode = Vue.ref('summary'); // 'summary' 聚合 8 列 | 'detail' 明细 9 列
+    // 双锁互斥，复用 QueryPage.exportToday（renderer.js exportToday）的范式：
+    // busy 包住实际导出过程，confirming 包住「确认弹窗 → 选目录 → 执行」整段窗口，
+    // 嵌套 try/finally 保证任何返回路径都会复位（4 个导出入口都会弹系统目录框，并发会竞态）
+    const busy = Vue.ref(false);
+    const confirming = Vue.ref(false);
 
     // 近 7 天（含今天）的日期区间：以今天 00:00 为终点，往前推 6 天
     function dateRange() {
@@ -4984,6 +5244,7 @@ const WeeklyOrdersPage = {
       errMsg.value = '';
       try {
         const { from, to } = dateRange();
+        curRange.value = { from, to };
         rangeText.value = from + ' 至 ' + to + '（近 7 天，含今天）';
         const base = { silent: true, pageSize: 100, dateFrom: from, dateTo: to };
         const all = [];
@@ -5009,6 +5270,10 @@ const WeeklyOrdersPage = {
               first: r.createdAt,
               last: r.createdAt,
               users: new Set(),
+              // notes 必须保留：主进程 applyWeeklyFilters 的关键词按
+              // [barcode, note, username, storeName] 匹配，这里若丢掉备注，
+              // 关键词命中备注的行在页面上能筛出来、导出 CSV 里却没有，两边结果不一致
+              notes: new Set(),
               store: r.storeName || '本店'
             });
           }
@@ -5016,13 +5281,21 @@ const WeeklyOrdersPage = {
           g.count++;
           if (r.createdAt < g.first) g.first = r.createdAt;
           if (r.createdAt > g.last) g.last = r.createdAt;
-          g.users.add(r.username);
+          if (r.username) g.users.add(r.username);
+          if (r.note) g.notes.add(r.note);
           if (r.storeName) g.store = r.storeName;
         }
         const list = [...map.values()].sort((a, b) => b.last.localeCompare(a.last));
-        for (const g of list) g.userText = [...g.users].join('、');
+        for (const g of list) {
+          g.userText = [...g.users].join('、');
+          g.noteText = [...g.notes].join(' / ');
+        }
         rows.value = list;
         totalPhotos.value = all.length;
+        // 数据变了：下拉里的候选值可能已不存在，把失效的筛选项收回，避免用户看到「0 个订单」
+        // 却以为真的没有数据（其实是筛选条件指向了已消失的录入人/门店）
+        if (userFilter.value !== 'all' && !userOptions.value.includes(userFilter.value)) userFilter.value = 'all';
+        if (storeFilter.value !== 'all' && !storeOptions.value.includes(storeFilter.value)) storeFilter.value = 'all';
       } catch (e) {
         errMsg.value = '加载失败：' + (e.message || e);
       } finally {
@@ -5041,6 +5314,114 @@ const WeeklyOrdersPage = {
       );
     }
 
+    // 录入人 / 门店下拉选项：取自当前可见的全量 rows（而非筛选后的，否则选了就再也选不回来）
+    const userOptions = Vue.computed(() =>
+      [...new Set(rows.value.flatMap((g) => [...g.users]))].filter(Boolean).sort((a, b) => a.localeCompare(b, 'zh-CN'))
+    );
+    const storeOptions = Vue.computed(() =>
+      [...new Set(rows.value.map((g) => g.store))].filter(Boolean).sort((a, b) => a.localeCompare(b, 'zh-CN'))
+    );
+
+    // 本地筛选：字段范围必须与主进程 store.applyWeeklyFilters 对齐
+    // （barcode / note / username / storeName），否则「看到的」与「导出的」会不一致
+    const filteredRows = Vue.computed(() => {
+      const kw = keyword.value.trim().toLowerCase();
+      return rows.value.filter((g) => {
+        if (kw) {
+          const hit =
+            String(g.barcode || '').toLowerCase().includes(kw) ||
+            String(g.userText || '').toLowerCase().includes(kw) ||
+            String(g.store || '').toLowerCase().includes(kw) ||
+            String(g.noteText || '').toLowerCase().includes(kw);
+          if (!hit) return false;
+        }
+        // 录入人：精确判断该录入人是否在这一单里（与主进程 applyWeeklyFilters 同口径），
+        // 不用 userText.includes —— 那会让「张三」同时命中只有「张三丰」的订单
+        if (userFilter.value !== 'all' && !g.users.has(userFilter.value)) return false;
+        if (storeFilter.value !== 'all' && g.store !== storeFilter.value) return false;
+        return true;
+      });
+    });
+    const filteredPhotos = Vue.computed(() => filteredRows.value.reduce((n, g) => n + g.count, 0));
+
+    // 按钮禁用条件：无数据 / 加载中 / 导出进行中都禁用（含 confirming，防止连点弹出两个目录框）
+    const exportDisabled = Vue.computed(
+      () => loading.value || busy.value || confirming.value || !filteredRows.value.length
+    );
+    const exportTitle = Vue.computed(() => {
+      if (loading.value) return '正在加载本周订单…';
+      if (busy.value || confirming.value) return '导出进行中…';
+      if (!filteredRows.value.length) return '当前筛选条件下没有数据，无法导出';
+      return '导出为 Excel 可直接打开的 CSV 表格（UTF-8 带 BOM）';
+    });
+
+    function resetFilters() {
+      keyword.value = '';
+      userFilter.value = 'all';
+      storeFilter.value = 'all';
+    }
+
+    /**
+     * 导出本周订单表格。
+     * 只把「日期范围 + 筛选条件 + 筛选后的条码集合」下推给主进程，由主进程
+     * 重新鉴权、重算后落盘——页面 rows 缺少明细模式需要的 id / photoFile / 逐张时间。
+     */
+    async function exportWeekly() {
+      if (busy.value || confirming.value) return;
+      if (exportDisabled.value) return;
+      confirming.value = true;
+      try {
+        const isDetail = exportMode.value === 'detail';
+        const ok = await showConfirm({
+          title: isDetail ? '导出本周订单明细' : '导出本周订单表格',
+          message:
+            '将把当前筛选结果（' + filteredRows.value.length + ' 个订单、' + filteredPhotos.value + ' 张照片）' +
+            '导出为 CSV 表格到您选择的目录。\n日期范围：' + rangeText.value +
+            '\n导出类型：' + (isDetail ? '逐张照片明细（9 列）' : '订单聚合（8 列）') + '。',
+          confirmText: '选择目录并导出'
+        });
+        if (!ok) return; // 取消：零 IPC
+        const d = await window.api.chooseExportDir();
+        if (!d.ok) {
+          if (d.message && d.message !== '已取消') toast(d.message, 'error');
+          return;
+        }
+        busy.value = true;
+        toast('正在生成' + (isDetail ? '本周订单明细' : '本周订单表格') + '…', 'success');
+        try {
+          const res = await window.api.exportWeeklyOrders(props.token, {
+            targetDir: d.data,
+            dateFrom: curRange.value.from,
+            dateTo: curRange.value.to,
+            mode: exportMode.value,
+            filters: {
+              keyword: keyword.value.trim(),
+              username: userFilter.value === 'all' ? '' : userFilter.value,
+              store: storeFilter.value === 'all' ? '' : storeFilter.value,
+              // 白名单：保证「所见即所得」，主进程仍会按自己的谓词与权限先过滤一遍
+              barcodes: filteredRows.value.map((g) => g.barcode)
+            }
+          });
+          if (res.ok) {
+            toast(
+              '导出完成：' + res.data.orders + ' 个订单、' + res.data.photos + ' 张照片 → ' + res.data.csvPath +
+              (res.data.logged === false ? '（客户端模式未写入操作日志）' : '') +
+              '。若条码显示为科学计数法，请将该列设为文本。',
+              'success'
+            );
+          } else {
+            toast(res.message || '导出失败', 'error');
+          }
+        } catch (e) {
+          toast('导出失败：' + (e.message || e), 'error');
+        } finally {
+          busy.value = false;
+        }
+      } finally {
+        confirming.value = false;
+      }
+    }
+
     // 「去处理」：切到记录查询页并带上本单条码。
     // 管理员角色下查询页的菜单 key 是 data（非 query），两处都指向 QueryPage，需按角色选 key。
     function goProcess(barcode) {
@@ -5048,13 +5429,18 @@ const WeeklyOrdersPage = {
     }
 
     Vue.onMounted(load);
-    return { loading, rows, totalPhotos, rangeText, errMsg, load, fmt, goProcess };
+    return {
+      loading, rows, totalPhotos, rangeText, errMsg, load, fmt, goProcess,
+      keyword, userFilter, storeFilter, userOptions, storeOptions,
+      filteredRows, filteredPhotos, exportMode, exportDisabled, exportTitle,
+      busy, confirming, resetFilters, exportWeekly
+    };
   },
   template: `
     <div>
       <div class="page-head">
         <h2>本周订单</h2>
-        <p>近 7 天（含今天）录入的订单清单，仅展示、不导出任何文件。</p>
+        <p>近 7 天（含今天）录入的订单清单；可按下方筛选条件导出为 Excel 可直接打开的 CSV 表格（仅表格，不复制照片文件）。</p>
       </div>
 
       <div v-if="errMsg" class="card">
@@ -5078,8 +5464,44 @@ const WeeklyOrdersPage = {
       </div>
 
       <div v-else class="table-wrap">
+        <div class="filter-bar weekly-filter">
+          <div class="f-item f-keyword">
+            <label>关键词</label>
+            <input v-model="keyword" :disabled="loading" placeholder="条码 / 录入人 / 门店 / 备注" />
+          </div>
+          <div class="f-item f-user">
+            <label>录入人</label>
+            <select v-model="userFilter" :disabled="loading">
+              <option value="all">全部录入人</option>
+              <option v-for="u in userOptions" :key="u" :value="u">{{ u }}</option>
+            </select>
+          </div>
+          <div class="f-item f-store" v-if="storeOptions.length > 1">
+            <label>所属门店</label>
+            <select v-model="storeFilter" :disabled="loading">
+              <option value="all">全部门店</option>
+              <option v-for="s in storeOptions" :key="s" :value="s">{{ s }}</option>
+            </select>
+          </div>
+          <div class="f-item">
+            <label>&nbsp;</label>
+            <button class="btn btn-ghost btn-sm" :disabled="loading" @click="resetFilters">重置筛选</button>
+          </div>
+        </div>
         <div class="weekly-summary">
-          共 <b>{{ rows.length }}</b> 个订单 · <b>{{ totalPhotos }}</b> 张照片 · {{ rangeText }}
+          <span>共 <b>{{ filteredRows.length }}</b> 个订单 · <b>{{ filteredPhotos }}</b> 张照片 · {{ rangeText }}</span>
+          <span class="weekly-export">
+            <select v-model="exportMode" :disabled="exportDisabled" title="选择导出粒度">
+              <option value="summary">订单聚合（8 列）</option>
+              <option value="detail">逐张照片明细（9 列）</option>
+            </select>
+            <button
+              class="btn btn-primary btn-sm"
+              :disabled="exportDisabled"
+              :title="exportTitle"
+              @click="exportWeekly"
+            >{{ busy ? '导出中…' : (filteredRows.length === rows.length ? '导出本周订单表格' : '导出筛选结果（' + filteredRows.length + '）') }}</button>
+          </span>
         </div>
         <table>
           <thead>
@@ -5093,7 +5515,7 @@ const WeeklyOrdersPage = {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="g in rows" :key="g.barcode">
+            <tr v-for="g in filteredRows" :key="g.barcode">
               <td class="code">
                 <button type="button" class="barcode-jump" :title="'去记录查询处理 ' + g.barcode" @click="goProcess(g.barcode)">{{ g.barcode }}</button>
               </td>

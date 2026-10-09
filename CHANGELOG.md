@@ -1,5 +1,14 @@
 # 更新日志
 
+## v1.2.9（2026-10-09）
+
+### 修复
+- **相机生命周期状态机 9 项缺陷修复（renderer/camera-controller.js）**：修复 `Promise.race` 落败侧孤儿定时器悬挂；`play()` / `applyConstraints` 永不 settle 导致的永久 STARTING 卡死（新增 `attachTimeoutMs` / `applyConstraintMs` 超时兜底）；权限预检挂起使界面永久「准备中」（新增 `accessGateMs` 超时放行）；闪断定时器数组泄漏；`unmount` 误清空监听器导致控制器复用后界面状态冻结；以及灰度样本 NaN 被误判为纯黑帧（`analyzeGraySamples` 跳过非有限值）。
+- **`showConfirm` 单例竞态修复（renderer/renderer.js）**：弹窗未关闭时二次调用覆盖 `resolve`，导致首次 `await showConfirm` 永久挂死（影响删除记录 / 改码 / 删账号等路径），改为 FIFO 队列，调用点零改动。
+
+### 新增
+- **校验脚本**：新增 `verify-app-smoke`（Electron 实机冒烟 105 项）、`verify-layout`（实机布局 98 项）、`verify-confirm-queue`（15 项）、`verify-weekly-export`（50 项）。
+
 ## v1.2.3（2026-10-02）
 
 > **版本号更正与仓库拆分**

@@ -1229,6 +1229,7 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     '登录', '登录失败', '退出登录', '修改密码', '重置密码',
     '新增条码', '新增存档照片', '修改条码', '离线存档', '删除存档', '批量删除存档',
     '查询记录', '查看记录', '批量导出照片', '按日期导出照片',
+    '导出本周订单表格', '导出本周订单明细',
     '下载原片', '批量下载原片',
     '新增用户', '修改用户', '删除用户',
     '修改备注',
@@ -2177,6 +2178,243 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     return q.length;
   }
 
+  // ---------- 本周订单表格导出（供 WeeklyOrdersPage 使用） ----------
+
+  /**
+   * 将二维数组写成 CSV：RFC4180 全量双引号包裹、内部引号转义为 ""、CRLF 换行、UTF-8 带 BOM。
+   * 带 BOM 是 Excel 双击打开后中文表头不乱码的唯一可靠做法；CRLF 是 Excel/记事本的行结束约定。
+   * 同名文件直接覆盖（沿用既有「导出清单_*.csv」的语义），不生成递增后缀。
+   *
+   * 架构红线：渲染层禁止用 Blob / a.download 自行生成 CSV —— 那会绕开
+   * requireSessionPermission 的权限裁剪，也不会产生操作日志。
+   *
+   * @param {string} csvPath 目标文件绝对路径（所在目录不存在时自动创建）
+   * @param {Array<Array<string|number|null|undefined>>} rows 首行即表头
+   * @returns {string} csvPath
+   */
+  function writeCsv(csvPath, rows) {
+    const esc = (v) => '"' + String(v === null || v === undefined ? '' : v).replace(/"/g, '""') + '"';
+    const csv = rows.map((row) => row.map(esc).join(',')).join('\r\n');
+    fs.mkdirSync(path.dirname(csvPath), { recursive: true });
+    fs.writeFileSync(csvPath, '\ufeff' + csv, 'utf8');
+    return csvPath;
+  }
+
+  /** 表格用的时间格式：YYYY-MM-DD HH:mm（本地时区），与渲染层 WeeklyOrdersPage 一致 */
+  const fmtDateTime = (iso) => {
+    const d = new Date(iso || '');
+    if (isNaN(d.getTime())) return '—';
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  };
+
+  /**
+   * 本周订单筛选谓词（服务端 / 客户端共用，只在 store.js 定义一份，main.js 直接复用）。
+   *
+   * keyword 的匹配范围与 listRecords（store.js:843-845）一致：[barcode, note, username, storeName]。
+   *
+   * 三条谓词一律按**条码（订单）分组**判定：只要该订单里有任何一张照片命中，
+   * 整单（含未命中的照片）都会带上。这与渲染层 WeeklyOrdersPage 的行为必须一致——
+   * 页面是在「已聚合的行」上做筛选的，若这里按单张照片过滤，
+   * 同一个订单在页面上显示 3 张、导出的 CSV 里却只剩 1 张，两边对不上。
+   *
+   * @param {Array<object>} records 已落在日期区间与权限范围内的记录
+   * @param {{keyword?:string, username?:string, store?:string, barcodes?:string[]}} f 前端筛选条件
+   * @returns {Array<object>}
+   */
+  function applyWeeklyFilters(records, f) {
+    const ff = f || {};
+    const kw = String(ff.keyword || '').trim().toLowerCase();
+    const u = String(ff.username || '').trim();
+    const st = String(ff.store || '').trim();
+    // 分组键与渲染层保持一致（空条码统一落到「未命名」，否则页面中 '' 与这里的 '' 会分到不同组）
+    const keyOf = (r) => String(r.barcode || '未命名').toLowerCase();
+    // 门店列的取值口径必须与页面 WeeklyOrdersPage 一致：空 storeName 显示「本店」
+    const storeLabelOf = (r) => String(r.storeName || '') || '本店';
+
+    // barcodes 白名单：主进程先做自己的谓词过滤（安全边界），再与它取交集保证「所见即所得」。
+    // 空数组或异常大的集合一律忽略，只按谓词导出（防御渲染层传入脏数据）。
+    const codes = Array.isArray(ff.barcodes) ? ff.barcodes : [];
+    const allow = codes.length && codes.length <= 5000
+      ? new Set(codes.map((c) => String(c || '').toLowerCase()))
+      : null;
+    let list = allow ? records.filter((r) => allow.has(keyOf(r))) : records;
+
+    const hasPred = kw || (u && u !== 'all') || (st && st !== 'all');
+    if (!hasPred) return list;
+
+    // 按条码分组后整单判定
+    const groups = new Map();
+    for (const r of list) {
+      const k = keyOf(r);
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(r);
+    }
+    const keep = new Set();
+    for (const [k, group] of groups) {
+      const hitKw =
+        !kw ||
+        group.some((r) =>
+          [r.barcode, r.note, r.username, r.storeName].some((v) => String(v || '').toLowerCase().includes(kw))
+        );
+      // 录入人用「精确属于该单」判定，与页面「从下拉里选某个录入人」的语义一致
+      const hitUser = !u || u === 'all' || group.some((r) => String(r.username || '') === u);
+      // 门店：页面列的取值是「storeName || 本店」，这里必须按同一个口径比，
+      // 否则筛选「本店」时页面有行、CSV 里却是 0 行（storeName 为空时被||跳过）
+      const hitStore =
+        !st || st === 'all' ||
+        group.some((r) => storeLabelOf(r) === st || normalizeStore(r.storeName) === normalizeStore(st));
+      if (hitKw && hitUser && hitStore) keep.add(k);
+    }
+    return list.filter((r) => keep.has(keyOf(r)));
+  }
+
+  /**
+   * 聚合模式 8 列：条形码 / 照片张数 / 首拍时间 / 末拍时间 / 录入人 / 所属门店 / 备注 / 照片文件夹位置。
+   * 排序 = 末拍时间倒序（与页面 renderer.js 的 rows 排法一致）。
+   *
+   * @param {Array<object>} records 参与聚合的记录
+   * @param {boolean} absolute true = 第 8 列拼上照片根目录（服务端模式）；false = 只给相对目录（客户端模式）
+   * @returns {Array<Array<string|number>>} 首行为表头
+   */
+  function weeklySummaryRows(records, absolute) {
+    const photoDir = absolute ? getPhotoDir() : '';
+    const groups = new Map();
+    for (const r of records) {
+      const code = String(r.barcode || '未命名');
+      if (!groups.has(code)) groups.set(code, []);
+      groups.get(code).push(r);
+    }
+    const out = [];
+    for (const group of groups.values()) {
+      group.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+      const firstT = String((group[0] && group[0].createdAt) || '');
+      const lastT = String((group[group.length - 1] && group[group.length - 1].createdAt) || '');
+      const users = [...new Set(group.map((r) => String(r.username || '')).filter(Boolean))];
+      const notes = [...new Set(group.map((r) => String(r.note || '')).filter(Boolean))];
+      const dirName = path.dirname(String((group[0] && group[0].photoFile) || ''));
+      out.push({
+        barcode: String(group[0].barcode || '未命名'),
+        count: group.length,
+        first: fmtDateTime(firstT),
+        last: fmtDateTime(lastT),
+        lastRaw: lastT,
+        users: users.join('、'),
+        store: String(group[0].storeName || '') || '本店',
+        notes: notes.join(' / '),
+        dir: absolute ? (dirName ? path.join(photoDir, dirName) : photoDir) : dirName
+      });
+    }
+    out.sort((a, b) => b.lastRaw.localeCompare(a.lastRaw));
+    const rows = [['条形码（订单号）', '照片张数', '首拍时间', '末拍时间', '录入人', '所属门店', '备注', '照片文件夹位置']];
+    for (const g of out) {
+      rows.push([g.barcode, g.count, g.first, g.last, g.users, g.store, g.notes, g.dir]);
+    }
+    return rows;
+  }
+
+  /**
+   * 明细模式 9 列：条形码 / 序号 / 拍摄时间 / 照片文件名 / 照片相对路径 / 录入人 / 所属门店 / 备注 / 记录 ID。
+   * 排序 = 条码 localeCompare('zh-CN') 升序 + seq 升序。
+   *
+   * @param {Array<object>} records 参与明细的记录
+   * @param {boolean} absolute 仅用于保持与 weeklySummaryRows 的签名一致（明细用相对路径列，不拼根目录）
+   * @returns {Array<Array<string|number>>} 首行为表头
+   */
+  function weeklyDetailRows(records, absolute) {
+    const list = records.slice().sort((a, b) => {
+      const c = String(a.barcode || '').localeCompare(String(b.barcode || ''), 'zh-CN');
+      if (c !== 0) return c;
+      return (Number(a.seq) || 0) - (Number(b.seq) || 0);
+    });
+    const rows = [
+      ['条形码（订单号）', '序号（第几张）', '拍摄时间', '照片文件名', '照片相对路径', '录入人', '所属门店', '备注', '记录 ID']
+    ];
+    for (const r of list) {
+      rows.push([
+        String(r.barcode || '未命名'),
+        Number(r.seq) || 0,
+        fmtDateTime(r.createdAt),
+        path.basename(String(r.photoFile || '')),
+        String(r.photoFile || ''),
+        String(r.username || ''),
+        String(r.storeName || '') || '本店',
+        String(r.note || ''),
+        String(r.id || '')
+      ]);
+    }
+    return rows;
+  }
+
+  /** 把筛选条件渲染成一句人话，写进操作日志 detail，便于事后核对导出范围 */
+  function summarizeWeeklyFilter(f) {
+    const ff = f || {};
+    const parts = [];
+    if (String(ff.keyword || '').trim()) parts.push('关键词「' + String(ff.keyword).trim() + '」');
+    if (String(ff.username || '').trim() && ff.username !== 'all') parts.push('录入人「' + ff.username + '」');
+    if (String(ff.store || '').trim() && ff.store !== 'all') parts.push('门店「' + ff.store + '」');
+    return parts.length ? '筛选条件：' + parts.join('，') : '筛选条件：无';
+  }
+
+  /**
+   * 导出「本周订单」表格（当前专供 WeeklyOrdersPage，未来可作为任意筛选导出的通用入口）。
+   * 与 exportPhotosByDate 的边界：本函数只出表格、永远不复制照片文件。
+   *
+   * @param {string} token 会话令牌（要求 query 权限）
+   * @param {{targetDir:string, dateFrom:string, dateTo:string, mode?:'summary'|'detail', filters?:object}} p
+   * @returns {{csvPath:string, orders:number, photos:number, mode:string, dateFrom:string, dateTo:string, targetDir:string, logged:boolean}}
+   */
+  function exportWeeklyOrders(token, p = {}) {
+    const me = requireSessionPermission(token, 'query');
+    // 先判空再 resolve：path.resolve('') 会返回当前工作目录，
+    // 那样缺 targetDir 时不会报错，反而把 CSV 写进莫名其妙的地方
+    const rawDir = String((p && p.targetDir) || '').trim();
+    if (!rawDir) throw new Error('请先选择保存目录');
+    const targetDir = path.resolve(rawDir);
+    const dateFrom = String((p && p.dateFrom) || '').trim();
+    const dateTo = String((p && p.dateTo) || '').trim();
+    if (!dateFrom || !dateTo) throw new Error('请选择开始与结束日期');
+    if (dateFrom > dateTo) throw new Error('开始日期不能晚于结束日期');
+    const mode = String((p && p.mode) || 'summary') === 'detail' ? 'detail' : 'summary';
+    const fromIso = new Date(dateFrom + 'T00:00:00').toISOString();
+    const toIso = new Date(dateTo + 'T23:59:59.999').toISOString();
+
+    let records = loadRecords();
+    // 非系统管理员按 listRecords(store.js:831) 的同款可见范围裁剪
+    if (!isSysAdmin(me)) records = records.filter((r) => canViewRecord(me, r));
+    records = records.filter((r) => r.createdAt >= fromIso && r.createdAt <= toIso);
+    records = applyWeeklyFilters(records, p && p.filters);
+    if (!records.length) throw new Error('当前筛选条件下没有订单，无法导出');
+
+    const rows = mode === 'detail' ? weeklyDetailRows(records, true) : weeklySummaryRows(records, true);
+    const fileName = (mode === 'detail' ? '本周订单明细_' : '本周订单_') + dateFrom + '_至_' + dateTo + '.csv';
+    const csvPath = writeCsv(path.join(targetDir, fileName), rows);
+
+    appendLog({
+      ...logBase(me),
+      module: isSysAdmin(me) ? '数据管理' : '记录查询',
+      action: mode === 'detail' ? '导出本周订单明细' : '导出本周订单表格',
+      detail:
+        (mode === 'detail' ? '导出本周订单明细：' : '导出本周订单表格：') +
+        dateFrom + ' 至 ' + dateTo + '，' +
+        summarizeWeeklyFilter(p && p.filters) + '，' +
+        (rows.length - 1) + ' 行 → ' + csvPath,
+      result: '成功'
+    });
+
+    const barcodes = new Set(records.map((r) => String(r.barcode || '未命名')));
+    return {
+      csvPath,
+      orders: barcodes.size,
+      photos: records.length,
+      mode,
+      dateFrom,
+      dateTo,
+      targetDir,
+      logged: true
+    };
+  }
+
   // ---------- 按日期导出照片（含归档表格） ----------
   function exportPhotosByDate(token, p = {}) {
     const me = requireSessionPermission(token, 'query');
@@ -2245,10 +2483,8 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
       rows.push([code, copied, dir]);
     }
 
-    // 生成 CSV 归档表格（带 BOM，Excel 打开中文不乱码）
-    const csv = rows.map((row) => row.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
-    const csvPath = path.join(targetDir, `导出清单_${dateFrom}_${dateTo}.csv`);
-    fs.writeFileSync(csvPath, '\ufeff' + csv, 'utf8');
+    // 生成 CSV 归档表格（带 BOM、CRLF、RFC4180 转义，Excel 打开中文不乱码）
+    const csvPath = writeCsv(path.join(targetDir, `导出清单_${dateFrom}_${dateTo}.csv`), rows);
 
     appendLog({
       ...logBase(me),
@@ -2591,6 +2827,13 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     deleteRecords,
     exportPhotos,
     exportPhotosByDate,
+    // CSV 单一出口与本周订单表格导出：供 store 内部与 main.js 的客户端分支共用，
+    // 列定义只在 weeklySummaryRows / weeklyDetailRows 里写一份，避免两地实现漂移
+    writeCsv,
+    weeklySummaryRows,
+    weeklyDetailRows,
+    applyWeeklyFilters,
+    exportWeeklyOrders,
     downloadPhoto,
     downloadPhotos,
     listUsers,
