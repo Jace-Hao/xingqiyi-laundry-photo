@@ -47,7 +47,13 @@
     // 若不加超时，控制器会卡在 STARTING 且无错误提示（与「黑屏只能重开」同族症状）
     attachTimeoutMs: 2000,
     applyConstraintMs: 1000,
-    accessGateMs: 1000
+    accessGateMs: 1000,
+    // 分辨率锁定：逐档探测的总预算。部分 UVC 摄像头每档 applyConstraints 都要等满
+    // applyConstraintMs 才超时，不加总预算会把「出画」拖成十几秒（现场表现为黑屏）
+    resBudgetMs: 2500,
+    // 阶梯最大档位数 / 最高档的帧率备选数（防止候选集无限膨胀）
+    resMaxRungs: 16,
+    resMaxFps: 3
   };
 
   /* ---------- 纯计算辅助（可被单测直接调用） ---------- */
@@ -126,6 +132,207 @@
     return String(id).slice(0, 8);
   }
 
+  /* ---------- 分辨率：纯计算（可单测，不碰 DOM / navigator） ---------- */
+
+  var RES_PREF_VERSION = 1;
+
+  // 分辨率单边合法性上限：与 normalizeResolution 共用同一个常量。
+  // 别在两处硬编码 —— 一旦失配，阶梯就会产出我们自己判非法的档位：
+  // 那类档位会被 buildResolutionConstraints 静默丢掉（等于记忆失效），还白占一档探测预算。
+  var MAX_RES_DIM = 7680;
+
+  // 常见摄像头档位表（面积降序）。Chromium 的 getCapabilities() 只给 min/max 区间、
+  // 不给离散档位，因此候选集 = 「标准档位表 ∩ 能力区间」+「双 max 组合」，
+  // 而不是直接把 width.max 与 height.max 拼在一起 —— 后者经常拼出设备根本不支持的
+  // 组合（例如 width.max=1920 只在 720 及以下高度可用），一 applyConstraints 就
+  // OverconstrainedError，旧实现把它静默吞掉，于是「设置了更高分辨率但不生效」。
+  var STANDARD_RATINGS = [
+    [3840, 2160], [2560, 1440], [1920, 1080], [1600, 1200], [1600, 900],
+    [1280, 1024], [1280, 960], [1280, 720], [1024, 768], [960, 540],
+    [800, 600], [640, 480], [640, 360], [352, 288], [320, 240], [176, 144]
+  ];
+
+  function intOf(v) {
+    var n = Number(v);
+    return isFinite(n) ? Math.floor(n) : null;
+  }
+
+  /**
+   * 取能力区间：max/min 缺一半时用另一半兜底，区间反了就换回来。
+   * upper 为合法性上限（分辨率用 MAX_RES_DIM），超过即夹到上限，
+   * 保证阶梯不会产出「我们自己也判非法」的档位。
+   */
+  function capRange(cap, key, upper) {
+    var c = cap && cap[key];
+    if (!c || typeof c !== 'object') return null;
+    var max = typeof c.max === 'number' && isFinite(c.max) ? Math.floor(c.max) : null;
+    var min = typeof c.min === 'number' && isFinite(c.min) ? Math.floor(c.min) : null;
+    if (max == null && min == null) return null;
+    // 退化能力（个别虚拟/驱动异常的摄像头会报 max:0）：整体判无效。
+    // 不能靠「区间反了就交换」把它凑成 max=1 —— 那会向设备下发 width:{exact:1} 这种荒谬档位
+    if (max != null && max < 1) return null;
+    if (max == null) max = min;
+    if (min == null) min = 1;
+    if (max < min) {
+      var t = min;
+      min = max;
+      max = t;
+    }
+    if (upper != null) {
+      if (max > upper) max = upper;
+      if (min > upper) min = upper;
+    }
+    return { min: min, max: max };
+  }
+
+  /**
+   * 由 getCapabilities() 构造「分辨率候选阶梯」（纯函数）。
+   * 排序：像素面积降序 → 帧率降序 → 宽度降序。
+   * 帧率只对最高档展开多个备选：USB 摄像头常常是「分辨率够、带宽不够」，
+   * 降帧率能保住分辨率，比直接掉到下一档分辨率更划算。
+   *
+   * @param {object} capabilities track.getCapabilities() 的返回值
+   * @param {object} [options] { maxRungs, maxFps }
+   * @returns {Array<{width:number,height:number,frameRate?:number}>}
+   */
+  function buildResolutionLadder(capabilities, options) {
+    var opt = options || {};
+    var maxRungs = opt.maxRungs == null ? DEFAULTS.resMaxRungs : Math.max(1, intOf(opt.maxRungs) || 1);
+    var maxFps = opt.maxFps == null ? DEFAULTS.resMaxFps : Math.max(1, intOf(opt.maxFps) || 1);
+    var w = capRange(capabilities, 'width', MAX_RES_DIM);
+    var h = capRange(capabilities, 'height', MAX_RES_DIM);
+    if (!w || !h || w.max < 1 || h.max < 1) return [];
+    var wMin = Math.max(1, w.min);
+    var hMin = Math.max(1, h.min);
+
+    var pairs = [];
+    function pushPair(pw, ph) {
+      if (!(pw >= wMin && pw <= w.max && ph >= hMin && ph <= h.max)) return;
+      for (var i = 0; i < pairs.length; i++) {
+        if (pairs[i][0] === pw && pairs[i][1] === ph) return;
+      }
+      pairs.push([pw, ph]);
+    }
+
+    // ① 双 max 组合：绝大多数摄像头的最高档就是它，必须排在最前
+    pushPair(w.max, h.max);
+    // ② 最大宽 × 常用高（最多 3 档）：处理「最大宽度只与较低高度搭配」的摄像头
+    var altH = [];
+    for (var i = 0; i < STANDARD_RATINGS.length && altH.length < 3; i++) {
+      var sh = STANDARD_RATINGS[i][1];
+      if (sh <= h.max && altH.indexOf(sh) < 0) altH.push(sh);
+    }
+    for (var a = 0; a < altH.length; a++) pushPair(w.max, altH[a]);
+    // ③ 标准档位表 ∩ 能力区间
+    for (var j = 0; j < STANDARD_RATINGS.length; j++) {
+      pushPair(STANDARD_RATINGS[j][0], STANDARD_RATINGS[j][1]);
+    }
+    // ④ 兜底：能力区间下界（下界小得离谱时不放，避免出现 1×1 这种不可能的档位）
+    if (wMin >= 160 && hMin >= 120) pushPair(wMin, hMin);
+    if (!pairs.length) return [];
+
+    pairs.sort(function (p1, p2) {
+      var d = p2[0] * p2[1] - p1[0] * p1[1];
+      return d ? d : p2[0] - p1[0];
+    });
+
+    // 帧率备选：最高档展开 [max, 30, 15…]，其余档只取设备最高帧率
+    var fps = capRange(capabilities, 'frameRate');
+    var topFps = null;
+    var fpsList = [null];
+    if (fps) {
+      topFps = Math.max(1, fps.max);
+      fpsList = [topFps];
+      var fpHint = [30, 20, 15, 10, 5];
+      var fpMin = Math.max(1, Math.ceil(fps.min));
+      for (var k = 0; k < fpHint.length && fpsList.length < maxFps; k++) {
+        if (fpHint[k] >= topFps || fpHint[k] < fpMin) continue;
+        fpsList.push(fpHint[k]);
+      }
+    }
+
+    var out = [];
+    for (var p = 0; p < pairs.length; p++) {
+      var list = p === 0 ? fpsList : [topFps];
+      for (var q = 0; q < list.length; q++) {
+        var rung = { width: pairs[p][0], height: pairs[p][1] };
+        if (list[q]) rung.frameRate = list[q];
+        out.push(rung);
+      }
+    }
+    return out.length > maxRungs ? out.slice(0, maxRungs) : out;
+  }
+
+  /**
+   * 归一化一个分辨率值：接受 {width,height,frameRate} / {w,h,fps}，非法一律返回 null。
+   * 用于校验 getSettings() 输出与持久化的记忆档位，脏数据不得污染状态机。
+   */
+  function normalizeResolution(value) {
+    if (!value || typeof value !== 'object') return null;
+    var w = intOf(value.width != null ? value.width : value.w);
+    var h = intOf(value.height != null ? value.height : value.h);
+    if (!w || !h || w < 1 || h < 1 || w > MAX_RES_DIM || h > MAX_RES_DIM) return null;
+    var out = { width: w, height: h };
+    var fps = intOf(value.frameRate != null ? value.frameRate : value.fps);
+    if (fps && fps > 0 && fps <= 240) out.frameRate = fps;
+    return out;
+  }
+
+  /**
+   * 校验持久化的记忆档位：带版本号与时间戳，版本不认 / 字段非法一律当「没存过」，
+   * 宁可走一次全量枚举，也不能拿脏存档把分辨率锁死在一个设备不支持的档位上。
+   */
+  function parseResolutionPref(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    if (raw.v != null && Number(raw.v) !== RES_PREF_VERSION) return null;
+    var r = normalizeResolution(raw);
+    if (!r) return null;
+    r.version = RES_PREF_VERSION;
+    r.ts = intOf(raw.ts) || 0;
+    if (typeof raw.dev === 'string' && raw.dev) r.dev = raw.dev;
+    return r;
+  }
+
+  /**
+   * 生成待持久化的存档（v=版本号，ts=时间戳，dev=这份档位来自哪台设备）。
+   * dev 只用于「没指定设备」那份存档的防串档校验。
+   */
+  function makeResolutionPref(rung, ts, dev) {
+    var r = normalizeResolution(rung);
+    if (!r) return null;
+    return {
+      v: RES_PREF_VERSION,
+      w: r.width,
+      h: r.height,
+      fps: r.frameRate || 0,
+      ts: typeof ts === 'number' && isFinite(ts) ? Math.floor(ts) : 0,
+      dev: typeof dev === 'string' ? dev : ''
+    };
+  }
+
+  /**
+   * 组装 gUM 的视频约束（纯函数）。分辨率用 exact 才是「锁定」；
+   * frameRate 只用 ideal —— 带宽不够时降帧比整档失败更划算。
+   * 没有档位可写时返回与旧实现完全一致的结构（video:true / deviceId exact），
+   * 保证既有契约断言不被破坏。
+   *
+   * @param {string} deviceId 设备 id（空串 / 降级态下不写 deviceId）
+   * @param {object} [rung] 记忆档位 {width,height,frameRate}
+   * @returns {{video:(true|object),audio:boolean}}
+   */
+  function buildResolutionConstraints(deviceId, rung) {
+    var video = null;
+    if (deviceId) video = { deviceId: { exact: deviceId } };
+    var r = normalizeResolution(rung);
+    if (r) {
+      video = video || {};
+      video.width = { exact: r.width };
+      video.height = { exact: r.height };
+      if (r.frameRate) video.frameRate = { ideal: r.frameRate };
+    }
+    return { video: video === null ? true : video, audio: false };
+  }
+
   // 默认日志：优先走 window.api.cameraLog（主进程落盘），不可用时降级到控制台，绝不抛错
   function defaultLog(level, event, fields) {
     try {
@@ -162,12 +369,21 @@
     // 不支持时为 null，一律放行，绝不阻断正常取流
     var checkAccess = opt.checkAccess || null;
     var openPrivacy = opt.openPrivacy || null;
+    // 分辨率记忆的注入点：controller 是纯逻辑模块，禁止直接碰 localStorage。
+    // 未注入时（Node 单测 / 无痕模式）一律 no-op，退化为「每次全量枚举」
+    var loadPref = typeof opt.loadResolutionPref === 'function' ? opt.loadResolutionPref : null;
+    var savePref = typeof opt.saveResolutionPref === 'function' ? opt.saveResolutionPref : null;
 
     var alive = false;
     var state = STATES.UNINIT;
     var error = null; // { code, message, recoverable }
     var stream = null;
-    var resolution = null; // { width, height }
+    var resolution = null; // 实际输出 { width, height[, frameRate] }
+    var resolutionRequest = null; // 本次请求（并校验通过）的档位，与 resolution 对照用
+    var resolutionSource = 'none'; // pref | already | ladder | none —— 当前分辨率是怎么来的
+    var resPrefUsed = null; // 本次 gUM 约束里带上的记忆档位（命中失败时据此清空记忆）
+    var resPrefMissed = false; // 本轮打开中记忆档位已被证明不可用，后续尝试不再带它
+    var resDroppedTried = false; // 本轮已试过「保留设备、只去掉分辨率约束」，再失败才放开设备
     var seq = 0;
     var attempt = 0;
     var preferredId = '';
@@ -209,6 +425,11 @@
       return resolution && (resolution.width || resolution.height)
         ? { w: resolution.width || 0, h: resolution.height || 0 }
         : null;
+    }
+
+    // 任意档位对象 → 日志 res 字段（附加字段只收原始类型，不能把对象塞进日志）
+    function resFieldOf(r) {
+      return r && r.width && r.height ? { w: r.width, h: r.height } : null;
     }
 
     function setState(next, reason) {
@@ -479,38 +700,290 @@
 
     /* ---------- 打开流程 ---------- */
 
-    function buildConstraints(deviceId) {
-      var video = true;
-      if (deviceId && !fallbackNoExact) video = { deviceId: { exact: deviceId } };
-      return { video: video, audio: false };
+    /* ---------- 分辨率：候选阶梯 → 逐档锁定 → 持久化 ----------
+     * 为什么必须这么绕：Chromium 必须在 track 已 live（gUM 成功）之后才能读到
+     * getCapabilities()，开流前无法真正枚举格式。旧实现是「开流后用 ideal 提一次」：
+     *   ① ideal 只是倾向，Chromium 可以自行降档 → 设了不生效；
+     *   ② width.max × height.max 常被分别取到，拼出的组合设备并不支持 →
+     *      OverconstrainedError 被 catch 静默吞掉 → 静默失败；
+     *   ③ 不校验实际输出，掉到低分辨率无人知晓；
+     *   ④ 不持久化，重启 / 换设备只能重新走「默认档 → 事后提档」→ 回落。
+     * 三段式修复：
+     *   ① 开流前：命中该设备的记忆档位 → 直接以 exact 写进 gUM 约束，一次到位；
+     *   ② 开流后、attach 之前：按 buildResolutionLadder() 的阶梯逐档 applyConstraints
+     *      ({exact}) 并用 getSettings() 校验实际输出，成功即锁定并持久化；
+     *   ③ 全档失败：保留当前流正常出画，只写日志（绝不置 ERROR，绝不影响拍照）。
+     */
+
+    // 读取 track 报告的真实输出；getSettings 抛异常时返回 null，绝不影响出画
+    function readRawSettings(track) {
+      if (!track || typeof track.getSettings !== 'function') return null;
+      try { return track.getSettings() || null; } catch (e) { return null; }
     }
 
-    async function applyMaxResolution(track) {
-      if (!track || typeof track.getCapabilities !== 'function' || typeof track.applyConstraints !== 'function') return null;
-      var cap = null;
-      try { cap = track.getCapabilities(); } catch (e) { return null; }
-      var maxW = cap && cap.width && cap.width.max;
-      var maxH = cap && cap.height && cap.height.max;
-      if (maxW && maxH) {
+    function readSettings(track) {
+      return normalizeResolution(readRawSettings(track));
+    }
+
+    function sameRung(a, b) {
+      if (!a || !b) return false;
+      return a.width === b.width && a.height === b.height;
+    }
+
+    function toResolution(r) {
+      var n = normalizeResolution(r);
+      if (!n) return null;
+      return { width: n.width, height: n.height };
+    }
+
+    // 存档键：指定了设备就严格按设备 id 存（切换摄像头绝不串档）；
+    // 没指定设备（开系统默认摄像头，典型场景是刚启动、还没枚举出 deviceId）用默认键 ''。
+    // 默认键的存档里记了它来自哪台设备（dev），一旦实际出流的设备对不上就立即作废，
+    // 因此「换过默认摄像头 / 换过 USB 口」也不会沿用旧档位。
+    function prefKeyOf(deviceId) {
+      return deviceId ? deviceId : '';
+    }
+
+    function buildConstraints(deviceId) {
+      resPrefUsed = null;
+      var rung = null;
+      // deviceId 为空 = 开系统默认摄像头（刚启动还没枚举出 deviceId 的典型场景）：
+      // 这时用默认键 '' 的存档，让重启后也能一次到位；指定设备时严格按设备 id 取，绝不串档
+      if (!fallbackNoExact && !resPrefMissed && loadPref) {
         try {
-          // 部分 UVC 摄像头 applyConstraints 会永不 settle，必须加超时，超时则跳过提分辨率直接出画
-          var acw = waitMs(cfg.applyConstraintMs);
-          await Promise.race([
-            track.applyConstraints({ width: { ideal: maxW }, height: { ideal: maxH } }),
-            acw.promise
-          ]);
-          acw.cancel();
+          rung = parseResolutionPref(loadPref(deviceId));
         } catch (e) {
-          /* 部分摄像头不支持调整，保持当前分辨率 */
+          rung = null; // 存档损坏 / localStorage 不可用 → 当作没有记忆
         }
+        log('info', 'CAM_RES_PREF', {
+          seq: seq,
+          device: shortDeviceId(deviceId),
+          res: resFieldOf(rung),
+          reason: rung ? 'hit' : 'miss'
+        });
+        if (rung) resPrefUsed = rung;
       }
+      // 降级态（Overconstrained 后）不带 deviceId，也不带分辨率约束
+      return buildResolutionConstraints(deviceId && !fallbackNoExact ? deviceId : '', rung);
+    }
+
+    /**
+     * 逐档探测并锁定最高可用分辨率。
+     * @returns {object|null} 实际输出 { width, height }（永远反映真实输出，不撒谎）
+     */
+    async function applyMaxResolution(track, deviceId, mySeq) {
+      resolution = null;
+      resolutionRequest = null;
+      resolutionSource = 'none';
+      var cur = readSettings(track);
+      var raw = readRawSettings(track);
+      var actualDev = raw && raw.deviceId ? raw.deviceId : '';
+      // 防串档：默认键的存档记着它来自哪台设备，实际出流的设备对不上就作废并重新枚举
+      // （换过摄像头 / 换过 USB 口时设备 id 会变，沿用旧档位会被 Overconstrained 打回）
+      if (resPrefUsed && !deviceId && resPrefUsed.dev && actualDev && resPrefUsed.dev !== actualDev) {
+        log('warn', 'CAM_RES_PREF', {
+          seq: mySeq,
+          device: shortDeviceId(actualDev),
+          res: resFieldOf(resPrefUsed),
+          reason: 'device-changed'
+        });
+        clearResolutionPref('', mySeq, 'device-changed');
+      }
+      var cap = null;
       try {
-        var s = track.getSettings();
-        resolution = { width: s.width || 0, height: s.height || 0 };
-      } catch (e2) {
-        resolution = null;
+        cap = track && typeof track.getCapabilities === 'function' ? track.getCapabilities() : null;
+      } catch (e) {
+        cap = null;
+      }
+      var ladder = buildResolutionLadder(cap, { maxRungs: cfg.resMaxRungs, maxFps: cfg.resMaxFps });
+      var top = ladder.length ? ladder[0] : null;
+      log('info', 'CAM_RES_ENUM', {
+        seq: mySeq,
+        device: shortDeviceId(deviceId),
+        res: resFieldOf(top),
+        rungs: ladder.length,
+        capW: cap && cap.width ? cap.width.max : null,
+        capH: cap && cap.height ? cap.height.max : null,
+        capFps: cap && cap.frameRate ? cap.frameRate.max : null
+      });
+
+      var chosen = null;
+      var budgetHit = false;
+      var deadline = now() + cfg.resBudgetMs; // 总预算：不让逐档探测把出画拖成十几秒
+      for (var i = 0; i < ladder.length; i++) {
+        if (!alive || mySeq !== seq) return toResolution(cur);
+        // 总预算闸门只放在这一个地方（循环头部）：每轮复查一次。
+        // 只在某个分支里查会让闸门形同虚设 —— 恒挂设备（部分 UVC 摄像头的真实行为）会
+        // 一路 applyConstraints 超时，resMaxRungs(16) × applyConstraintMs(1000) ≈ 16s 才出画，
+        // 那正是本次要消灭的现场症状。
+        // 取舍说明：预算生效后最坏只探测 2~3 档是可接受的 —— 正常失败（Overconstrained）
+        // 是秒回的、不吃满 applyConstraintMs，只有真悬挂才吃满，而真悬挂的设备本来也锁不上更高档。
+        // 因此不要为了「多试几档」去调小 applyConstraintMs（1000ms 是 UVC 永不 settle 的生产安全兜底）。
+        if (budgetHit || now() >= deadline) { budgetHit = true; break; }
+        var rung = ladder[i];
+        // 当前输出已经是这一档 → 不必调 applyConstraints。很多摄像头默认就开在最高档，
+        // 而部分 UVC 设备一调 applyConstraints 就卡住，少调一次就少一次风险
+        if (sameRung(cur, rung)) {
+          chosen = rung;
+          resolutionSource = resPrefUsed && sameRung(resPrefUsed, rung) ? 'pref' : 'already';
+          break;
+        }
+        var applied = await tryApplyRung(track, rung, deviceId, mySeq);
+        if (applied === 'stale') return toResolution(cur);
+        if (!applied) continue;
+        var got = readSettings(track);
+        if (sameRung(got, rung)) {
+          chosen = rung;
+          // 「记忆命中但要 applyConstraints 复现」（重启后摄像头开在默认档的最常见路径）
+          // 也算命中，不能标成 ladder —— 现场要靠这个字段判断记忆机制有没有起作用
+          resolutionSource = resPrefUsed && sameRung(resPrefUsed, rung) ? 'pref' : 'ladder';
+          cur = got;
+          break;
+        }
+        // 设备「接受」了约束却没给到对应输出 —— 旧实现完全看不见这种情况
+        log('warn', 'CAM_RES_FALLBACK', {
+          seq: mySeq,
+          device: shortDeviceId(deviceId),
+          res: resFieldOf(rung),
+          reason: 'verify-mismatch',
+          gotW: got ? got.width : null,
+          gotH: got ? got.height : null
+        });
+        cur = got;
+      }
+
+      resolution = toResolution(cur);
+      if (chosen) {
+        var req = toResolution(chosen);
+        if (chosen.frameRate) req.frameRate = chosen.frameRate;
+        resolutionRequest = req;
+        log('info', 'CAM_RES_APPLY', {
+          seq: mySeq,
+          device: shortDeviceId(deviceId),
+          res: resField(),
+          reason: resolutionSource
+        });
+        persistResolution(deviceId, chosen, mySeq);
+      } else if (ladder.length) {
+        // 全档失败 / 预算耗尽：都保留当前流正常出画，只留证据（不置 ERROR、不影响拍照）。
+        // reason 区分两者：'ladder-exhausted' = 阶梯里每一档都被设备拒绝了；
+        //                 'budget-exhausted' = 还有档没试但总预算用完（通常意味着设备在悬挂）
+        log('warn', 'CAM_RES_FALLBACK', {
+          seq: mySeq,
+          device: shortDeviceId(deviceId),
+          res: resField(),
+          reason: budgetHit ? 'budget-exhausted' : 'ladder-exhausted',
+          budgetMs: cfg.resBudgetMs,
+          rungs: ladder.length
+        });
+        if (resPrefUsed) clearResolutionPref(deviceId, mySeq, 'pref-unusable');
       }
       return resolution;
+    }
+
+    // 单档尝试：exact 锁定 + 超时兜底 + 显式失败原因。
+    // 返回 'stale'（会话已作废）/ true（已应用）/ false（被拒或超时）
+    async function tryApplyRung(track, rung, deviceId, mySeq) {
+      if (!track || typeof track.applyConstraints !== 'function') return false;
+      var cst = { width: { exact: rung.width }, height: { exact: rung.height } };
+      // frameRate 只用 ideal：带宽不够时降帧比整档失败更划算
+      if (rung.frameRate) cst.frameRate = { ideal: rung.frameRate };
+      var acw = waitMs(cfg.applyConstraintMs);
+      var timedOut = false;
+      var err = null;
+      try {
+        await Promise.race([
+          track.applyConstraints(cst).then(function () { return 'ok'; }, function (e) { err = e; return 'err'; }),
+          acw.promise.then(function (v) { if (v !== false) timedOut = true; return 'timeout'; })
+        ]);
+      } catch (e2) {
+        err = err || e2;
+      }
+      // 无论胜负都回收定时器：落败一侧的计时器若留下就是悬挂定时（QA 探测项 A/D1）
+      acw.cancel();
+      if (!alive || mySeq !== seq) return 'stale';
+      if (timedOut || err) {
+        log('warn', 'CAM_RES_FALLBACK', {
+          seq: mySeq,
+          device: shortDeviceId(deviceId),
+          res: resFieldOf(rung),
+          reason: timedOut ? 'apply-timeout' : ((err && err.name) === 'OverconstrainedError' ? 'overconstrained' : 'apply-error'),
+          err: err ? { name: (err && err.name) || 'Error', message: (err && err.message) || '' } : null
+        });
+        return false;
+      }
+      return true;
+    }
+
+    // 锁定成功 → 持久化「设备 → 档位」，下次开流前直接写进 gUM 约束（重启 / 换设备不再回落）
+    function persistResolution(deviceId, rung, mySeq) {
+      if (!savePref) return;
+      var keys = [prefKeyOf(deviceId)];
+      // 开的是默认设备时额外按「实际出流的设备 id」存一份：
+      // 下次明确指定这台设备（下拉里选它）时也能直接命中，不必再枚举一遍
+      var raw = readRawSettings(activeTrack());
+      var devId = raw && raw.deviceId ? raw.deviceId : '';
+      if (!deviceId && devId) keys.push(devId);
+      var payload = makeResolutionPref(rung, now(), devId);
+      for (var i = 0; i < keys.length; i++) {
+        try {
+          savePref(keys[i], payload);
+          log('info', 'CAM_RES_PERSIST', {
+            seq: mySeq,
+            device: shortDeviceId(keys[i]),
+            res: resFieldOf(rung),
+            reason: 'saved'
+          });
+        } catch (e) {
+          /* 持久化失败不得影响拍照，仅此而已 */
+        }
+      }
+    }
+
+    // 记忆档位被设备拒绝 / 无法复现 → 立刻清空，避免每次开流都先撞一次失败
+    function clearResolutionPref(deviceId, mySeq, reason) {
+      var key = prefKeyOf(deviceId);
+      resPrefUsed = null;
+      resPrefMissed = true;
+      if (!savePref) return;
+      try {
+        savePref(key, null);
+        log('warn', 'CAM_RES_PERSIST', {
+          seq: mySeq,
+          device: shortDeviceId(key),
+          reason: reason || 'cleared'
+        });
+      } catch (e) {
+        /* 同上：清理失败不影响主流程 */
+      }
+    }
+
+    // 出画后交叉校验：track.getSettings() 与 video.videoWidth/Height 必须一致。
+    // 不一致 = 驱动没真正切档，这是现场「设了更高分辨率但不生效」唯一可观测的证据。
+    // 以画面真实尺寸为准 —— 拍照出图用的是 video 尺寸，状态显示不能撒谎。
+    function verifyOutputResolution(el, deviceId, mySeq) {
+      if (!el) return;
+      var vw = intOf(el.videoWidth) || 0;
+      var vh = intOf(el.videoHeight) || 0;
+      if (!vw || !vh) return; // 尚未出画：拿不到尺寸就不下结论
+      if (resolution && resolution.width === vw && resolution.height === vh) {
+        log('info', 'CAM_RES_VERIFY', {
+          seq: mySeq,
+          device: shortDeviceId(deviceId),
+          res: resField(),
+          reason: 'ok'
+        });
+        return;
+      }
+      log('warn', 'CAM_RES_VERIFY', {
+        seq: mySeq,
+        device: shortDeviceId(deviceId),
+        res: resField(),
+        reason: 'video-mismatch',
+        gotW: vw,
+        gotH: vh
+      });
+      resolution = { width: vw, height: vh };
     }
 
     async function waitForFrame(el, mySeq) {
@@ -626,6 +1099,12 @@
 
       if (!raced.ok) {
         var res = classifyError(raced.err);
+        // 记忆档位被这台设备拒绝：立刻清空它，否则每次开流都要先撞一次 OverconstrainedError。
+        // 非 Overconstrained 的可恢复错误（占用 / 未就绪）同样停用记忆档位：分辨率约束会
+        // 让部分摄像头直接开不出流，宁可本轮退回「开流后再逐档提」，也不能打不开摄像头。
+        if (resPrefUsed && !res.fatal && res.code !== 'NO_TRACK') {
+          clearResolutionPref(deviceId, mySeq, res.code === 'OVERCONSTRAINED' ? 'overconstrained' : 'pref-blocked');
+        }
         log('error', 'CAM_GUM_FAIL', { seq: mySeq, attempt: att, code: res.code, err: res.err, reason: 'gum' });
         return res;
       }
@@ -645,7 +1124,8 @@
       bindTracks(s, mySeq);
       log('info', 'CAM_GUM_OK', { seq: mySeq, device: shortDeviceId(deviceId), attempt: att, tracks: trackList(s).length });
       var track = activeTrack();
-      await applyMaxResolution(track);
+      // 提分辨率必须在 attachStream() 之前：video.play() 之后再由驱动改分辨率会被底层覆盖
+      await applyMaxResolution(track, deviceId, mySeq);
 
       var el = safeVideo();
       var attached = await attachStream(el, s, mySeq);
@@ -655,6 +1135,8 @@
         releaseActive('late');
         return { cancelled: true };
       }
+      // 出画后用 video 真实尺寸复核一遍，不一致即留证据并以画面尺寸为准
+      verifyOutputResolution(el, deviceId, mySeq);
       setState(STATES.LIVE, 'attached');
       log('info', 'CAM_LIVE', { seq: mySeq, device: shortDeviceId(deviceId), res: resField(), attempt: att, flap: flapCount });
       return true;
@@ -687,8 +1169,16 @@
         if (!r || r.cancelled || r.handled) return false;
         if (!alive || mySeq !== seq) return false;
         if (r.code === 'OVERCONSTRAINED' && !fallbackNoExact) {
-          fallbackNoExact = true;
-          log('warn', 'CAM_RETRY', { seq: mySeq, attempt: attempt, reason: 'overconstrained-fallback', delayMs: 0 });
+          // 若这次失败是「记忆档位」带来的（已清空并停用记忆），只去掉分辨率约束、
+          // 保留 deviceId 约束 —— 否则会连设备一起放开，打开的就不是用户选的那台摄像头了。
+          // 再去一次仍然 Overconstrained，才回退到 { video: true }
+          if (resPrefMissed && !resDroppedTried) {
+            resDroppedTried = true;
+            log('warn', 'CAM_RETRY', { seq: mySeq, attempt: attempt, reason: 'overconstrained-drop-res', delayMs: 0 });
+          } else {
+            fallbackNoExact = true;
+            log('warn', 'CAM_RETRY', { seq: mySeq, attempt: attempt, reason: 'overconstrained-fallback', delayMs: 0 });
+          }
           continue;
         }
         if (r.fatal || attempt >= cfg.maxAttempts) {
@@ -788,6 +1278,9 @@
       if (!sameId) fallbackNoExact = false;
       attempt = 0;
       fallbackNoExact = false;
+      // 换设备 / 人工重开 = 新的一轮：上一轮被证明不可用的记忆档位重新纳入考虑
+      resPrefMissed = false;
+      resDroppedTried = false;
       // 人工发起的打开（挂载 / 重试 / 换设备 / 唤醒）视为新一轮，闪断计数归零
       flapCount = 0;
       lastLiveAt = 0;
@@ -829,6 +1322,8 @@
       alive = true;
       attempt = 0;
       fallbackNoExact = false;
+      resPrefMissed = false;
+      resDroppedTried = false;
       setError(null);
       setState(STATES.UNINIT, 'mount');
       bindDeviceChange();
@@ -937,6 +1432,10 @@
         lastLiveAt: lastLiveAt,
         liveTracks: stream ? trackList(stream).filter(function (t) { return t.readyState === 'live'; }).length : 0,
         resolution: resolution,
+        // 「请求档位」与「实际档位」同时暴露：现场核对「设了最高档但没生效」时，
+        // 两者不一致就是驱动降档的铁证（getResolution() 只给实际档位）
+        resolutionRequest: resolutionRequest,
+        resolutionSource: resolutionSource,
         preferredId: preferredId,
         alive: alive,
         trackBinds: trackBinds.length
@@ -962,6 +1461,10 @@
       getStream: function () { return stream; },
       getTrack: function () { return activeTrack(); },
       getResolution: function () { return resolution; },
+      // 请求档位 / 实际档位 / 来源（pref 记忆命中 | already 开流即最高档 | ladder 逐档锁定 | none 未锁定）
+      getResolutionInfo: function () {
+        return { request: resolutionRequest, actual: resolution, source: resolutionSource };
+      },
       getSeq: function () { return seq; },
       getAttempt: function () { return attempt; },
       snapshot: snapshot,
@@ -987,6 +1490,14 @@
     create: createCameraController,
     analyzeGraySamples: analyzeGraySamples,
     sampleCenterGray: sampleCenterGray,
-    classifyError: classifyError
+    classifyError: classifyError,
+    // 分辨率锁定（纯函数，供单测直接断言）
+    buildResolutionLadder: buildResolutionLadder,
+    normalizeResolution: normalizeResolution,
+    parseResolutionPref: parseResolutionPref,
+    makeResolutionPref: makeResolutionPref,
+    buildResolutionConstraints: buildResolutionConstraints,
+    RES_PREF_VERSION: RES_PREF_VERSION,
+    STANDARD_RATINGS: STANDARD_RATINGS
   };
 });

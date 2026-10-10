@@ -1,7 +1,7 @@
 {
   "name": "xingqiyi-laundry-photo",
   "productName": "星期衣精致洗衣衣物照片系统",
-  "version": "1.2.9",
+  "version": "1.2.10",
   "description": "洗衣店衣物拍照存档系统：客户端拍照/查询 + 管理端用户权限/日志/数据管理",
   "main": "main/main.js",
   "repository": {
@@ -15,7 +15,7 @@
     "prebuild": "node scripts/copy-vue.js && node scripts/sync-manual.js",
     "build": "electron-builder --win",
     "release:desktop": "node scripts/release-desktop.js",
-    "verify": "node scripts/verify-store.js && node scripts/verify-server.js && node scripts/verify-templates.js && node scripts/verify-watermark.js && node scripts/verify-thumb.js && node scripts/verify-credentials.js && node scripts/verify-camera.js && node scripts/verify-camera-log.js && node scripts/verify-camera-qa.js && node scripts/sync-manual.js && node scripts/verify-manual-sync.js && node scripts/verify-manual-render.js && node scripts/verify-release-isolation.js"
+    "verify": "node scripts/verify-store.js && node scripts/verify-server.js && node scripts/verify-templates.js && node scripts/verify-watermark.js && node scripts/verify-thumb.js && node scripts/verify-credentials.js && node scripts/verify-camera.js && node scripts/verify-camera-log.js && node scripts/verify-camera-qa.js && node scripts/verify-camera-res.js && node scripts/verify-camera-res-qa2.js && node scripts/verify-camera-res-mutation.js && node scripts/verify-camera-res-budget.js && node scripts/sync-manual.js && node scripts/verify-manual-sync.js && node scripts/verify-manual-render.js && node scripts/verify-release-isolation.js"
   },
   "author": "星期衣精致洗衣",
   "license": "MIT",

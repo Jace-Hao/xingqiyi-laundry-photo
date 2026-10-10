@@ -1,5 +1,23 @@
 # 更新日志
 
+## v1.2.10（2026-10-10）
+
+### 修复
+- **摄像头最高分辨率锁定（`renderer/camera-controller.js`）**
+  - **问题**：现场门店多为 UVC 免驱摄像头，画面长期停留在 640×480 / 720p 的浏览器默认档，衣物标签上的小字拍照后看不清。排查为六处缺陷叠加：
+    1. `getUserMedia` 约束里**完全没带分辨率**，开流即落在驱动默认的最低档；
+    2. 开流后用 `{ideal}` 提档不锁定——`ideal` 只是「倾向值」，驱动可无视，实际 settings 常常原样不变；
+    3. 改用 `width.max × height.max` 拼出驱动不支持的组合，被 gUM **静默吞掉**（不报错、不提档），界面无从察觉；
+    4. `applyConstraints` 的超时分支在部分路径上**误判成功**，把从未生效的档位当成已锁定；
+    5. 未与 `<video>` 的**真实画面尺寸**（`videoWidth` / `videoHeight`）交叉校验，settings 说已在 high 档、实际出图仍是低分辨率；
+    6. 分辨率**没有持久化**，切换摄像头或重启后一律回落默认档。
+  - **方案**：开流前先读记忆档位、以 `exact` 直接写进 gUM 约束，一次到位；只有当无从记忆（首次 / 新设备）时才走「枚举 → 按面积优先 → 帧率次之 → 宽度降序」的候选阶梯，在 `attachStream()` 拿到第一帧**之前**逐档试探 `applyConstraints({exact})` 并复核真实尺寸；失败按 `overconstrained` / `apply-timeout` / `verify-mismatch` **三类原因明确降级**，而不是含糊失败；锁定成功后才按 `deviceId` 分档持久化（`v` 版本号 + `ts` 时间戳，脏存档一律当没存过）。
+  - **兜底**：新增 `resBudgetMs`：2500 总预算闸门，作为**单一检查点**收敛所有耗时，避免恒挂（每次 `applyConstraints` 都撞满超时）的设备把「出画」拖成十几秒——现场表现为黑屏。超预算即刻以当前已生效档位出画，不阻塞拍照。
+
+### 新增
+- **渲染层 deviceId 记忆持久化（`renderer/renderer.js`）**：此前 deviceId 未持久化，重启后连「上次用的是哪个摄像头」都查不到，记忆档位无从匹配。现新增 `loadResolutionPref` / `saveResolutionPref`，由渲染层读写 `localStorage` 并注入控制器（控制器保持纯逻辑、可在 Node 下用假对象单测）；存档按 `deviceId` 分开键存，切换摄像头不串档；无痕模式 / 存储不可用时静默降级为单次会话生效。
+- **校验脚本（均已接入 `npm run verify`）**：`verify-camera-res`（98 项，分辨率阶梯/降级/持久化）、`verify-camera-res-qa2`（102 项，边界与同分排名）、`verify-camera-res-mutation`（12 项变异对照，确认断言真的会失败）、`verify-camera-res-budget`（16 项，总预算闸门与出画时延）。
+
 ## v1.2.9（2026-10-09）
 
 ### 修复

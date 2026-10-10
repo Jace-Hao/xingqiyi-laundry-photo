@@ -700,7 +700,9 @@ async function main() {
       'CAM_ATTACH_FAIL', 'CAM_PLAY_FAIL', 'CAM_PLAY_TIMEOUT', 'CAM_LIVE', 'CAM_DEGRADED', 'CAM_TRACK_ENDED',
       'CAM_TRACK_MUTED', 'CAM_RETRY', 'CAM_SLEEP', 'CAM_WAKE', 'CAM_DEVICE_CHANGE',
       'CAM_CAPTURE_OK', 'CAM_CAPTURE_REJECT', 'CAM_LEAK_GUARD',
-      'CAM_PERMISSION_CHECK', 'CAM_PERMISSION_REQUEST', 'CAM_WINDOW_STATE'
+      'CAM_PERMISSION_CHECK', 'CAM_PERMISSION_REQUEST', 'CAM_WINDOW_STATE',
+      // 分辨率锁定（本次修复新增）：枚举 / 记忆命中 / 逐档应用 / 出画复核 / 降级 / 持久化
+      'CAM_RES_ENUM', 'CAM_RES_PREF', 'CAM_RES_APPLY', 'CAM_RES_VERIFY', 'CAM_RES_FALLBACK', 'CAM_RES_PERSIST'
     ];
     const used = new Set();
     for (const f of ['renderer/renderer.js', 'renderer/camera-controller.js']) {

@@ -1636,6 +1636,10 @@ const CapturePage = {
               window.api && typeof window.api.openCameraPrivacy === 'function'
                 ? () => window.api.openCameraPrivacy()
                 : null,
+            // 分辨率记忆：controller 是纯逻辑模块（要能在 Node 下用假对象单测），
+            // 不碰 localStorage，读写由这里注入；存档按 deviceId 分开，切换摄像头不串档
+            loadResolutionPref: (id) => readResPref(id),
+            saveResolutionPref: (id, val) => writeResPref(id, val),
             log: camLog
           })
         : null;
@@ -3486,6 +3490,38 @@ function writePref(key, val) {
     window.localStorage.setItem(key, val);
   } catch (e) {
     /* 无痕模式 / 存储不可用时静默降级为单次生效 */
+  }
+}
+
+/* ---------- 摄像头分辨率记忆（按 deviceId 分别存档）----------
+ * 场景：门店现场多是 UVC 免驱摄像头，同一台机器重启 / 换 USB 口后浏览器默认档位
+ * 常常掉回 640×480。这里把「上一次真正锁定成功」的档位存档，下次开流前由 controller
+ * 直接以 exact 写进 getUserMedia 约束，一次到位（不用等开流后再提）。
+ * 存档带版本号 v 与时间戳 ts，controller 侧 parseResolutionPref() 会校验，
+ * 版本不认或字段非法一律当「没存过」→ 退回全量枚举，绝不会被脏存档锁死。 */
+const CAM_RES_PREFIX = 'xqy-cam-res:';
+
+function readResPref(deviceId) {
+  // deviceId 为空串是合法的「默认设备」档位键（启动时还没枚举出 deviceId 就靠它），
+  // 只有 null/undefined 才拒绝
+  if (deviceId === null || deviceId === undefined) return null;
+  const raw = readPref(CAM_RES_PREFIX + deviceId, '');
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw);
+    return v && typeof v === 'object' ? v : null;
+  } catch (e) {
+    return null; // 存档损坏：当作没有记忆
+  }
+}
+
+function writeResPref(deviceId, val) {
+  if (deviceId === null || deviceId === undefined) return;
+  try {
+    if (!val) window.localStorage.removeItem(CAM_RES_PREFIX + deviceId);
+    else writePref(CAM_RES_PREFIX + deviceId, JSON.stringify(val));
+  } catch (e) {
+    /* 无痕模式 / 存储不可用时静默降级为单次生效（本次会话内仍然有效） */
   }
 }
 
