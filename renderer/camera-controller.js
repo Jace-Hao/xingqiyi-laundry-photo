@@ -43,6 +43,14 @@
     flapMax: 5,
     blackMean: 12,
     blackVariance: 4,
+    // 黑帧复采：单次采样会把「对焦脉冲 / 自动曝光 / 分辨率重协商」造成的**瞬时**黑帧
+    // 误判成镜头被遮挡而拒拍（现场表现：预览看着正常，却间歇性提示「画面全黑、拍不了」）。
+    // 命中黑帧后在 blackRetryMs 总预算内按 blackSampleGapMs 复采，只有持续全黑才真的拒收。
+    blackRetryMs: 900,
+    blackSampleGapMs: 120,
+    // 拍照闸门瞬时未通过时的复检间隔：track 短暂 mute 在对焦脉冲期间很常见，
+    // 不该一次未通过就直接把拍照判死
+    captureGateRetryMs: 260,
     // 悬挂兜底：play() / applyConstraints 部分 UVC 摄像头会永不 settle，
     // 若不加超时，控制器会卡在 STARTING 且无错误提示（与「黑屏只能重开」同族症状）
     attachTimeoutMs: 2000,
@@ -1404,7 +1412,10 @@
       return true;
     }
 
-    function isBlackFrame(el) {
+    // silent=true：只取判定结果、不写「拒收」日志。供 confirmBlackFrame 复采使用，
+    // 避免留下「先记拒收、复采后却又放行」这种误导现场排查的日志。
+    // 对外行为（默认调用）与改造前完全一致，既有契约测试不受影响。
+    function isBlackFrame(el, silent) {
       var enabled = true;
       try { enabled = blackFrameEnabled() !== false; } catch (e) { enabled = true; }
       if (!enabled || !frameSampler) return false;
@@ -1414,10 +1425,34 @@
       try { samples = frameSampler(target, cfg.sampleSize); } catch (e) { samples = null; }
       if (!samples || !samples.length) return false;
       var r = analyzeGraySamples(samples, { mean: cfg.blackMean, variance: cfg.blackVariance });
-      if (r.black) {
+      if (r.black && !silent) {
         log('warn', 'CAM_CAPTURE_REJECT', { seq: seq, reason: 'black-frame', mean: Math.round(r.mean * 100) / 100, variance: Math.round(r.variance * 100) / 100 });
       }
       return r.black;
+    }
+
+    // 拍照前的黑帧复采（异步）：只有「持续全黑」才拒拍。
+    // 背景：部分 UVC 摄像头在 single-shot 对焦脉冲、自动曝光调整或分辨率重协商期间会
+    // 短暂停输出，那一瞬画面确实是黑的，但预览上看只是一闪。单次采样会把这种瞬时黑帧
+    // 当成「镜头被遮挡」拒收 —— 正是「预览正常却间歇性提示全黑、无法拍摄」的来源。
+    // 设计取舍：只放宽「时间维度」（复采到持续黑才拒），**不动阈值**，
+    // 因此不会削弱「真挡镜头 / 真黑照片入库」的拦截能力。
+    async function confirmBlackFrame(el) {
+      if (!isBlackFrame(el, true)) return false;
+      var deadline = now() + cfg.blackRetryMs;
+      var attempts = 1;
+      while (now() < deadline) {
+        await waitMs(cfg.blackSampleGapMs).promise;
+        // 复采期间被卸载 / 休眠：不拦拍，交由上层状态闸门裁决
+        if (!alive) return false;
+        attempts += 1;
+        if (!isBlackFrame(el, true)) {
+          log('warn', 'CAM_BLACK_RETRY', { seq: seq, reason: 'transient-recovered', attempts: attempts });
+          return false;
+        }
+      }
+      log('warn', 'CAM_CAPTURE_REJECT', { seq: seq, reason: 'black-frame-persistent', attempts: attempts, waitMs: cfg.blackRetryMs });
+      return true;
     }
 
     function snapshot() {
@@ -1453,7 +1488,10 @@
       wake: wake,
       // 闸门与检测
       canCapture: canCapture,
+      // 同步单次采样（对外契约不变，供测试与旧调用点使用）
       isBlackFrame: isBlackFrame,
+      // 异步复采：拍照前应使用这个，瞬时黑帧不再误拒
+      confirmBlackFrame: confirmBlackFrame,
       openPrivacySettings: openPrivacySettings,
       // 供单测/渲染层读取
       getState: function () { return state; },

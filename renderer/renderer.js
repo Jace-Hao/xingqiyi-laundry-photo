@@ -1819,6 +1819,9 @@ const CapturePage = {
     // RC-8：仅在真正出画（LIVE）且窗口可见时执行，连续失败 2 次即停，
     // 避免部分 UVC 摄像头在 single-shot 期间停输出造成周期黑帧。
     let focusFail = 0;
+    // 对焦脉冲进行中标记：部分 UVC 摄像头在 single-shot 期间会停输出（周期黑帧），
+    // 拍照前必须等这个窗口过去再采样，否则把「脉冲黑帧」误判成「镜头被遮挡」而拒拍
+    let focusPulseBusy = false;
 
     function startFocusPulse(track) {
       stopFocusPulse();
@@ -1830,6 +1833,7 @@ const CapturePage = {
           return;
         }
         if (document.hidden || camState.value !== 'LIVE') return;
+        focusPulseBusy = true;
         try {
           // 对焦脉冲同样可能永不 settle，加超时跳过，避免周期黑帧或卡死
           await Promise.race([
@@ -1845,8 +1849,25 @@ const CapturePage = {
         } catch (e) {
           focusFail++;
           if (focusFail >= 2) stopFocusPulse();
+        } finally {
+          // 无论成功失败都要解除：否则一次异常会把后续所有拍照永久卡在等待里
+          focusPulseBusy = false;
         }
       }, 20000);
+    }
+
+    // 拍照前等对焦脉冲结束，最多等 maxMs。
+    // 超时不再等——宁可采到黑帧再走复采，也不能把拍照入口卡死。
+    function waitPulseClear(maxMs) {
+      if (!focusPulseBusy) return Promise.resolve(false);
+      const t0 = Date.now();
+      return new Promise((resolve) => {
+        const tick = () => {
+          if (!focusPulseBusy || Date.now() - t0 >= maxMs) return resolve(focusPulseBusy);
+          setTimeout(tick, 60);
+        };
+        setTimeout(tick, 60);
+      });
     }
 
     function stopFocusPulse() {
@@ -1972,8 +1993,11 @@ const CapturePage = {
       LIVE: '画面未就绪，请稍候'
     };
 
-    function capture() {
-      if (saving.value) return;
+    // 拍照进行中标记：复采/等脉冲期间禁止重入，否则连拍按空格会并发进入同一张照片流程
+    let capturing = false;
+
+    async function capture() {
+      if (saving.value || capturing) return;
       if (!controller) {
         toast('摄像头模块未加载，请重启程序', 'error');
         return;
@@ -1984,41 +2008,61 @@ const CapturePage = {
         toast(CAPTURE_BLOCK_MSG.SLEEPING, 'info');
         return;
       }
-      // I5：仅 LIVE 允许拍照；STARTING / DEGRADED / ERROR 一律拒绝并给出可执行提示
-      if (!controller.canCapture()) {
-        const err = controller.getError();
-        const msg = st === 'ERROR' && err ? '摄像头不可用：' + err.message : CAPTURE_BLOCK_MSG[st] || CAPTURE_BLOCK_MSG.LIVE;
-        camLog('warn', 'CAM_CAPTURE_REJECT', { reason: st, state: st });
-        toast(msg, 'error');
-        return;
+      capturing = true;
+      try {
+        // I5：仅 LIVE 允许拍照；STARTING / DEGRADED / ERROR 一律拒绝并给出可执行提示。
+        // 先复检一次再拒绝：track 短暂 mute（对焦脉冲 / 分辨率重协商期间常见）是一次性的，
+        // 立刻判死会让用户觉得「明明看得见画面却拍不了」。
+        if (!controller.canCapture()) {
+          await new Promise((r) => setTimeout(r, 260));
+          if (!controller.canCapture()) {
+            // 复检后重新取状态：canCapture() 内部可能已把 LIVE 降级为 DEGRADED，
+            // 用入口处那个 st 会选错文案（旧实现正是拿过期状态提示）
+            const st2 = controller.getState();
+            const err = controller.getError();
+            const msg = st2 === 'ERROR' && err ? '摄像头不可用：' + err.message : CAPTURE_BLOCK_MSG[st2] || CAPTURE_BLOCK_MSG.LIVE;
+            camLog('warn', 'CAM_CAPTURE_REJECT', { reason: st2, state: st2, retried: true });
+            toast(msg, 'error');
+            return;
+          }
+        }
+        // 对焦脉冲期间部分 UVC 摄像头会停输出（周期黑帧），等它结束再采样
+        await waitPulseClear(1200);
+        const v = videoEl.value;
+        if (!v || !v.videoWidth) {
+          toast('摄像头画面未就绪', 'error');
+          return;
+        }
+        // 黑帧检测：镜头被遮挡 / 信号中断时拒收，杜绝黑照片入库（可用 window.__xqyBlackFrame=false 关闭）。
+        // 用带复采的 confirmBlackFrame：只有「持续全黑」才拒，瞬时黑帧（脉冲/自动曝光）自动放行。
+        const black = controller.confirmBlackFrame
+          ? await controller.confirmBlackFrame(v)
+          : controller.isBlackFrame(v);
+        if (black) {
+          // 拒收明细（复采次数、预算）由 controller 侧 CAM_CAPTURE_REJECT 记录，此处只做界面提示
+          toast('画面持续全黑：请检查镜头是否被遮挡或光线不足，调整后再拍', 'error');
+          return;
+        }
+        // 拍摄操作说明用户正在使用摄像头，重置空闲计时，防止键盘操作路径下误休眠
+        bumpActivity();
+        // 时间取拍摄这一刻：连拍时每张各自记录自己的拍摄时间，
+        // 不能等到统一保存时才取时间，否则连拍的多张会显示同一时刻
+        const shotAt = new Date();
+        // 按摄像头当前（最大）分辨率绘制，不做缩放
+        const canvas = document.createElement('canvas');
+        canvas.width = v.videoWidth;
+        canvas.height = v.videoHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(v, 0, 0);
+        // 右上角烧录拍照时间水印：存进照片本身，导出/打印后依然可见
+        drawTimeWatermark(ctx, canvas.width, canvas.height, watermarkTimeText(shotAt));
+        shots.value.push(canvas.toDataURL('image/jpeg', 0.92));
+        if (!resolution.value) resolution.value = v.videoWidth + ' × ' + v.videoHeight;
+        camLog('info', 'CAM_CAPTURE_OK', { res: { w: canvas.width, h: canvas.height }, queue: shots.value.length });
+      } finally {
+        // 任何出口都要解锁：否则一次拒拍会把拍照入口永久锁死
+        capturing = false;
       }
-      const v = videoEl.value;
-      if (!v || !v.videoWidth) {
-        toast('摄像头画面未就绪', 'error');
-        return;
-      }
-      // 黑帧检测：镜头被遮挡 / 信号中断时拒收，杜绝黑照片入库（可用 window.__xqyBlackFrame=false 关闭）
-      if (controller.isBlackFrame(v)) {
-        camLog('warn', 'CAM_CAPTURE_REJECT', { reason: 'black-frame' });
-        toast('画面异常（全黑），请检查摄像头后重拍', 'error');
-        return;
-      }
-      // 拍摄操作说明用户正在使用摄像头，重置空闲计时，防止键盘操作路径下误休眠
-      bumpActivity();
-      // 时间取拍摄这一刻：连拍时每张各自记录自己的拍摄时间，
-      // 不能等到统一保存时才取时间，否则连拍的多张会显示同一时刻
-      const shotAt = new Date();
-      // 按摄像头当前（最大）分辨率绘制，不做缩放
-      const canvas = document.createElement('canvas');
-      canvas.width = v.videoWidth;
-      canvas.height = v.videoHeight;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(v, 0, 0);
-      // 右上角烧录拍照时间水印：存进照片本身，导出/打印后依然可见
-      drawTimeWatermark(ctx, canvas.width, canvas.height, watermarkTimeText(shotAt));
-      shots.value.push(canvas.toDataURL('image/jpeg', 0.92));
-      if (!resolution.value) resolution.value = v.videoWidth + ' × ' + v.videoHeight;
-      camLog('info', 'CAM_CAPTURE_OK', { res: { w: canvas.width, h: canvas.height }, queue: shots.value.length });
     }
 
     function removeShot(i) {

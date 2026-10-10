@@ -7,6 +7,8 @@ dist/
 # 运行日志与临时文件
 *.log
 npm-debug.log*
+# 临时验证/产物解包目录（本机核验安装包时生成，非源码）
+.verify-tmp/
 
 # 系统/编辑器杂项
 .DS_Store

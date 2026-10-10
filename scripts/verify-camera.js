@@ -702,7 +702,9 @@ async function main() {
       'CAM_CAPTURE_OK', 'CAM_CAPTURE_REJECT', 'CAM_LEAK_GUARD',
       'CAM_PERMISSION_CHECK', 'CAM_PERMISSION_REQUEST', 'CAM_WINDOW_STATE',
       // 分辨率锁定（本次修复新增）：枚举 / 记忆命中 / 逐档应用 / 出画复核 / 降级 / 持久化
-      'CAM_RES_ENUM', 'CAM_RES_PREF', 'CAM_RES_APPLY', 'CAM_RES_VERIFY', 'CAM_RES_FALLBACK', 'CAM_RES_PERSIST'
+      'CAM_RES_ENUM', 'CAM_RES_PREF', 'CAM_RES_APPLY', 'CAM_RES_VERIFY', 'CAM_RES_FALLBACK', 'CAM_RES_PERSIST',
+      // 黑帧复采：瞬时黑帧复采后恢复（放行），区别于 CAM_CAPTURE_REJECT 的持续黑帧拒收
+      'CAM_BLACK_RETRY'
     ];
     const used = new Set();
     for (const f of ['renderer/renderer.js', 'renderer/camera-controller.js']) {
