@@ -1,0 +1,99 @@
+classDiagram
+    class CameraController {
+        +STATES
+        +DEFAULTS
+        -expAssist : ExposureAssistState
+        +mount(video)
+        +open(deviceId)
+        +sleep(reason) / wake()
+        +canCapture() boolean
+        +isBlackFrame(el, silent) boolean
+        +confirmBlackFrame(el) Promise~boolean~
+        +getExposureInfo() ExposureInfo
+        +onExposureChange(cb) unsubscribe
+        +startExposureAssist(seq) / stopExposureAssist(reason, restore)
+        +snapshot() Snapshot
+    }
+
+    class GridCellStats {
+        +mean : number
+        +sat : number
+        +clip : number
+    }
+
+    class ExposureDecision {
+        +hit : boolean
+        +reason : string
+        +subjectRatio : number
+        +hiRatio : number
+        +centerSubjectRatio : number
+        +sceneMean : number
+        +subjectMean : number
+        +clipRatio : number
+    }
+
+    class AssistHysteresisState {
+        +state : string
+        +hit : number
+        +miss : number
+        +engagedAt : number
+        +releasedAt : number
+    }
+
+    class EvStepResult {
+        +ev : number
+        +step : number
+        +err : number
+    }
+
+    class ExposurePlan {
+        +tier : 0|1|2
+        +reason : string
+        +min/max/step : number
+        +baseTime/baseIso : number
+        +timeMin/timeMax/isoMin/isoMax : number
+        +restoreMode : string
+    }
+
+    class ExposureAssistState {
+        +state : OFF|IDLE|ACTIVE
+        +st : AssistHysteresisState
+        +ev : number
+        +tier : number
+        +plan : ExposurePlan
+        +dirty : boolean
+        +lastSceneMean : number
+        +lastSubjectMean : number
+        +lastSubjectRatio : number
+        +adjusts : number
+        +fails : number
+        +lastApplyAt : number
+    }
+
+    class FrameSampler {
+        <<interface>>
+        +sample(video, size) Array~number~
+    }
+
+    class GridSampler {
+        <<interface>>
+        +sample(video, size) ImageData
+    }
+
+    class MediaStreamTrack {
+        <<external>>
+        +getCapabilities()
+        +getSettings()
+        +applyConstraints(cst)
+    }
+
+    CameraController *-- ExposureAssistState
+    ExposureAssistState *-- AssistHysteresisState
+    ExposureAssistState o-- ExposurePlan
+    CameraController ..> GridCellStats : 产出（computeGridStats）
+    CameraController ..> ExposureDecision : 产出（classifyExposureGrid）
+    CameraController ..> EvStepResult : 产出（nextEvStep）
+    CameraController ..> ExposurePlan : 产出（pickExposurePlan）
+    CameraController --> FrameSampler : 注入（黑帧检测复用）
+    CameraController --> GridSampler : 注入（曝光检测）
+    CameraController --> MediaStreamTrack : 只发 advanced 曝光键

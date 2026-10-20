@@ -1,0 +1,14 @@
+sequenceDiagram
+    participant R as renderer / 用户
+    participant C as CameraController
+    participant T as MediaStreamTrack
+    participant L as camLog
+
+    R->>C: sleep() / unmount() / 切换设备
+    C->>C: releaseActive()
+    alt expAssist.dirty（本会话真的改过曝光）
+        C->>T: applyConstraints(恢复约束)[竞速，不 await]
+        C->>L: CAM_EXP_RESTORE{ok}
+    end
+    C->>C: stopExposureAssist('release'/'unmount')
+    Note over C: 定时器从 timers[] 摘掉，状态回 IDLE/OFF<br/>unmount 后无任何 live track（I7）

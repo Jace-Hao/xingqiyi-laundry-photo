@@ -1,0 +1,41 @@
+sequenceDiagram
+    participant V as video(DOM)
+    participant GS as gridSampler(渲染层)
+    participant C as CameraController
+    participant T as MediaStreamTrack
+    participant L as camLog(CAM_EXP_*)
+
+    Note over C: attemptOnce() 出画 → setState(LIVE) → CAM_LIVE
+    C->>C: startExposureAssist(seq)<br/>延迟 expEngageDelayMs(800ms)
+    loop 每 expCycleMs(250ms)，仅 LIVE + 页面可见 + 非对焦脉冲
+        C->>GS: gridSampler(video, 64)
+        GS-->>C: ImageData 64×64
+        C->>C: computeGridStats → classifyExposureGrid
+        alt 连续 expEngageHits(3) 帧命中
+            C->>T: getCapabilities() / getSettings()
+            T-->>C: cap / settings
+            C->>C: pickExposurePlan → tier 1/2/0
+            C->>L: CAM_EXP_ENUM
+            alt tier 1 或 2
+                C->>T: applyConstraints(advanced:曝光键)<br/>Promise.race + expApplyTimeoutMs(1000ms)
+                T-->>C: ok / 超时 / Overconstrained
+            else tier 0
+                Note over C: 不发约束，转软件兜底
+            end
+            C->>L: CAM_EXP_ENGAGE
+            Note over C: 进入 ACTIVE，闭环步进
+            loop ACTIVE 且距上次 apply ≥ max(stepGap, settle)
+                C->>C: nextEvStep(ev, subjectMean)
+                alt step ≠ 0 且 tier>0
+                    C->>T: applyConstraints(advanced:曝光键)[竞速]
+                    C->>L: CAM_EXP_STEP
+                else tier 0
+                    Note over C: 只更新 ev（拍照时 LUT 用）
+                end
+            end
+        else 连续 expReleaseMisses(10) 帧未命中
+            C->>T: applyConstraints(恢复约束)[竞速，best-effort]
+            C->>L: CAM_EXP_RELEASE / CAM_EXP_RESTORE
+            Note over C: 回 IDLE，ev 归零，进入冷却
+        end
+    end

@@ -1567,11 +1567,25 @@ const CapturePage = {
     // 取代原来写死的 aspect-ratio:4/3 与 max-height:68vh
     const camAr = Vue.ref(''); // --cam-ar，形如 '1280 / 720'
     const camMaxH = Vue.ref(0); // --cam-max-h，单位 px
+    // 曝光辅助（黑色衣物过曝防护）：controller 推来的辅助状态，供徽标与软件兜底消费。
+    // 仅 ACTIVE 时才有意义；可用 window.__xqyExposureAssist=false 整体退出
+    const exposureInfo = Vue.ref(null);
 
     // 错误态 UI：按错误码取为我们预先定义好的文案与按钮组合，取不到时一律回退 UNKNOWN
     const camErr = Vue.computed(() => {
       const c = camErrCode.value;
       return (c && CAM_ERR_UI[c]) || null;
+    });
+
+    // 曝光辅助徽标：只在辅助 ACTIVE 时显示，让介入行为对用户可见（不隐性）。
+    // tier 0 = 硬件不支持补偿，靠拍照时软件压暗存档图 —— 预览仍会偏亮，
+    // 用告示色 + 「软件压暗」文案明确告知，避免用户误以为没生效
+    const exposureBadge = Vue.computed(() => {
+      const e = exposureInfo.value;
+      if (!e || e.state !== 'ACTIVE') return null;
+      const ev = (Math.round(e.ev * 10) / 10).toFixed(1);
+      if (e.tier === 0) return { text: '软件压暗 ' + ev + 'EV', level: 'warn' };
+      return { text: '曝光补偿 ' + ev + 'EV', level: 'ok' };
     });
 
     function camIdleMs() {
@@ -1616,6 +1630,26 @@ const CapturePage = {
       }
     }
 
+    // 曝光检测采样：整帧缩到 size×size 取 ImageData（不取中心 —— 黑色衣物
+    // 检测要的是全画面的暗/亮分布）。统计与判定在 controller 纯函数里做，
+    // 渲染层只负责把画面变成像素数组（DOM 只出现在这里）
+    function sampleExposureGrid(video, size) {
+      try {
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        if (!vw || !vh) return null;
+        const side = Math.max(1, Math.min(size || 64, vw, vh));
+        const canvas = document.createElement('canvas');
+        canvas.width = side;
+        canvas.height = side;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, vw, vh, 0, 0, side, side);
+        return ctx.getImageData(0, 0, side, side);
+      } catch (e) {
+        return null;
+      }
+    }
+
     // ---------- 摄像头生命周期控制器（renderer/camera-controller.js）----------
     // 取流 / 释放 / 重连 / 拍照闸门全部收敛到 controller：
     // 7 个并发入口（mount、重试、切换设备、空格、扫码、窗口可见、拍照）都只是转发，
@@ -1640,6 +1674,13 @@ const CapturePage = {
             // 不碰 localStorage，读写由这里注入；存档按 deviceId 分开，切换摄像头不串档
             loadResolutionPref: (id) => readResPref(id),
             saveResolutionPref: (id, val) => writeResPref(id, val),
+            // 曝光辅助（黑色衣物过曝防护）：controller 不碰 DOM，4 项全部注入。
+            // gridSampler 未注入即整体 OFF；focusBusy 让周期避开对焦脉冲
+            // （single-shot 期间部分 UVC 停输出，帧统计是噪声）
+            gridSampler: sampleExposureGrid,
+            pageVisible: () => !document.hidden,
+            focusBusy: () => focusPulseBusy,
+            exposureAssistEnabled: () => window.__xqyExposureAssist !== false,
             log: camLog
           })
         : null;
@@ -1751,11 +1792,17 @@ const CapturePage = {
       } else {
         stopFocusPulse();
       }
+      // 离开 LIVE 时徽标即消失：辅助只在 LIVE 跑，残留状态会误导现场判断
+      if (s !== 'LIVE') exposureInfo.value = null;
     }
 
     if (controller) {
       controller.onStateChange(syncCameraState);
       controller.onError(syncCameraState);
+      // 曝光辅助状态推送（与 onStateChange 并列）：徽标与软件兜底共用同一份数据
+      if (typeof controller.onExposureChange === 'function') {
+        controller.onExposureChange((e) => { exposureInfo.value = e; });
+      }
       controller.onDevicesChange(() => {
         loadDevices();
       });
@@ -2054,6 +2101,23 @@ const CapturePage = {
         canvas.height = v.videoHeight;
         const ctx = canvas.getContext('2d');
         ctx.drawImage(v, 0, 0);
+        // 曝光辅助软件兜底（仅 tier0：硬件不支持曝光补偿时）：用闭环算出的 EV
+        // 对存档图做 gamma 压暗，保住黑衣物的暗部层次（线性乘会压成死黑）。
+        // 只改存档图、不改预览，所以必须放在 drawImage 之后、水印之前 ——
+        // 水印放在压暗之后，保证时间戳始终是醒目的白色
+        const expInfo = typeof controller.getExposureInfo === 'function' ? controller.getExposureInfo() : null;
+        if (expInfo && expInfo.state === 'ACTIVE' && expInfo.tier === 0 && expInfo.ev < 0 &&
+            window.CameraController && typeof window.CameraController.buildExposureLut === 'function') {
+          const lut = window.CameraController.buildExposureLut(expInfo.ev);
+          const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const px = frame.data;
+          for (let i = 0; i < px.length; i += 4) {
+            px[i] = lut[px[i]];
+            px[i + 1] = lut[px[i + 1]];
+            px[i + 2] = lut[px[i + 2]];
+          }
+          ctx.putImageData(frame, 0, 0);
+        }
         // 右上角烧录拍照时间水印：存进照片本身，导出/打印后依然可见
         drawTimeWatermark(ctx, canvas.width, canvas.height, watermarkTimeText(shotAt));
         shots.value.push(canvas.toDataURL('image/jpeg', 0.92));
@@ -2396,6 +2460,7 @@ const CapturePage = {
       barcode, note, saving, barcodeCount, videoEl, barcodeEl, ready,
       barcodeWarn, applyCleaned, applySimilar, barcodeLocked, unlockBarcode,
       sleeping, camState, camHint, camPrivacy, camErr, camErrCode, camAr, camMaxH,
+      exposureInfo, exposureBadge,
       startCamera, retryCamera, switchDevice, wakeCamera, sleepCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone, openPrivacySettings
     };
   },
@@ -2447,6 +2512,7 @@ const CapturePage = {
                 {{ d.label || ('摄像头 ' + (i + 1)) }}
               </option>
             </select>
+            <span v-if="exposureBadge" class="exposure-badge" :class="exposureBadge.level">{{ exposureBadge.text }}</span>
             <button class="btn btn-primary btn-shutter" :disabled="camState !== 'LIVE'" @click="capture">📸 拍照（空格）</button>
             <button v-if="camState !== 'SLEEPING' && camState !== 'UNINIT'" class="btn btn-ghost" @click="sleepCamera('manual')">释放摄像头</button>
           </div>

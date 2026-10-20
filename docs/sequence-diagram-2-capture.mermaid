@@ -1,0 +1,24 @@
+sequenceDiagram
+    participant U as 用户(空格/快门)
+    participant R as renderer.capture()
+    participant C as CameraController
+    participant K as canvas(存档图)
+
+    U->>R: capture()
+    R->>C: canCapture()（仅 LIVE）
+    R->>R: waitPulseClear(1200)（等对焦脉冲）
+    R->>C: confirmBlackFrame(v)
+    loop 黑帧复采预算内
+        C->>C: isBlackFrame(v, silent)
+        alt 辅助 ACTIVE 且实时场景均值 ≥ expBlackFloor(4)
+            C->>C: 门控放行，记 CAM_EXP_BLACKGATE
+            C-->>R: false（放行）
+        else 持续全黑
+            C-->>R: true → 拒拍并提示
+        end
+    end
+    R->>K: drawImage(video)
+    alt tier 0（硬件不支持）且 ACTIVE
+        R->>R: buildExposureLut(ev) 逐像素压暗
+    end
+    R->>K: 烧录时间水印 → toDataURL 入队

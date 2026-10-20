@@ -61,7 +61,41 @@
     resBudgetMs: 2500,
     // 阶梯最大档位数 / 最高档的帧率备选数（防止候选集无限膨胀）
     resMaxRungs: 16,
-    resMaxFps: 3
+    resMaxFps: 3,
+
+    // ===== 曝光辅助：黑色衣物过曝防护（设计文档 docs/exposure-assist-design.md）=====
+    // 所有曝光 applyConstraints 只带 advanced 曝光键，绝不夹带 width/height/frameRate
+    // （夹带一次就可能破坏分辨率锁定，项目纪律红线）
+    expGridSize: 64,             // 整帧降采样边长（64×64 像素统计，开销可忽略）
+    expGridCells: 8,             // 网格划分数：8×8=64 格
+    expSubjectMeanMax: 185,      // 主体格亮度上限：比垫板暗即候选
+    expSubjectSatMax: 0.28,      // 主体格饱和度上限：低饱和=灰黑系；
+    //   深蓝/深棕/深绿衣物饱和度高，不触发（它们不过曝成灰白）
+    expHiMeanMin: 185,           // 高亮格亮度下限：亮垫板/亮背景参照
+    expSubjectAreaMin: 0.08,     // 主体面积下限：零星暗物（电线/阴影）不触发
+    expSubjectAreaMax: 0.75,     // 主体面积上限：超过视为整体昏暗场景，不触发
+    expHiAreaMin: 0.06,          // 高亮面积下限：没有亮参照就无法区分
+    //   「AE 提亮黑衣物」与「场景本来就暗」
+    expCenterSubjectMin: 0.15,   // 中心区域主体下限：衣物在台垫中央，
+    //   顺带排除画面边缘暗物（电线/桌沿阴影）
+    expSceneMeanMin: 45,         // 场景均值下限：低于此=昏暗/遮挡/黑信号，
+    //   那是黑帧检测的职责，不触发
+    expEngageHits: 3,            // 滞回 engage：连续 3 帧命中（≈750ms）
+    expReleaseMisses: 10,        // 滞回 release：连续 10 帧未命中（≈2.5s）
+    expMinHoldMs: 1500,          // engage 后最短保持：衣物半出画不急着恢复
+    expReEngageCooldownMs: 3000, // release 后冷却：防反复横跳
+    expCycleMs: 250,             // 检测周期
+    expEngageDelayMs: 800,       // LIVE 后启动延迟：避开分辨率探测/首帧 AE 窗口
+    expTargetMean: 58,           // 闭环目标：主体平均亮度（黑而有纹理）
+    expDeadzone: 8,              // 死区：AE 自身波动 ±几格很正常，不动
+    expEvGain: 0.025,            // 步长增益：误差×0.025=步长(EV)
+    expMaxStepEv: 0.34,          // 单步上限 1/3 档：小步逼近防画面跳变
+    expEvMin: -2.0,              // 累计下限：再暗就逼近黑帧闸门、暗部细节也没了
+    expStepGapMs: 500,           // 两次曝光 applyConstraints 最小间隔
+    expSettleMs: 400,            // 单次调整后稳定等待：拿过渡值算步长会过冲
+    expApplyTimeoutMs: 1000,     // 曝光 applyConstraints 超时竞速（UVC 悬挂兜底）
+    expApplyFailLimit: 2,        // 连续失败这么多次：停硬件路径、降级软件兜底
+    expBlackFloor: 4             // 黑帧门控兜底：ACTIVE 时场景均值 <4 仍拒拍
   };
 
   /* ---------- 纯计算辅助（可被单测直接调用） ---------- */
@@ -111,6 +145,268 @@
       }
     }
     return out;
+  }
+
+  /* ---------- 曝光辅助：纯计算（可单测，不碰 DOM / MediaStreamTrack） ----------
+   * 黑色衣物过曝防护的「判定与数学」全部落在这里：渲染层只负责把整帧降采样成
+   * ImageData，编排层只负责拿结果去发约束。这样 CI 无摄像头环境也能覆盖绝大部分逻辑。
+   * 设计文档：docs/exposure-assist-design.md §6 / §7
+   */
+
+  // 网格降采样统计：整帧按 grid×grid 切格，每格算 { mean, sat, clip }
+  // 为什么整帧统计而不是继续用中心 64×64：黑色衣物检测要回答的是
+  // 「画面里暗主体占多大、有没有亮背景参照」，这是全局问题，中心采样回答不了
+  function computeGridStats(image, grid) {
+    var g = Math.max(1, grid || DEFAULTS.expGridCells);
+    var w = image && image.width ? image.width : 0;
+    var h = image && image.height ? image.height : 0;
+    var data = image && image.data;
+    if (!w || !h || !data) return null;
+    var cw = Math.max(1, Math.floor(w / g));
+    var ch = Math.max(1, Math.floor(h / g));
+    var cells = new Array(g * g);
+    for (var cy = 0; cy < g; cy++) {
+      for (var cx = 0; cx < g; cx++) {
+        var sum = 0;
+        var satSum = 0;
+        var clip = 0;
+        var n = 0;
+        var y1 = cy * ch;
+        var x1 = cx * cw;
+        for (var y = 0; y < ch; y++) {
+          var row = (y1 + y) * w;
+          for (var x = 0; x < cw; x++) {
+            var i = (row + x1 + x) * 4;
+            var r = data[i];
+            var gg = data[i + 1];
+            var b = data[i + 2];
+            var mx = Math.max(r, gg, b);
+            var mn = Math.min(r, gg, b);
+            var luma = (r * 299 + gg * 587 + b * 114) / 1000;
+            sum += luma;
+            // 饱和度 (max-min)/max；纯黑像素（max=0）定义为 0，避免除零
+            satSum += mx > 0 ? (mx - mn) / mx : 0;
+            if (luma > 250) clip++;
+            n++;
+          }
+        }
+        cells[cy * g + cx] = n
+          ? { mean: sum / n, sat: satSum / n, clip: clip / n }
+          : { mean: 0, sat: 0, clip: 0 };
+      }
+    }
+    return cells;
+  }
+
+  // 场景判定：是否命中「黑色衣物过曝」场景。四类相邻暗场景的区分见设计文档 §6.1
+  function classifyExposureGrid(cells, th) {
+    // 缺省阈值取 DEFAULTS：单测可以直接传 { expXxx: ... } 只覆盖关心的几项
+    var t = Object.assign({}, DEFAULTS, th || {});
+    var grid = t.expGridCells;
+    var n = cells && cells.length ? cells.length : 0;
+    if (!n) {
+      return {
+        hit: false, reason: 'no-cells', subjectRatio: 0, hiRatio: 0,
+        centerSubjectRatio: 0, sceneMean: null, subjectMean: null, clipRatio: 0, cells: 0
+      };
+    }
+    var subject = 0;
+    var hi = 0;
+    var centerSubject = 0;
+    var centerTotal = 0;
+    var sum = 0;
+    var subjSum = 0;
+    var clipSum = 0;
+    // 中心区域 = 网格中央一半（g/4 ~ 3g/4）
+    var lo = Math.floor(grid / 4);
+    var hiEdge = Math.ceil((grid * 3) / 4);
+    for (var i = 0; i < n; i++) {
+      var c = cells[i];
+      var cx = i % grid;
+      var cy = Math.floor(i / grid);
+      // 主体格：比垫板暗且低饱和。刻意不要求 mean<60 —— 被 AE 提亮成
+      // 灰白色的黑衣物（mean 90~185、sat≈0.1）正是要救的对象
+      var isSubject = c.mean <= t.expSubjectMeanMax && c.sat < t.expSubjectSatMax;
+      if (isSubject) { subject++; subjSum += c.mean; }
+      if (c.mean > t.expHiMeanMin) hi++;
+      sum += c.mean;
+      clipSum += c.clip;
+      if (cx >= lo && cx < hiEdge && cy >= lo && cy < hiEdge) {
+        centerTotal++;
+        if (isSubject) centerSubject++;
+      }
+    }
+    var out = {
+      hit: false,
+      reason: 'normal',
+      subjectRatio: subject / n,
+      hiRatio: hi / n,
+      centerSubjectRatio: centerTotal ? centerSubject / centerTotal : 0,
+      sceneMean: sum / n,
+      subjectMean: subject ? subjSum / subject : null,
+      clipRatio: clipSum / n,
+      cells: n
+    };
+    // 按序短路：每一道都对应一类必须排除的场景（设计文档 §6.1 场景表）
+    if (out.sceneMean < t.expSceneMeanMin) { out.reason = 'overall-dark-or-blocked'; return out; }
+    if (out.hiRatio < t.expHiAreaMin) { out.reason = 'no-bright-reference'; return out; }
+    if (out.subjectRatio < t.expSubjectAreaMin) { out.reason = 'subject-too-small'; return out; }
+    if (out.subjectRatio > t.expSubjectAreaMax) { out.reason = 'subject-too-large'; return out; }
+    if (out.centerSubjectRatio < t.expCenterSubjectMin) { out.reason = 'subject-off-center'; return out; }
+    out.hit = true;
+    out.reason = 'black-garment';
+    return out;
+  }
+
+  // 滞回状态机：engage 要连续 expEngageHits 帧命中，release 要连续
+  // expReleaseMisses 帧未命中且满足最短保持/冷却。单帧抖动不改状态，
+  // 否则补偿会跟着画面闪烁反复横跳（那比过曝本身更扰人）
+  function stepAssistHysteresis(st, hit, nowMs, cfg) {
+    var c = Object.assign({}, DEFAULTS, cfg || {});
+    // engagedAt / releasedAt 必须原样带下去：只在「不改状态」的分支里复制
+    // state/hit/miss 会把这两个时间戳丢掉，最短保持与冷却闸门就永久失效
+    // （engagedAt 变 undefined → nowMs - 0 恒大于阈值）
+    var s = {
+      state: st.state,
+      hit: st.hit,
+      miss: st.miss,
+      engagedAt: st.engagedAt || 0,
+      releasedAt: st.releasedAt || 0
+    };
+    if (hit) { s.hit += 1; s.miss = 0; } else { s.miss += 1; s.hit = 0; }
+    if (s.state === 'IDLE' && s.hit >= c.expEngageHits &&
+      nowMs - (st.releasedAt || 0) >= c.expReEngageCooldownMs) {
+      return { st: { state: 'ACTIVE', hit: 0, miss: 0, engagedAt: nowMs, releasedAt: 0 }, action: 'engage' };
+    }
+    if (s.state === 'ACTIVE' && s.miss >= c.expReleaseMisses &&
+      nowMs - (st.engagedAt || 0) >= c.expMinHoldMs) {
+      return { st: { state: 'IDLE', hit: 0, miss: 0, engagedAt: 0, releasedAt: nowMs }, action: 'release' };
+    }
+    return { st: s, action: null };
+  }
+
+  // EV 闭环步长：按实测主体亮度与目标的误差算下一步补偿（比例控制）
+  //   err  = subjectMean - expTargetMean   （正=还太亮）
+  //   step = clamp(err × expEvGain, ±expMaxStepEv)   （正=要压暗，EV 往下走）
+  //   ev   = clamp(ev - step, expEvMin, 0)
+  // 死区内不动：AE 自身波动 ±几格就微调会让日志爆炸、画面有呼吸感
+  function nextEvStep(curEv, subjectMean, cfg) {
+    var c = Object.assign({}, DEFAULTS, cfg || {});
+    if (subjectMean == null || !isFinite(subjectMean)) return { ev: curEv, step: 0, err: 0 };
+    var err = subjectMean - c.expTargetMean;
+    if (Math.abs(err) < c.expDeadzone) return { ev: curEv, step: 0, err: err };
+    var step = err * c.expEvGain;
+    if (step > c.expMaxStepEv) step = c.expMaxStepEv;
+    if (step < -c.expMaxStepEv) step = -c.expMaxStepEv;
+    var next = curEv - step;
+    if (next < c.expEvMin) next = c.expEvMin; // 下限保护：再暗就逼近黑帧闸门
+    if (next > 0) next = 0;                   // 上限锁 0：本方案只解决过曝，不做正补偿
+    return { ev: next, step: next - curEv, err: err };
+  }
+
+  // 能力探测 → 三档降级路径（设计文档 §7.1）。摄像头能力差异极大，
+  // 且部分 UVC 的 getCapabilities() 直接抛异常，调用方必须包 try
+  function pickExposurePlan(cap, settings) {
+    if (!cap || typeof cap !== 'object') return { tier: 0, reason: 'no-capabilities' };
+    if (cap.exposureCompensation && typeof cap.exposureCompensation.min === 'number') {
+      return {
+        tier: 1,
+        reason: 'exposure-compensation',
+        min: cap.exposureCompensation.min,
+        max: typeof cap.exposureCompensation.max === 'number' ? cap.exposureCompensation.max : 0,
+        step: cap.exposureCompensation.step || 0
+      };
+    }
+    var modes = cap.exposureMode || [];
+    if (modes.indexOf('manual') >= 0 && (cap.exposureTime || cap.iso)) {
+      // 只有 min 才能定下「压到哪」。设备只报 exposureTime.max（无 min）又无 iso 能力时，
+      // buildExposureConstraints 会退化成「切了 manual 却不发任何曝光值」——画面根本
+      // 不会被压暗，但渲染层徽标仍显示「曝光补偿 xEV」，用户看到的反馈与事实不符。
+      // 这类能力残缺的设备一律降级 tier0（软件兜底，徽标如实显示「软件压暗」）。
+      // 注意别误伤「有 min 无 max」的正常设备：那种由下面的 1e9 兜底覆盖，仍算 tier2
+      var timeMin = cap.exposureTime && typeof cap.exposureTime.min === 'number' ? cap.exposureTime.min : null;
+      var isoMin = cap.iso && typeof cap.iso.min === 'number' ? cap.iso.min : null;
+      if (timeMin == null && isoMin == null) return { tier: 0, reason: 'manual-without-min' };
+      return {
+        tier: 2,
+        reason: 'manual-exposure',
+        baseTime: settings && settings.exposureTime ? settings.exposureTime : null,
+        baseIso: settings && settings.iso ? settings.iso : null,
+        timeMin: timeMin,
+        timeMax: cap.exposureTime && typeof cap.exposureTime.max === 'number' ? cap.exposureTime.max : 1e9,
+        isoMin: isoMin,
+        isoMax: cap.iso && typeof cap.iso.max === 'number' ? cap.iso.max : 1e9,
+        restoreMode: modes.indexOf('continuous') >= 0 ? 'continuous' : 'manual-baseline'
+      };
+    }
+    return { tier: 0, reason: 'unsupported' };
+  }
+
+  // 按档位构造曝光约束。红线：绝不夹带 width/height/frameRate ——
+  // 曝光调整碰分辨率键会破坏 applyMaxResolution 的锁定（项目纪律）
+  function buildExposureConstraints(plan, ev) {
+    if (!plan || plan.tier === 0) return null;
+    if (plan.tier === 1) {
+      var v = ev;
+      // 按设备步长取整：部分 UVC 对非步长整数倍的补偿直接拒绝。
+      // isFinite 守卫不可省：有设备把 step 报成 Infinity，而
+      // Math.round(ev / Infinity) * Infinity === NaN —— NaN 会一路送进
+      // applyConstraints（被静默忽略或直接 reject），那样负补偿等于没发。
+      // 步长不可用时原样透传 ev（绝大多数设备本身就接受任意小数）
+      if (plan.step > 0 && isFinite(plan.step)) v = Math.round(ev / plan.step) * plan.step;
+      if (v < plan.min) v = plan.min;
+      if (v > plan.max) v = plan.max;
+      return { advanced: [{ exposureMode: 'continuous', exposureCompensation: v }] };
+    }
+    // tier2 手动档：EV 负补偿 = 曝光时间 ×2^ev；优先压时间不升 iso
+    // （升 iso 只加噪点不救过曝，时间才是曝光量的主轴）
+    var adv2 = { exposureMode: 'manual' };
+    if (plan.baseTime && plan.timeMin != null) {
+      var t = plan.baseTime * Math.pow(2, ev);
+      if (t < plan.timeMin) t = plan.timeMin;
+      if (t > plan.timeMax) t = plan.timeMax;
+      adv2.exposureTime = t;
+    } else if (plan.baseIso && plan.isoMin != null) {
+      var iso = plan.baseIso * Math.pow(2, ev);
+      if (iso < plan.isoMin) iso = plan.isoMin;
+      if (iso > plan.isoMax) iso = plan.isoMax;
+      adv2.iso = iso;
+    }
+    // 不变式：产不出具体曝光值就绝不发 manual 约束。
+    // 上游 pickExposurePlan 只守住了「能力里没有 min」，守不住「能力有 min 但
+    // getSettings() 不给基线」这种组合（baseTime / baseIso 为 null）——那类设备
+    // 会被切进手动模式却拿不到曝光量，画面根本不会变暗，而渲染层徽标仍显示
+    // 「曝光补偿 xEV」，属于用户可见的撒谎。把守点下沉到构造函数末尾，任何
+    // 上游判定遗漏的组合在这里都会被封死。
+    if (adv2.exposureTime === undefined && adv2.iso === undefined) return null;
+    return { advanced: [adv2] };
+  }
+
+  // 恢复约束：最小约束原则（只发必须发的键）—— 多发一个键就多一次
+  // Overconstrained / 悬挂风险。tier1 只把补偿归零；tier2 切回 continuous
+  // 把曝光交还 AE（切回连续后 time/iso 约束自动失效，无需逐个还原）
+  function buildExposureRestoreConstraints(plan) {
+    if (!plan || plan.tier === 0) return null;
+    if (plan.tier === 1) return { advanced: [{ exposureCompensation: 0 }] };
+    if (plan.restoreMode === 'continuous') return { advanced: [{ exposureMode: 'continuous' }] };
+    var adv = { exposureMode: 'manual' };
+    if (plan.baseTime) adv.exposureTime = plan.baseTime;
+    if (plan.baseIso) adv.iso = plan.baseIso;
+    return { advanced: [adv] };
+  }
+
+  // 软件兜底查找表：out = 255×(in/255)^(2^-ev)
+  // 为什么用 gamma 而不是线性乘：线性乘把中间调成比例压暗，黑衣物的褶皱
+  // 纹理全挤在 0 附近直接死黑；gamma 曲线压暗的同时保住暗部层次
+  function buildExposureLut(ev) {
+    var lut = new Uint8ClampedArray(256);
+    if (!ev || ev >= 0) {
+      for (var i0 = 0; i0 < 256; i0++) lut[i0] = i0;
+      return lut;
+    }
+    var g = Math.pow(2, -ev);
+    for (var i = 0; i < 256; i++) lut[i] = Math.round(255 * Math.pow(i / 255, g));
+    return lut;
   }
 
   // 错误分类：fatal=true 表示不可重试（权限/无设备/安全上下文）
@@ -381,6 +677,13 @@
     // 未注入时（Node 单测 / 无痕模式）一律 no-op，退化为「每次全量枚举」
     var loadPref = typeof opt.loadResolutionPref === 'function' ? opt.loadResolutionPref : null;
     var savePref = typeof opt.saveResolutionPref === 'function' ? opt.saveResolutionPref : null;
+    // 曝光辅助的 4 个注入（黑色衣物过曝防护）。与 blackFrameEnabled 同一模式：
+    // 控制器是纯逻辑模块，不碰 DOM、不读 document、不读 localStorage。
+    // 未注入时一律按「不拦 / 不启用」处理，既有调用方不受任何影响
+    var gridSampler = typeof opt.gridSampler === 'function' ? opt.gridSampler : null;
+    var pageVisible = typeof opt.pageVisible === 'function' ? opt.pageVisible : null;
+    var focusBusy = typeof opt.focusBusy === 'function' ? opt.focusBusy : null;
+    var exposureAssistEnabled = typeof opt.exposureAssistEnabled === 'function' ? opt.exposureAssistEnabled : null;
 
     var alive = false;
     var state = STATES.UNINIT;
@@ -406,7 +709,7 @@
     var trackBinds = [];
     var deviceBound = false;
 
-    var listeners = { state: [], error: [], devices: [] };
+    var listeners = { state: [], error: [], devices: [], exposure: [] };
 
     function on(name, cb) {
       if (typeof cb !== 'function') return function () {};
@@ -511,6 +814,7 @@
         try { ct(ts[j]); } catch (e2) {}
       }
       clearDegradedWatch();
+      clearExposureWatch();
     }
 
     function clearDegradedWatch() {
@@ -571,6 +875,10 @@
 
     // I1：唯一的「停止当前活跃流」入口
     function releaseActive(reason) {
+      // 曝光恢复必须赶在 stream=null（activeTrack 会失效）与 track.stop() 之前点火：
+      // 流一停，设备上的负补偿就再也还回不去了。best-effort、不 await、失败只留痕
+      if (expAssist.state === 'ACTIVE' && expAssist.dirty) restoreExposure('release');
+      stopExposureAssist('release', false);
       var s = stream;
       stream = null;
       openPromise = null;
@@ -676,6 +984,9 @@
         clearDegradedWatch();
         setState(STATES.LIVE, 'unmuted');
         log('info', 'CAM_LIVE', { seq: seq, device: shortDeviceId(preferredId), res: resField(), reason: 'unmuted', flap: flapCount });
+        // 同一 track 复活：曝光辅助重启（内部先尽力恢复上一会话的补偿
+        // 再归零，否则设备停在降曝态而内部状态已重置，两边会对不上）
+        startExposureAssist(mySeq);
       } else {
         startDegradedWatch(mySeq);
       }
@@ -699,6 +1010,338 @@
         reconnect('muted');
       }, cfg.degradedWatchMs);
       timers.push(degradedTimer);
+    }
+
+    /* ---------- 曝光辅助：黑色衣物过曝防护（设计文档 docs/exposure-assist-design.md）----------
+     * 自包含闭环：检测（纯函数）→ 滞回决策 → 执行（applyConstraints 竞速）→ 恢复。
+     * 不碰 DOM、不碰 localStorage；帧数据经注入的 gridSampler 取得。
+     * 三态：OFF（禁用/无采样器）/ IDLE（在测未命中）/ ACTIVE（已介入）。
+     * 所有对外副作用（日志、约束下发）都被包在里面，任何异常都不得影响预览与拍照主链。
+     */
+    var expAssist = {
+      state: 'OFF',      // OFF（禁用/无采样器）/ IDLE / ACTIVE
+      st: { state: 'IDLE', hit: 0, miss: 0, engagedAt: 0, releasedAt: 0 },
+      ev: 0,
+      tier: 0,
+      plan: null,
+      dirty: false,      // 本会话是否真的改过设备曝光（决定要不要恢复）
+      lastSceneMean: null,
+      lastSubjectMean: null,
+      lastSubjectRatio: null,
+      adjusts: 0,
+      fails: 0,
+      lastApplyAt: 0
+    };
+    var expWatch = null;
+
+    function expEnabled() {
+      if (!gridSampler) return false;
+      try { return exposureAssistEnabled() !== false; } catch (e) { return false; }
+    }
+
+    // LIVE 后启动。内部先 stopExposureAssist('restart', true)：DEGRADED→LIVE
+    // 复活时同一 track 上可能还挂着上一会话的负补偿，必须先尽力恢复再归零，
+    // 否则设备停在降曝态而内部状态已重置，两边会对不上
+    function startExposureAssist(mySeq) {
+      stopExposureAssist('restart', true);
+      if (!expEnabled()) return;
+      expAssist.state = 'IDLE';
+      expAssist.st = { state: 'IDLE', hit: 0, miss: 0, engagedAt: 0, releasedAt: 0 };
+      expAssist.ev = 0;
+      expAssist.tier = 0;
+      expAssist.plan = null;
+      expAssist.dirty = false;
+      expAssist.lastSceneMean = null;
+      expAssist.lastSubjectMean = null;
+      expAssist.lastSubjectRatio = null;
+      expAssist.adjusts = 0;
+      expAssist.fails = 0;
+      expAssist.lastApplyAt = 0;
+      scheduleExposureCycle(mySeq, cfg.expEngageDelayMs);
+    }
+
+    function scheduleExposureCycle(mySeq, delay) {
+      clearExposureWatch();
+      expWatch = st(function () {
+        var firedId = expWatch;
+        expWatch = null;
+        // 回调触发时把自身 id 从 timers 摘掉，避免数组随周期单调增长
+        if (firedId != null) {
+          var ti = timers.indexOf(firedId);
+          if (ti >= 0) timers.splice(ti, 1);
+        }
+        if (mySeq !== seq || !alive) return;
+        exposureCycle(mySeq);
+      }, delay);
+      timers.push(expWatch);
+    }
+
+    function clearExposureWatch() {
+      if (expWatch == null) return;
+      try { ct(expWatch); } catch (e) {}
+      var i = timers.indexOf(expWatch);
+      if (i >= 0) timers.splice(i, 1);
+      expWatch = null;
+    }
+
+    // 停止辅助；restore=true 且 dirty 时把设备曝光还回去。
+    // 新流（attemptOnce 路径）本来就是默认曝光，此时 dirty=false，
+    // 不会白发一次 applyConstraints —— 那也是给爱悬挂的 UVC 添堵
+    function stopExposureAssist(reason, restore) {
+      clearExposureWatch();
+      if (restore && expAssist.dirty) restoreExposure(reason);
+      expAssist.state = expEnabled() ? 'IDLE' : 'OFF';
+      expAssist.st = { state: 'IDLE', hit: 0, miss: 0, engagedAt: 0, releasedAt: 0 };
+      expAssist.ev = 0;
+      expAssist.tier = 0;
+      expAssist.plan = null;
+      expAssist.dirty = false;
+      emitExposure();
+    }
+
+    async function exposureCycle(mySeq) {
+      try {
+        // 闸门组：仅 LIVE + 页面可见 + 采样器可用。对焦脉冲期间整个周期跳过 ——
+        // single-shot 期间部分 UVC 停输出，此时的帧统计全是噪声，且曝光
+        // applyConstraints 与对焦 applyConstraints 交叠有回弹风险
+        if (mySeq !== seq || !alive || state !== STATES.LIVE) return;
+        if (!expEnabled()) { stopExposureAssist('disabled', false); return; }
+        if (pageVisible && !pageVisible()) {
+          log('info', 'CAM_EXP_SKIP', { seq: seq, reason: 'page-hidden' });
+          scheduleExposureCycle(mySeq, cfg.expCycleMs);
+          return;
+        }
+        if (focusBusy && focusBusy()) {
+          log('info', 'CAM_EXP_SKIP', { seq: seq, reason: 'focus-pulse' });
+          scheduleExposureCycle(mySeq, cfg.expCycleMs);
+          return;
+        }
+        var el = safeVideo();
+        if (!frameReady(el)) { scheduleExposureCycle(mySeq, cfg.expCycleMs); return; }
+        var image = null;
+        try { image = gridSampler(el, cfg.expGridSize); } catch (e) { image = null; }
+        var cells = computeGridStats(image, cfg.expGridCells);
+        if (!cells) { scheduleExposureCycle(mySeq, cfg.expCycleMs); return; }
+        var cl = classifyExposureGrid(cells, cfg);
+        expAssist.lastSceneMean = cl.sceneMean;
+        expAssist.lastSubjectMean = cl.subjectMean;
+        expAssist.lastSubjectRatio = cl.subjectRatio;
+        var h = stepAssistHysteresis(expAssist.st, cl.hit, now(), cfg);
+        expAssist.st = h.st;
+        if (h.action === 'engage') await engageAssist(mySeq, cl);
+        else if (h.action === 'release') releaseAssist('no-hit');
+        else if (expAssist.state === 'ACTIVE') await tickClosedLoop(mySeq, cl);
+        if (mySeq !== seq || !alive) return;
+        scheduleExposureCycle(mySeq, cfg.expCycleMs);
+      } catch (e) {
+        // 曝光辅助任何意外都不得影响预览/拍照主链：记一条日志，下个周期再来
+        log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'cycle-error', err: { name: (e && e.name) || 'Error', message: (e && e.message) || String(e) } });
+        if (mySeq === seq && alive) scheduleExposureCycle(mySeq, cfg.expCycleMs);
+      }
+    }
+
+    async function engageAssist(mySeq, cl) {
+      var track = activeTrack();
+      expAssist.state = 'ACTIVE';
+      expAssist.ev = 0;
+      expAssist.adjusts = 0;
+      expAssist.fails = 0;
+      if (!track || typeof track.getCapabilities !== 'function') {
+        expAssist.tier = 0;
+        expAssist.plan = null;
+        log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'no-track-capability', tier: 0 });
+        emitExposure();
+        return;
+      }
+      var cap = null;
+      var settings = null;
+      try { cap = track.getCapabilities(); } catch (e) { cap = null; }
+      try { settings = track.getSettings(); } catch (e2) { settings = null; }
+      var plan = pickExposurePlan(cap, settings);
+      expAssist.plan = plan;
+      expAssist.tier = plan.tier;
+      log('info', 'CAM_EXP_ENUM', { seq: seq, tier: plan.tier, reason: plan.reason });
+      if (plan.tier === 0) {
+        // 硬件不支持：不发任何约束，改由拍照时软件压暗（徽标提示「软件压暗」）
+        log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'software-fallback', tier: 0 });
+        emitExposure();
+        return;
+      }
+      // 先把模式切过去（补偿从 0 起，具体压多少交给闭环），失败即降级 tier0
+      var cst = buildExposureConstraints(plan, 0);
+      var ok = await applyExposure(track, cst, mySeq);
+      if (!ok) {
+        expAssist.tier = 0;
+        expAssist.plan = null;
+        log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'engage-apply-failed', tier: plan.tier });
+      } else {
+        expAssist.dirty = true;
+      }
+      log('info', 'CAM_EXP_ENGAGE', {
+        seq: seq,
+        tier: expAssist.tier,
+        ev: expAssist.ev,
+        subjectRatio: Math.round(cl.subjectRatio * 100) / 100,
+        sceneMean: cl.sceneMean == null ? null : Math.round(cl.sceneMean)
+      });
+      emitExposure();
+    }
+
+    async function tickClosedLoop(mySeq, cl) {
+      var nowMs = now();
+      // 频率限制：距上次 apply 不足 max(stepGap, settle) 不动。不足 settle
+      // 说明 AE 还在收敛，此刻测的亮度是过渡值，拿它算步长会过冲
+      if (nowMs - expAssist.lastApplyAt < Math.max(cfg.expStepGapMs, cfg.expSettleMs)) return;
+      var r = nextEvStep(expAssist.ev, cl.subjectMean, cfg);
+      if (r.step === 0) return;
+      if (expAssist.tier === 0) {
+        // 软件兜底档：没有约束可发，EV 照样闭环推进（供拍照时 LUT 使用）。
+        // lastApplyAt 也要记账：否则每周期都来一次，日志会爆炸
+        expAssist.ev = r.ev;
+        expAssist.lastApplyAt = nowMs;
+        expAssist.adjusts += 1;
+        log('info', 'CAM_EXP_STEP', {
+          seq: seq, tier: 0,
+          ev: Math.round(r.ev * 100) / 100,
+          step: Math.round(r.step * 100) / 100,
+          subjectMean: cl.subjectMean == null ? null : Math.round(cl.subjectMean)
+        });
+        emitExposure();
+        return;
+      }
+      var track = activeTrack();
+      if (!track) return;
+      var cst = buildExposureConstraints(expAssist.plan, r.ev);
+      var ok = await applyExposure(track, cst, mySeq);
+      if (!ok) {
+        // 连续失败达到上限：停硬件路径降软件兜底，并把这轮补偿恢复掉
+        if (expAssist.fails >= cfg.expApplyFailLimit) {
+          log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'fail-limit', tier: expAssist.tier });
+          restoreExposure('fail-limit');
+          expAssist.tier = 0;
+          expAssist.plan = null;
+          emitExposure();
+        }
+        return;
+      }
+      expAssist.ev = r.ev;
+      expAssist.lastApplyAt = nowMs;
+      expAssist.adjusts += 1;
+      log('info', 'CAM_EXP_STEP', {
+        seq: seq, tier: expAssist.tier,
+        ev: Math.round(r.ev * 100) / 100,
+        step: Math.round(r.step * 100) / 100,
+        subjectMean: cl.subjectMean == null ? null : Math.round(cl.subjectMean)
+      });
+      emitExposure();
+    }
+
+    // 曝光约束统一竞速：部分 UVC 摄像头 applyConstraints 永不 settle，
+    // 不竞速会把曝光周期（进而拍照前的等待）卡死。与 tryApplyRung 同构
+    async function applyExposure(track, cst, mySeq) {
+      if (!track || !cst || typeof track.applyConstraints !== 'function') return false;
+      // 变量名刻意不用 acw：scripts/verify-camera-res-mutation.js 的 M4 变异体以
+      // 「acw.cancel();」为锚点定位 tryApplyRung 的定时器回收，这里同名会让锚点失配
+      var expW = waitMs(cfg.expApplyTimeoutMs);
+      var err = null;
+      var raced = null;
+      try {
+        raced = await Promise.race([
+          track.applyConstraints(cst).then(function () { return 'ok'; }, function (e) { err = e; return 'err'; }),
+          expW.promise.then(function (v) { return v === false ? 'aborted' : 'timeout'; })
+        ]);
+      } catch (e2) {
+        err = err || e2;
+        raced = 'err';
+      } finally {
+        // 防御性回收，不是正确性支柱：sleep / unmount / 重开流这几条路径上的
+        // clearTimers() 已经兜底清空了 timers[]，删掉这行不会改变 EV、档位或
+        // 下发次数（QA 实测逐项相同），只是运行期间会多残留 1~2 颗已无用的定时器，
+        // 并在超时前继续持有闭包。这里提前释放是为了少一点抖动
+        expW.cancel();
+      }
+      // 'aborted' = 定时器被 clearTimers 打断（卸载/休眠），不算设备故障
+      if (raced === 'aborted') return false;
+      if (raced === 'timeout' || raced === 'err') {
+        expAssist.fails += 1;
+        log('warn', 'CAM_EXP_FALLBACK', {
+          seq: mySeq,
+          reason: raced === 'timeout' ? 'apply-timeout' : 'apply-error',
+          err: err ? { name: (err && err.name) || 'Error', message: (err && err.message) || '' } : null
+        });
+        return false;
+      }
+      expAssist.fails = 0;
+      return true;
+    }
+
+    function releaseAssist(reason) {
+      if (expAssist.state !== 'ACTIVE') return;
+      log('info', 'CAM_EXP_RELEASE', { seq: seq, reason: reason, ev: Math.round(expAssist.ev * 100) / 100 });
+      // 衣物移出画面时 track 还活着，这里的恢复是用户可感知的，必须真发
+      restoreExposure(reason);
+      expAssist.state = 'IDLE';
+      expAssist.st = { state: 'IDLE', hit: 0, miss: 0, engagedAt: 0, releasedAt: now() };
+      expAssist.ev = 0;
+      expAssist.tier = 0;
+      expAssist.plan = null;
+      expAssist.dirty = false;
+      emitExposure();
+    }
+
+    // 恢复曝光：best-effort，点火即忘（sleep/unmount/releaseActive 路径是同步调用它的）。
+    // 刻意不挂 waitMs 竞速定时器：那些路径上 clearTimers() 往往已经跑过，
+    // 再挂一颗定时器就会留下永不回收的悬挂定时 —— 而这里的流马上就停，
+    // 设备重置后设置本来就会丢，失败只需留痕，不需要重排
+    function restoreExposure(reason) {
+      var plan = expAssist.plan;
+      if (!plan || plan.tier === 0 || expAssist.tier === 0) return Promise.resolve(false);
+      var track = activeTrack();
+      var cst = buildExposureRestoreConstraints(plan);
+      if (!track || !cst || typeof track.applyConstraints !== 'function') {
+        log('warn', 'CAM_EXP_RESTORE', { seq: seq, reason: reason, ok: false });
+        return Promise.resolve(false);
+      }
+      var p = null;
+      try {
+        p = Promise.resolve(track.applyConstraints(cst));
+      } catch (e) {
+        p = Promise.reject(e);
+      }
+      p.then(function () {
+        expAssist.dirty = false;
+        log('info', 'CAM_EXP_RESTORE', { seq: seq, reason: reason, ok: true });
+      }, function () {
+        log('warn', 'CAM_EXP_RESTORE', { seq: seq, reason: reason, ok: false });
+      });
+      return Promise.resolve(true);
+    }
+
+    // 黑帧门控放行条件（设计文档 §9.1）。用「刚刚」采的场景均值而不是
+    // 上一个周期的值：挡镜头后 sceneMean 会在一个周期内崩塌，若拿陈旧值
+    // 放行，被遮挡的 release 滞回窗口（≈2.5s）里就可能放进黑照片。
+    // gridSampler 是同步的，重新采一次的代价可接受
+    function expGateSuppress() {
+      if (expAssist.state !== 'ACTIVE' || !gridSampler) return false;
+      var sceneMean = expAssist.lastSceneMean;
+      try {
+        var image = gridSampler(safeVideo(), cfg.expGridSize);
+        var cells = computeGridStats(image, cfg.expGridCells);
+        var cl = cells ? classifyExposureGrid(cells, cfg) : null;
+        if (cl && cl.sceneMean != null) sceneMean = cl.sceneMean;
+      } catch (e) { /* 采样失败时退回上一个周期的值 */ }
+      return sceneMean != null && sceneMean >= cfg.expBlackFloor;
+    }
+
+    function emitExposure() {
+      emit('exposure', {
+        state: expAssist.state,
+        ev: expAssist.ev,
+        tier: expAssist.tier,
+        sceneMean: expAssist.lastSceneMean,
+        subjectMean: expAssist.lastSubjectMean,
+        adjusts: expAssist.adjusts
+      });
     }
 
     function frameReady(el) {
@@ -1147,6 +1790,9 @@
       verifyOutputResolution(el, deviceId, mySeq);
       setState(STATES.LIVE, 'attached');
       log('info', 'CAM_LIVE', { seq: mySeq, device: shortDeviceId(deviceId), res: resField(), attempt: att, flap: flapCount });
+      // 曝光辅助在 LIVE 之后启动，内部再延迟 expEngageDelayMs 避开
+      // 分辨率探测与首帧 AE 收敛窗口
+      startExposureAssist(mySeq);
       return true;
     }
 
@@ -1425,6 +2071,23 @@
       try { samples = frameSampler(target, cfg.sampleSize); } catch (e) { samples = null; }
       if (!samples || !samples.length) return false;
       var r = analyzeGraySamples(samples, { mean: cfg.blackMean, variance: cfg.blackVariance });
+      if (r.black && expGateSuppress()) {
+        // 曝光辅助 ACTIVE 期间的门控放行（设计文档 §9.1）：手动降曝后中心
+        // 区域必然更暗，沿用 blackMean:12 的绝对阈值会把「被正确压暗的
+        // 黑色衣物」误判成「画面全黑」而拒拍。ACTIVE 的成立条件本身已排除
+        // 挡镜头/黑信号（要求高亮参照 ≥ expHiAreaMin、场景均值 ≥ expSceneMeanMin），
+        // 故只保留一条兜底：实时场景均值 ≥ expBlackFloor 才放行。
+        // 为什么这里不守 silent 约定：它不是拒收记录，而是「门控放行了一次
+        // 本会被误拒的拍摄」的证据，且只在黑衣物+辅助激活时出现，量极小
+        log('info', 'CAM_EXP_BLACKGATE', {
+          seq: seq,
+          reason: 'assist-active',
+          sceneMean: expAssist.lastSceneMean == null ? null : Math.round(expAssist.lastSceneMean),
+          mean: Math.round(r.mean * 100) / 100,
+          variance: Math.round(r.variance * 100) / 100
+        });
+        return false;
+      }
       if (r.black && !silent) {
         log('warn', 'CAM_CAPTURE_REJECT', { seq: seq, reason: 'black-frame', mean: Math.round(r.mean * 100) / 100, variance: Math.round(r.variance * 100) / 100 });
       }
@@ -1473,7 +2136,19 @@
         resolutionSource: resolutionSource,
         preferredId: preferredId,
         alive: alive,
-        trackBinds: trackBinds.length
+        trackBinds: trackBinds.length,
+        // 曝光辅助现场复盘：state=ACTIVE & tier=1 & ev=-1.2 = 硬件补偿正常工作；
+        // tier=0 = 设备不支持走软件兜底（照片预览仍过曝是预期）；fails>0 = 约束在失败/超时
+        exposure: {
+          state: expAssist.state,
+          ev: expAssist.ev,
+          tier: expAssist.tier,
+          sceneMean: expAssist.lastSceneMean,
+          subjectMean: expAssist.lastSubjectMean,
+          subjectRatio: expAssist.lastSubjectRatio,
+          adjusts: expAssist.adjusts,
+          fails: expAssist.fails
+        }
       };
     }
 
@@ -1509,6 +2184,23 @@
       // 单入口（暴露出来便于断言 I1/I6）
       releaseActive: releaseActive,
       attachStream: attachStream,
+      // 曝光辅助（黑色衣物过曝防护）：渲染层据此显示徽标与做软件兜底
+      getExposureInfo: function () {
+        return {
+          state: expAssist.state,
+          ev: expAssist.ev,
+          tier: expAssist.tier,
+          sceneMean: expAssist.lastSceneMean,
+          subjectMean: expAssist.lastSubjectMean,
+          adjusts: expAssist.adjusts,
+          fails: expAssist.fails
+        };
+      },
+      onExposureChange: function (cb) { return on('exposure', cb); },
+      // 生命周期由控制器自管理（attemptOnce / handleTrackUnmuted / releaseActive
+      // 内部调用）；暴露出来仅为单测驱动，渲染层不调用
+      startExposureAssist: startExposureAssist,
+      stopExposureAssist: stopExposureAssist,
       // 事件订阅
       onStateChange: function (cb) { return on('state', cb); },
       onError: function (cb) { return on('error', cb); },
@@ -1536,6 +2228,15 @@
     makeResolutionPref: makeResolutionPref,
     buildResolutionConstraints: buildResolutionConstraints,
     RES_PREF_VERSION: RES_PREF_VERSION,
-    STANDARD_RATINGS: STANDARD_RATINGS
+    STANDARD_RATINGS: STANDARD_RATINGS,
+    // 曝光辅助（黑色衣物过曝防护）：纯函数供单测直接断言
+    computeGridStats: computeGridStats,
+    classifyExposureGrid: classifyExposureGrid,
+    stepAssistHysteresis: stepAssistHysteresis,
+    nextEvStep: nextEvStep,
+    pickExposurePlan: pickExposurePlan,
+    buildExposureConstraints: buildExposureConstraints,
+    buildExposureRestoreConstraints: buildExposureRestoreConstraints,
+    buildExposureLut: buildExposureLut
   };
 });
