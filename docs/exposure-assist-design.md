@@ -413,7 +413,7 @@ subjectMean      = subject 格的 mean 平均（EV 闭环的被控量）
 | `expDeadzone` | 8 | 死区：误差 <8 不调整（AE 自身波动 ±几格很正常） |
 | `expEvGain` | 0.025 | 步长增益：误差×0.025=步长(EV)（40 亮度≈1EV） |
 | `expMaxStepEv` | 0.34 | 单步上限 1/3 档（防画面跳变） |
-| `expEvMin` | -2.0 | 累计补偿下限（再暗就逼近黑帧闸门且暗部细节丢失） |
+| `expEvMin` | -3.0 | 累计补偿下限（再暗就逼近黑帧闸门且暗部细节丢失）。**勘误 2026-10：原为 -2.0**，现场数据见 §10 第 6 条：黑白相间鞋在 0→-2.0 全程 subjectMean 仍在 155~182，闭环贴住下限空转永不达标，-2.0 不够，加深到 -3.0 |
 | `expStepGapMs` | 500 | 两次曝光 applyConstraints 最小间隔 |
 | `expSettleMs` | 400 | 单次调整后稳定等待（拿过渡值算步长会过冲） |
 | `expApplyTimeoutMs` | 1000 | 曝光 applyConstraints 超时竞速（UVC 悬挂兜底） |
@@ -473,14 +473,50 @@ ev   = clamp(ev - step, expEvMin, 0)          （下限保护 + 只往防过曝�
 - **为什么闭环而不是一步到位**：AE 会回弹（见风险 R2），固定一步的补偿量在不同光照/衣物反光下不是过就是欠；闭环按实测亮度持续修正，天然抗回弹。
 - **为什么上限锁 0**：本方案只解决「过曝」；欠曝场景（画面整体偏暗）交给 AE 自己，正补偿不在职责内。
 
+> **勘误 2026-10（下限加深）**：本节公式中的 `expEvMin` 原为 `-2.0`。现场（黑白相间鞋、
+> 白色鞋底完全过曝裁剪）日志显示 ev 从 0 压到 -2.0 期间 `subjectMean` 始终 155~182，
+> 闭环贴住下限空转、永不达标。按亮度模型 `mean = 150×2^(ev/2.2)` 推演：旧下限 -2.0 处
+> 仍有 err≈22（> 死区 8），而加深到 -3.0 后闭环在 ev≈-2.72 处落入死区真正收敛
+> （`verify-camera-exposure.js` D14/D15/D16 逐项断言）。§6.2 阈值表、§8.1 代码段与
+> 实现均已同步为 -3.0。注意实际下发仍受设备 `cap.exposureCompensation.min` 二次钳位。
+
 #### 7.3 软件兜底（`buildExposureLut`，仅 tier0）
 
 ```
-out = 255 × (in/255)^(2^-ev)        ev 为负 → 指数 >1 → 压暗
+out = in × 2^(ev / gamma)           gamma = 2.2（sRGB 编码指数，与 §7.5 判定同源）
+                                    ev 为负 → 系数 <1 → 压暗
 ```
 
-- **为什么用 gamma 而不是线性乘**：线性乘按比例压暗，黑衣物的褶皱纹理全挤在 0 附近直接死黑；gamma 曲线压暗的同时保住暗部层次——而层次恰恰是黑色衣物照片的唯一信息量。
-- LUT 是 `Uint8ClampedArray(256)` 纯函数产出，Node 可单测（单调性/端点/幂次）；渲染层在 `capture()` 里逐像素套用，**只改存档图，不改预览**（徽标会说明）。
+> **勘误 2026-10（QA DEF-1，严重）**：本节原为 `out = 255 × (in/255)^(2^-ev)`。那是在**码值域做幂
+> 运算**：设码值 V ∝ L^(1/2.2)，则 V^(2^-ev) ∝ L^(2^-ev)，等价于把线性光**取幂** L → L^(2^-ev)，
+> 而不是曝光补偿应有的 L → L×2^ev。于是本模块里曾同时存在两套「EV 的定义」（§7.5 判定用 sRGB
+> 模型、§7.3 兜底用幂次曲线）。实测 `ev=-3`（tier0 闭环顶到 `expEvMin` 后的真实取值）：
+>
+> | 输入码值 | 旧 LUT | 正确值 | 后果 |
+> | --- | --- | --- | --- |
+> | 150（黑衣物主体） | 4 | 58（= `expTargetMean`） | 存档图被压成近全黑 |
+> | 255（白色鞋底裁剪） | 255 | 99 | **被裁剪的白色一点没救回来**（现场投诉的正是这项） |
+> | 20 / 30 / 45 / 60（褶皱暗部） | 0 / 0 / 0 / 0 | 8 / 12 / 17 / 23 | 暗部层次被抹平 |
+> | 等效实际 EV | -1EV→-2.19EV、-2EV→-5.05EV、-3EV→**-12EV** | 1:1 | 越深偏差越离谱 |
+>
+> 为什么这轮才致命：① 幽灵能力检测把设备导向 tier0（原先 tier0 只在「设备根本没能力」时才到）；
+> ② `expEvMin` 加深到 -3.0，而 -3.0 的依据正是「150 → 58 需要 -3EV」（sRGB 模型）——下限越深、
+> 幂次曲线的偏差越大。
+>
+> 为什么既有测试没抓住：主检对 LUT 只有单调性/端点断言，**没有任何「压暗量 vs EV」的语义校验**；
+> 而 tier0「不参与有效性验证、只改存档图」的例外让预览采样永远看不到 LUT 的效果。已补 E46~E50
+> 五条语义断言 + M34 负向对照（把 LUT 退回幂次曲线必须转红）。
+
+- **为什么是「码值域乘法」而不是幂次曲线**：硬件的曝光补偿做的是线性光等比例缩放（L → L×2^ev），8bit 码值域因此是一次乘法（×2^(ev/gamma)）。软件兜底要假装自己是硬件，就必须用同一条曲线——否则「判定说该降 27%」与「兜底实际压掉 96%」会同时成立。原始理由「幂次曲线保住暗部层次」也随之更正：真正保住层次的是**等比例压暗**（暗部按比例一起降，相对关系不变），幂次曲线恰恰是把暗部压死的那个。
+- LUT 是 `Uint8ClampedArray(256)` 纯函数产出，Node 可单测（单调性/端点/**压暗量语义**）；渲染层在 `capture()` 里逐像素套用，**只改存档图，不改预览**（徽标会说明）。
+
+#### 7.3.1 tier0 的 EV 取解析解（不用闭环，`solveTier0Ev`）
+
+`solveTier0Ev(subjectMean, cfg)`：`ev = clamp(gamma × log2(expTargetMean / subjectMean), expEvMin, 0)`。
+
+**为什么 tier0 不能用 `nextEvStep` 的闭环**：tier0 只改存档图、不改预览，闭环读到的 `subjectMean` 永远是**没被压暗的原图**，误差恒为正 → EV 一路撞到 `expEvMin`。实测主体 100（只需 -1.73EV）却取了 -3.00EV，存档被过压 1.27 档；主体 130 只需 -2.56EV。而解析解直接解 `code × 2^(ev/gamma) = expTargetMean`，一步到位且不会过压。语义断言 E51~E57（含「解析解自洽：按解压暗后确实落在目标附近」），负向对照 M35（tier0 退回闭环步进必须转红）。
+
+> 为什么 -3.0 的下限仍然保留：解析解会撞到 `expEvMin`，主体比 150 更亮时（如 182 需要 -3.63EV）下限就是「最多只能压这么多」的护栏，与 tier1/tier2 共用同一个常量，避免三档出现三个「下限」。
 
 #### 7.4 恢复条件表
 
@@ -493,6 +529,59 @@ out = 255 × (in/255)^(2^-ev)        ev 为负 → 指数 >1 → 压暗
 | DEGRADED → LIVE（同一 track 复活） | `handleTrackUnmuted` → `startExposureAssist` | 先尽力恢复上一会话补偿再归零重启（`expDirty` 标记避免新流上白发一次多余 applyConstraints） | 尽力而为 + 下个周期自愈 |
 
 **为什么 DEGRADED 复活要「先恢复再归零」**：mute/unmute 不重建 track，设备上的负补偿还在；若内部状态直接归零而设备停在降曝态，两边会对不上，画面会莫名偏暗直到下一次 engage。
+
+#### 7.5 补偿有效性验证与档位自动降级（幽灵能力，现场 2026-10 补）
+
+**症状**（`camera-20261022.log`）：拍黑白相间的鞋，白色鞋底完全过曝裁剪。徽标显示「曝光补偿 -2.0EV」，但画面一点没暗。日志：
+
+```
+CAM_EXP_ENGAGE ev:0  sceneMean:191
+CAM_EXP_STEP   ev:-0.34  subjectMean:170
+CAM_EXP_STEP   ev:-0.68  subjectMean:168
+...（全程 155~182 噪声波动）
+CAM_EXP_STEP   ev:-2.00  subjectMean:166   ← 贴住 expEvMin 空转
+```
+
+**根因**：这台设备的 `exposureCompensation` 是**幽灵能力**——`getCapabilities()` 报告有 min/max、`applyConstraints()` 不报错、甚至 `getSettings()` 也会回显，但画面亮度完全不受影响。闭环因此永远不达标：它只会一路把 ev 推到下限，然后贴在那里空转。
+
+**为什么没有 API 能提前识别**：Chromium 只暴露「能力声明」，不保证「能力生效」。UVC 驱动什么都敢报，`exposureTime` 同样可能是幽灵能力。唯一可信的判据是**实测**：发了补偿，亮度有没有按预期方向降。
+
+**判定（`judgeExposureEffect` 纯函数）**：
+
+```
+expected = 1 − 2^(ev / gamma)          // 8bit 灰度是 sRGB 编码：线性光 ×2^ev → 码值 ×2^(ev/gamma)
+need     = expected × ratio            // 实测降幅只要达到预期的一半就算有效（留一倍余量）
+drop     = (baseline − mean) / baseline
+verdict  = 连续 hits 次 drop < need → 'ineffective'
+           任一一次 drop ≥ need     → 'effective'（滞回清零）
+           证据不足                  → 'pending'
+```
+
+- `baseline` = 本档位开始时的 `subjectMean`；`mean` = 每次下发后**过完 settle** 测到的稳态 `subjectMean`。
+- 只判**实际下发**的补偿量（`appliedEvOf()`：闭环算出的 ev 会被设备步长取整、min/max 钳位，拿它算预期会高估）。
+- `ev = -1` 对应预期降幅 27%；`ratio=0.5` 即要求实测至少降 13.8%——现场幽灵设备的实测降幅是 **0**（甚至反向），离阈值很远，判定面很干净。
+
+**判定参数**（`EXP_EFFECT`，单测可用 `expEffect*` 覆盖；**刻意不进 DEFAULTS**——DEFAULTS 的 `exp*` 项与 §6.2 阈值表一一对应，QA 按 26 项对拍，新增判定参数另立一表）：
+
+- `windowMs`：2000 —— engage / 换档后先等这么久再判。刚下发模式切换时 AE 与驱动都在重收敛，此时的亮度变化不能用来判设备能力（**防误伤的第一道闸**）。
+- `minSteps`：3 —— 至少下发过 3 步补偿才判，前两步还混着 AE 收敛。
+- `minEv`：1.0 —— 累计补偿至少 1EV 才判。更浅的补偿在 8bit 上只对应几个百分点的亮度变化，会被 AE 抖动和衣物微动淹没。例外：已 `pinned`（贴住 EV 下限或设备把值钳死）时不受此限——那正是现场「压不动还在判」的形态。
+- `gamma`：2.2 —— sRGB 编码指数。
+- `ratio`：0.5 —— 预期降幅的达成系数（抗 AE 回弹余量）。
+- `hits`：2 —— **滞回**：连续 2 次不达标才判无效，单帧不判。AE 收敛、衣物微动、行人掠过都会让单帧亮度偏高，一次误判就会把好设备降成软件兜底（那比过曝更糟：预览不再变化，用户以为功能坏了）。
+
+**降级链（`demoteExposurePlan`）**：`tier1 → tier2 → tier0`，一路只往下走，最多两次。
+
+- tier1 无效：把 `exposureCompensation` 从能力对象里摘掉再探测 → 有 manual 且**真能产出曝光值**（`buildExposureConstraints(next, -1) !== null`，防「切了手动却不压暗」）→ tier2；否则 tier0。
+- tier2 无效：tier0（软件 LUT 压暗，徽标如实显示「软件压暗」）。
+- 每一步降级：① 先把当前档位的约束还回去（补偿归零 / 切回 continuous，**否则两份曝光偏置会叠在同一台设备上**）→ ② 重新探测 → ③ **ev 归零 + 基线与观测序列重置**（补偿与曝光时间不是同一个量纲，继承旧 ev 没有意义）→ ④ 对新档位重新做一次有效性验证（tier2 也可能是幽灵能力）。
+- 留痕：`CAM_EXP_FALLBACK`，`reason` = `comp-ineffective`（tier1 无效）/ `manual-ineffective`（tier2 无效）/ `demote-apply-failed`（换档后的首次 apply 失败）。`reason` 是 FIXED_KEY，不占附加字段额度。
+
+> **为什么 tier0 不参与有效性验证**：软件兜底作用于存档图（拍照时 LUT 压暗），不影响预览采样——拿预览亮度去判它「有没有生效」会永远判成无效，只会制造假降级。
+
+**降级结论的会话级记忆（QA 观察项 U19）**：「本设备某档位无效」是**设备**的属性，不是单次 engage 的属性。若只在单次 engage 内记住，幽灵设备每放一件衣物都要重走一次约 4s 的「徽标显示 -xEV、画面其实没压暗」窗口——那正是现场投诉的形态。实现：控制器内按 `deviceId` 记一张 `{tier: true}` 表，下次 engage 直接跳过该档（留痕 `CAM_EXP_FALLBACK{reason:'ghost-remembered', from, tier}`）；换设备（deviceId 变化）即清空，不串档。**只有「实测无效」才记账**：apply 失败/超时可能是设备忙，记进去会把好设备永久挡在硬件档之外（比误降级更难排查）。负向对照 M36（记忆被删掉 → 换衣物又重走无效窗口必须转红）、M37（记忆不按 deviceId 区分 → 换摄像头串档必须转红）。
+
+**已知边界（QA U4b，本次不改）**：判定用 engage 时刻的固定基线算降幅，与补偿无关的**整体变亮**（环境光持续变亮 ≥6 码值/秒，判定前累计约 50 码值）会被算进「没响应」，理论上可能误判好设备。不改的原因：现场 AE 处于 `continuous` 模式时会自行抵消环境光漂移；且改为「按 Δev 的增量判定」会让单次判据的预期降幅降到 ~10%（0.34EV），噪声 ±8 码值下判别力反而变差。已记入 §10 第 7 条，待现场日志（`CAM_EXP_FALLBACK` 中 `drop` 接近 0 但设备其实可用）积累后再评估。
 
 ---
 
@@ -530,7 +619,7 @@ out = 255 × (in/255)^(2^-ev)        ev 为负 → 指数 >1 → 压暗
     expDeadzone: 8,              // 死区：AE 自身波动 ±几格很正常，不动
     expEvGain: 0.025,            // 步长增益：误差×0.025=步长(EV)
     expMaxStepEv: 0.34,          // 单步上限 1/3 档：小步逼近防画面跳变
-    expEvMin: -2.0,              // 累计下限：再暗就逼近黑帧闸门、暗部细节也没了
+    expEvMin: -3.0,              // 累计下限（§7.2 勘误：原 -2.0，现场贴住下限不收敛）
     expStepGapMs: 500,           // 两次曝光 applyConstraints 最小间隔
     expSettleMs: 400,            // 单次调整后稳定等待：拿过渡值算步长会过冲
     expApplyTimeoutMs: 1000,     // 曝光 applyConstraints 超时竞速（UVC 悬挂兜底）
@@ -1325,12 +1414,22 @@ out = 255 × (in/255)^(2^-ev)        ev 为负 → 指数 >1 → 压暗
 | --- | --- | --- | --- |
 | `CAM_EXP_ENUM` | info | engage 时能力探测完成 | `tier`, `reason` |
 | `CAM_EXP_ENGAGE` | info | 进入 ACTIVE | `tier`, `ev`, `subjectRatio`, `sceneMean` |
-| `CAM_EXP_STEP` | info | 每次 EV 调整 | `tier`, `ev`, `step`, `subjectMean` |
+| `CAM_EXP_STEP` | info | 每次 EV 调整 | `tier`, `ev`, `step`, `subjectMean`, `clipRatio` |
 | `CAM_EXP_RELEASE` | info | 退出 ACTIVE | `ev`（`reason` 为 FIXED） |
 | `CAM_EXP_RESTORE` | info | 恢复曝光完成 | `ok`（`reason` 为 FIXED） |
 | `CAM_EXP_SKIP` | info | 周期跳过 | 无（`reason` 为 FIXED） |
-| `CAM_EXP_FALLBACK` | warn | 硬件路径失效/降级 | `tier`（`reason`/`err` 为 FIXED） |
+| `CAM_EXP_FALLBACK` | warn | 硬件路径失效/降级 | `tier`（`reason`/`err` 为 FIXED）。幽灵能力降级追加 `from`, `ev`, `drop` |
 | `CAM_EXP_BLACKGATE` | info | 黑帧门控放行一次本会被误拒的拍摄 | `sceneMean`, `mean`, `variance` |
+
+`CAM_EXP_STEP` 的 `clipRatio`（高光裁剪占比，千分位）：白色鞋底 / 白垫板「还在被裁剪」是过曝的直接证据。`classifyExposureGrid` 早就算出了 clip，只是没透出——现场调参时没有它只能靠猜。
+
+`CAM_EXP_FALLBACK` 新增 reason 取值（FIXED_KEY，不占附加字段额度）：
+
+| reason | 含义 | 追加字段 |
+| --- | --- | --- |
+| `comp-ineffective` | tier1 的 exposureCompensation 是幽灵能力（发了补偿亮度不降） | `tier`（降级**后**的档位）, `from`（原档位）, `ev`, `drop`（实测降幅） |
+| `manual-ineffective` | tier2 的 manual 曝光同样是幽灵能力 | 同上 |
+| `demote-apply-failed` | 降级换档后的首次 applyConstraints 失败 | `tier` |
 
 #### 9.6 `snapshot()` 新增字段
 
@@ -1349,7 +1448,8 @@ exposure: { state, ev, tier, sceneMean, subjectMean, subjectRatio, adjusts, fail
 3. **摄像头能力名以 Chromium 标准为准**。部分 UVC 经 DirectShow 适配层可能暴露非标能力，会落到 tier0 软件兜底（功能降级但可用）；真机 QA 需记录各店设备实际档位。
 4. **构图占比极大的黑色衣物（占画面 80%+）不触发**（`expSubjectAreaMax=0.75` 保守上限）。此场景是否也要防护，待产品确认——保守选择的代价是「几乎满画面的黑衣物」仍可能过曝。
 5. **软件兜底只改存档图不改预览**（tier0 时预览仍过曝）。用户是否预期「预览也变暗」待产品确认；硬件档（t1/t2）预览与存档一致。
-6. **EV 下限 −2.0 是否够**（极黑衣物 + 强环境光下）待现场数据；`CAM_EXP_STEP` 日志中 ev 长时间贴住 -2.0 且 subjectMean 仍 >80 即需要加深。
+6. ~~**EV 下限 −2.0 是否够**（极黑衣物 + 强环境光下）待现场数据~~ —— **已于 2026-10 用现场数据结案**：黑白相间鞋那台设备 ev 压到 -2.0 时 subjectMean 仍 155~182（>80 判据成立），确认 -2.0 不够，已加深到 **-3.0**（见 §7.2 勘误、§6.2 阈值表）。遗留观察点：加深后若某台设备出现「收敛到 -3.0 仍不达标」，那已经不是下限问题，而是该设备的曝光能力整体失效 —— 应走 §7.5 的幽灵能力降级路径（日志里应能看到 `comp-ineffective` / `manual-ineffective`）。
+7. **判定基线的环境光漂移边界（QA U4b，2026-10 新增）**：环境光持续变亮 ≥6 码值/秒时，好设备可能被误判成幽灵能力（固定基线算出的降幅被整体变亮抵消）。现场 `continuous` 模式下 AE 会自行抵消，风险可控；若 `CAM_EXP_FALLBACK` 里出现 `drop≈0` 但换衣/遮挡后又能正常压暗的记录，即为该边界命中，届时改按 Δev 增量判定。
 
 ---
 
@@ -1406,7 +1506,18 @@ exposure: { state, ev, tier, sceneMean, subjectMean, subjectRatio, adjusts, fail
 - **优先级**：P1
 - **验收**：`npm run verify` 全链通过；真机 QA 清单（见 §15 R6）逐项打勾
 
-**任务划分说明**：4 个任务呈层级链（契约 → 纯函数 → 编排 → 渲染层），这是本设计的最小可行切分——检测/决策数学不落地，编排无从测试；编排 api 不定稿，渲染层无法集成。每个任务 ≥3 个相关文件、按模块分组，配置文件（package.json）与契约登记（ENUM）集中在 T01，未分散。
+#### T05 现场缺陷修复：幽灵能力检测 + 档位自动降级（2026-10 追加）
+
+- **源文件**：
+  - `renderer/camera-controller.js`：`expEvMin` 由 -2.0 加深到 -3.0（§7.2 勘误）；新增 `EXP_EFFECT` 判定参数表与 `judgeExposureEffect` / `appliedEvOf` / `demoteExposurePlan` 三个纯函数（§7.5）；编排层新增 `resetEffectWatch` / `recordEffectSample` / `demoteExposureTier`，`CAM_EXP_STEP` 追加 `clipRatio`
+  - `scripts/verify-camera-exposure.js`：新增 O 组（有效性判定纯函数）、P 组（降级链）、R 组（控制器集成：幽灵设备降级 / 正常设备不误伤 / clipRatio），D 组补 D13~D16（下限加深的必要性）
+  - `scripts/verify-camera-exposure-mutation.js`：新增 M30（无效检测被删掉）/ M31（下限改回 -2.0）/ M32（滞回被删掉）/ M33（降级前不还原旧档位）
+  - `docs/exposure-assist-design.md`：§6.2 / §7.2 / §8.1 / §10 第 6 条同步 -3.0 并留勘误；新增 §7.5；§9.5 补 `clipRatio` 与新 reason
+- **依赖**：T03（编排已完成）
+- **优先级**：P0（现场阻塞：拍黑白鞋白色鞋底完全过曝裁剪）
+- **验收**：`npm run verify` 全链 EXIT=0；QA 独立套件与既有 `verify-camera.js` 不回归；4 条新变异体全部转红
+
+**任务划分说明**：5 个任务呈层级链（契约 → 纯函数 → 编排 → 渲染层 → 现场修复），这是本设计的最小可行切分——检测/决策数学不落地，编排无从测试；编排 api 不定稿，渲染层无法集成。每个任务 ≥3 个相关文件、按模块分组，配置文件（package.json）与契约登记（ENUM）集中在 T01，未分散。
 
 ### 13. 共享知识（Shared Knowledge）
 
@@ -1416,7 +1527,8 @@ exposure: { state, ev, tier, sceneMean, subjectMean, subjectRatio, adjusts, fail
 - **纯函数优先**：检测/滞回/EV/约束构造/LUT 全部纯函数 + 模块级导出，Node 可单测；每项修复配负向对照（变异测试转红才算数）。
 - **控制器边界**：不碰 DOM、不碰 localStorage；新能力一律依赖注入（参照 `blackFrameEnabled` 注入模式）；页面可见性经 `pageVisible` 注入而非直接读 `document`。
 - **总开关**：`window.__xqyExposureAssist !== false`（镜像既有 `window.__xqyBlackFrame`），运维/排障可一行命令整体退出。
-- **曝光状态机**：`OFF/IDLE/ACTIVE` 三态；`ev ∈ [expEvMin(-2.0), 0]`；仅 `LIVE + pageVisible + !focusBusy` 运行周期。
+- **曝光状态机**：`OFF/IDLE/ACTIVE` 三态；`ev ∈ [expEvMin(-3.0), 0]`；仅 `LIVE + pageVisible + !focusBusy` 运行周期。
+- **档位降级链**：能力探测 `tier1 → tier2 → tier0` + 有效性验证降级（幽灵能力）`tier1 → tier2 → tier0`；每次降级先还原旧档位约束、ev 归零、重新验证（§7.5）。
 - **测试配置模式**：缩短 `exp*` 毫秒值跑快测（参照 `verify-camera-blackretry.js` 的 `CFG = { blackRetryMs: 80, ... }` 写法），假对象驱动（假 track 可录制约束、可模拟悬挂）。
 - **CI 无摄像头策略**：纯函数 + 假 track 覆盖全部判定/数学/时序逻辑；渲染层只做静态契约扫描；真机行为走 QA 清单。
 
@@ -1443,6 +1555,7 @@ graph LR
 | R5 | **时序竞争残留**：对焦脉冲启动与曝光 apply 的极小交叠窗口；DEGRADED 复活时恢复与重启的竞态 | 短暂约束被覆盖 | 浏览器对同 track 的 applyConstraints 实际串行；下个周期自愈；恢复与重启的顺序在 `startExposureAssist` 内固定（先恢复后归零） |
 | R6 | **CI/无摄像头环境验证不足**：真机曝光行为（尤其 UVC 悬挂、AE 回弹）无法在 Node 覆盖 | 线上才发现设备级问题 | 纯函数 + 假 track（含悬挂模拟）覆盖判定/数学/竞速/门控；渲染层静态契约扫描；真机 QA 清单：①亮黄垫板+黑衣物 3s 内徽标出现且照片黑色层次恢复；②衣物移出 3s 内徽标消失、画面恢复正常；③挡镜头仍提示全黑；④昏暗店面/黑台垫不出现徽标；⑤`__xqyExposureAssist=false` 全静默；⑥连拍 10 张无卡顿无拒拍 |
 | R7 | **黑帧门控灰区**：ACTIVE 期间「挡住一半镜头」（场景均值 4~45）时，从遮挡发生到 release 滞回结束（≈2.5s）内拍照 | 极端情况下可能入库一张大半黑的照片 | `expGateSuppress` 放行前**实时复采**（不等周期），均值跌破 `expBlackFloor(4)` 即照常拒拍；残留灰区（均值 4~45 的半遮挡）记入待明确事项，上线后按 `CAM_EXP_BLACKGATE` 日志频次评估是否收紧 |
+| R8 | **有效性验证误判（新增）**：把「响应慢 / AE 回弹严重」的好设备误判成幽灵能力，降成软件兜底——预览不再变化，用户会以为功能坏了 | 现场效果打折，且比过曝更难解释（徽标说「软件压暗」，画面却一直亮着） | 三重防误伤：收敛窗口 2s + 步数/深度门槛 + 连续 2 次滞回；达成系数只要预期降幅的**一半**（留一倍余量）；实测降幅按「实际下发值」折算（防设备钳位导致高估）；降级留痕 `comp-ineffective` / `manual-ineffective` 带 `drop`，现场可逐台回看；`expEffect*` 参数可配 |
 
 ---
 

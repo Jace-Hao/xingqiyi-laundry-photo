@@ -90,7 +90,12 @@
     expDeadzone: 8,              // 死区：AE 自身波动 ±几格很正常，不动
     expEvGain: 0.025,            // 步长增益：误差×0.025=步长(EV)
     expMaxStepEv: 0.34,          // 单步上限 1/3 档：小步逼近防画面跳变
-    expEvMin: -2.0,              // 累计下限：再暗就逼近黑帧闸门、暗部细节也没了
+    // 累计下限。勘误 2026-10：原为 -2.0。现场（黑白相间鞋、白色鞋底过曝裁剪）
+    // ev 从 0 压到 -2.0 全程 subjectMean 仍在 155~182，闭环贴住下限空转永远不达标。
+    // -2.0 对应亮度只剩 1/4，而实测只掉了 1/5 不到——说明这点余量对极黑衣物 + 强环境光
+    // 根本不够（设计文档 §10 待明确事项 6 的现场结论）。加深到 -3.0 后闭环才有机会
+    // 收敛到 expTargetMean。注意：实际下发仍被设备 cap.exposureCompensation.min 二次钳位
+    expEvMin: -3.0,
     expStepGapMs: 500,           // 两次曝光 applyConstraints 最小间隔
     expSettleMs: 400,            // 单次调整后稳定等待：拿过渡值算步长会过冲
     expApplyTimeoutMs: 1000,     // 曝光 applyConstraints 超时竞速（UVC 悬挂兜底）
@@ -304,6 +309,125 @@
     return { ev: next, step: next - curEv, err: err };
   }
 
+  // sRGB 编码指数（IEC 61966-2-1 的 2.2 幂次近似）：线性光 ×2^ev ↔ 8bit 码值 ×2^(ev/gamma)。
+  // 全模块只有这一处定义，§7.5 的预期降幅与 §7.3 的软件兜底 LUT 必须同源 —— 两套
+  // 「EV 的定义」曾经同时存在（判定照 sRGB 模型、兜底照幂次曲线），后果是
+  // 「判定说该降 27%」与「兜底实际压掉 96%」同时成立（QA DEF-1）
+  var SRGB_GAMMA = 2.2;
+
+  /* ---------- 曝光有效性判定（设计文档 §7.5）：幽灵能力检测 ----------
+   * 现场 2026-10-22：某设备 getCapabilities() 报告 exposureCompensation 有 min/max、
+   * applyConstraints() 也不报错，但 ev 从 0 压到 -2.0 期间主体亮度只在 155~182 噪声
+   * 波动——约束「发出去了」，画面却一点没变。闭环因此永远不达标，只能贴着 expEvMin 空转。
+   * 这类「幽灵能力」没有任何 API 能提前识别，唯一的判据是**实测**：发了补偿，亮度有没有
+   * 按预期方向降。tier2 的 exposureTime 同样可能是幽灵能力（UVC 什么都敢报），所以这套
+   * 判定对 tier1/tier2 通用；tier0 不发约束、只改存档图，不适用。
+   */
+
+  // 判定参数。**刻意不进 DEFAULTS**：DEFAULTS 的 exp* 项与设计文档 §6.2 阈值表一一对应
+  // （QA 按 26 项对拍），新增判定参数另立一表，由 effectCfgOf() 从控制器 cfg 里
+  // 按 expEffect* 名覆盖（单测可注入，现场默认取这里的值）
+  var EXP_EFFECT = {
+    windowMs: 2000,  // 收敛窗口：engage / 换档后先等这么久再判。刚下发模式切换时
+    //   AE 与驱动都在重收敛，此时的亮度变化不能用来判设备能力（防误伤）
+    minSteps: 3,     // 至少下发过这么多次补偿步才判（前两步还混着 AE 收敛）
+    minEv: 1.0,      // 累计补偿至少这么深才判：比这更浅的补偿在 8bit 上只对应几个
+    //   百分点的亮度变化，会被 AE 抖动和衣物微动淹没
+    gamma: SRGB_GAMMA, // 8bit 灰度是 sRGB 编码：线性光 ×2^ev → 码值 ×2^(ev/gamma)
+    ratio: 0.5,      // 实测降幅 ≥ 预期降幅 × 该系数才算有效。留一倍余量吸收 AE 回弹
+    hits: 2          // 连续这么多次「无响应」才判无效。单帧不判：AE 收敛、衣物微动
+    //   都会让单帧亮度偏高，一次误判就会把好设备降成软件兜底
+  };
+
+  function numOr(v, dflt) {
+    var n = Number(v);
+    return isFinite(n) ? n : dflt;
+  }
+
+  // 把控制器 cfg 里的 expEffect* 覆盖项并进判定参数表（未覆盖的取 EXP_EFFECT 默认）
+  function effectCfgOf(cfg) {
+    var c = cfg || {};
+    return {
+      windowMs: Math.max(0, numOr(c.expEffectWindowMs, EXP_EFFECT.windowMs)),
+      minSteps: Math.max(1, Math.round(numOr(c.expEffectMinSteps, EXP_EFFECT.minSteps))),
+      minEv: Math.max(0, numOr(c.expEffectMinEv, EXP_EFFECT.minEv)),
+      gamma: numOr(c.expEffectGamma, EXP_EFFECT.gamma) || EXP_EFFECT.gamma,
+      ratio: numOr(c.expEffectRatio, EXP_EFFECT.ratio),
+      hits: Math.max(1, Math.round(numOr(c.expEffectHits, EXP_EFFECT.hits)))
+    };
+  }
+
+  // 预期亮度降幅：线性光 ×2^ev → 8bit 码值 ×2^(ev/gamma)。ev=-1 → 码值 ×0.73（降 27%）
+  function expectedDropRatio(ev, gamma) {
+    var g = numOr(gamma, EXP_EFFECT.gamma);
+    if (!(g > 0)) g = EXP_EFFECT.gamma;
+    var v = ev < 0 ? ev : 0; // 本方案不做正补偿，正 EV 不产生降幅预期
+    return 1 - Math.pow(2, v / g);
+  }
+
+  /**
+   * 曝光有效性判定（纯函数，Node 可单测）：这台设备的曝光能力是不是幽灵能力。
+   *
+   * @param {object} obs { baseline:number, samples:Array<{ev:number,mean:number,t:number,pinned?:boolean}>,
+   *                        startedAt:number }
+   *   baseline  本档位开始时的主体亮度（判定的参照点）
+   *   samples   每次下发补偿后测到的稳态主体亮度（ev 为**实际下发**的值）
+   *   startedAt 本档位开始时刻（收敛窗口闸门的起点）
+   * @param {object} [cfg] 可含 expEffect* 覆盖项
+   * @returns {{verdict:string, reason:string, dropRatio:?number, needDrop:?number,
+   *            expectedDrop:?number, streak:number, candidates:number}}
+   *   verdict: 'effective'（确实在压暗） / 'ineffective'（幽灵能力） / 'pending'（证据不足）
+   */
+  function judgeExposureEffect(obs, cfg) {
+    var e = effectCfgOf(cfg);
+    var o = obs || {};
+    var out = {
+      verdict: 'pending', reason: 'no-baseline', dropRatio: null, needDrop: null,
+      expectedDrop: null, streak: 0, candidates: 0
+    };
+    var baseline = Number(o.baseline);
+    if (!isFinite(baseline) || baseline <= 0) return out;
+    var samples = o.samples || [];
+    var startedAt = Number(o.startedAt);
+    if (!isFinite(startedAt)) startedAt = null;
+    var streak = 0;
+    var considered = 0;
+    var last = null;
+    for (var i = 0; i < samples.length; i++) {
+      var s = samples[i];
+      if (!s) continue;
+      var mean = Number(s.mean);
+      var ev = Number(s.ev);
+      if (!isFinite(mean) || !isFinite(ev)) continue;
+      // ① 步数门槛：前两步测的还混着 AE 收敛，没有判别力
+      if (i < e.minSteps - 1) continue;
+      // ② 深度门槛：补偿太浅时预期降幅落在噪声里。例外是「已经压不动了」
+      //    （pinned：贴住 EV 下限或设备把值钳死），那正是现场空转的形态，必须判
+      if (Math.abs(ev) < e.minEv && !s.pinned) continue;
+      // ③ 收敛窗口：刚 engage / 刚换档时 AE 与驱动都在重收敛，此时判会误伤好设备
+      if (startedAt != null && isFinite(Number(s.t)) && Number(s.t) - startedAt < e.windowMs) continue;
+      considered++;
+      var expected = expectedDropRatio(ev, e.gamma);
+      var need = expected * e.ratio;
+      var drop = (baseline - mean) / baseline;
+      last = { dropRatio: drop, needDrop: need, expectedDrop: expected };
+      // 滞回：连续 e.hits 次不达标才算无效，任何一次达标即清零（防单帧噪声误伤）
+      if (drop < need) streak++; else streak = 0;
+    }
+    out.candidates = considered;
+    out.streak = streak;
+    if (last) {
+      out.dropRatio = last.dropRatio;
+      out.needDrop = last.needDrop;
+      out.expectedDrop = last.expectedDrop;
+    }
+    if (considered === 0) { out.reason = 'need-steps'; return out; }
+    if (streak >= e.hits) { out.verdict = 'ineffective'; out.reason = 'no-response'; return out; }
+    if (streak === 0) { out.verdict = 'effective'; out.reason = 'responded'; return out; }
+    out.reason = 'hysteresis';
+    return out;
+  }
+
   // 能力探测 → 三档降级路径（设计文档 §7.1）。摄像头能力差异极大，
   // 且部分 UVC 的 getCapabilities() 直接抛异常，调用方必须包 try
   function pickExposurePlan(cap, settings) {
@@ -395,18 +519,94 @@
     return { advanced: [adv] };
   }
 
-  // 软件兜底查找表：out = 255×(in/255)^(2^-ev)
-  // 为什么用 gamma 而不是线性乘：线性乘把中间调成比例压暗，黑衣物的褶皱
-  // 纹理全挤在 0 附近直接死黑；gamma 曲线压暗的同时保住暗部层次
+  // 实际下发到设备的补偿量（EV）。闭环算出的 ev 会被设备步长取整、min/max 钳位，
+  // 真正下发的值可能更浅（例如设备 min=-0.5，闭环要 -2.0 也只能发 -0.5）。
+  // 有效性判定必须拿「真的发下去的值」算预期降幅，否则会高估预期、误判好设备
+  function appliedEvOf(plan, ev, cst) {
+    if (!cst || !cst.advanced || !cst.advanced[0]) return ev;
+    var a = cst.advanced[0];
+    if (!plan || plan.tier === 1) {
+      return typeof a.exposureCompensation === 'number' ? a.exposureCompensation : ev;
+    }
+    if (plan.tier === 2 && typeof a.exposureTime === 'number' && plan.baseTime > 0) {
+      return Math.log(a.exposureTime / plan.baseTime) / Math.LN2;
+    }
+    if (plan.tier === 2 && typeof a.iso === 'number' && plan.baseIso > 0) {
+      return Math.log(a.iso / plan.baseIso) / Math.LN2;
+    }
+    return ev;
+  }
+
+  /**
+   * 有效性判定失败后的档位降级（纯函数）：tier1 → tier2 → tier0，一路只往下走。
+   * tier1 的 exposureCompensation 是幽灵能力时，把该能力从 cap 里摘掉再探测，
+   * 让 pickExposurePlan 有机会落到 manual 路径；manual 同样无效就只剩软件兜底。
+   *
+   * @param {object} plan 当前档位（pickExposurePlan 的产物）
+   * @param {object} cap track.getCapabilities()
+   * @param {object} settings track.getSettings()
+   * @returns {{tier:number, reason:string, plan:(object|null)}}
+   */
+  function demoteExposurePlan(plan, cap, settings) {
+    var tier = plan && typeof plan.tier === 'number' ? plan.tier : 0;
+    if (tier === 2) return { tier: 0, reason: 'manual-ineffective', plan: null };
+    if (tier !== 1) return { tier: 0, reason: 'unsupported', plan: null };
+    // 把 exposureCompensation 摘掉再探测：它可能只是「报告有、实际无效」
+    var cap2 = {};
+    var k;
+    if (cap && typeof cap === 'object') {
+      for (k in cap) {
+        if (Object.prototype.hasOwnProperty.call(cap, k) && k !== 'exposureCompensation') cap2[k] = cap[k];
+      }
+    }
+    var next = pickExposurePlan(cap2, settings);
+    // 只有真能产出曝光值的 manual 才值得切：构造不出曝光值等于「切了手动却不压暗」，
+    // 与幽灵能力是同一个用户可见后果（徽标说在压暗、画面其实没压）
+    if (next.tier === 2 && !buildExposureConstraints(next, -EXP_EFFECT.minEv)) {
+      return { tier: 0, reason: 'comp-ineffective', plan: null };
+    }
+    if (next.tier === 2) return { tier: 2, reason: 'comp-ineffective', plan: next };
+    return { tier: 0, reason: 'comp-ineffective', plan: null };
+  }
+
+  // 软件兜底查找表：out = in × 2^(ev/gamma)（与 §7.5 判定同源的 sRGB 模型）
+  //
+  // 勘误 2026-10（QA DEF-1）：原实现 out = 255×(in/255)^(2^-ev) 是在**码值域做幂运算**，
+  // 等价于把线性光取幂 L → L^(2^-ev)，而不是曝光补偿应有的 L → L×2^ev。实测 ev=-3
+  // （tier0 闭环顶到 expEvMin 后的真实取值）：黑衣物主体 150 → 4（近全黑，而非目标 58）、
+  // 被裁剪的白色鞋底 255 → 255（永远救不回来，正是现场投诉的那一项）、褶皱暗部
+  // 20~60 全部抹成 0。越深的补偿偏差越大（-1EV→等效 -2.19EV、-3EV→等效 -12EV）。
+  // 正确做法与硬件补偿同源：线性光 ×2^ev → 码值 ×2^(ev/gamma)，码值域就是一次乘法。
+  // 「gamma 曲线保住暗部层次」的原始理由也随之更正 —— 真正在保层次的是等比例压暗
+  // （暗部按比例一起降、相对关系不变），幂次曲线恰恰是把暗部压死的那个。
   function buildExposureLut(ev) {
     var lut = new Uint8ClampedArray(256);
-    if (!ev || ev >= 0) {
+    var v = Number(ev);
+    // ev ≥ 0 / 非数 → 恒等（本方案不做提亮）；Uint8ClampedArray 自身会夹 [0,255]
+    if (!isFinite(v) || v >= 0) {
       for (var i0 = 0; i0 < 256; i0++) lut[i0] = i0;
       return lut;
     }
-    var g = Math.pow(2, -ev);
-    for (var i = 0; i < 256; i++) lut[i] = Math.round(255 * Math.pow(i / 255, g));
+    var k = Math.pow(2, v / SRGB_GAMMA);
+    for (var i = 0; i < 256; i++) lut[i] = Math.round(i * k);
     return lut;
+  }
+
+  // tier0（软件兜底）的 EV 解析解：code × 2^(ev/gamma) = expTargetMean
+  //   →  ev = clamp(gamma × log2(expTargetMean / subjectMean), expEvMin, 0)
+  // 为什么 tier0 不能继续用 nextEvStep 的闭环：tier0 只改存档图、不改预览，闭环读到的
+  // subjectMean 永远是「没被压暗的原图」，误差恒为正 → EV 一路撞到 expEvMin。实测
+  // 主体 100 只需 -1.73EV 却取了 -3.00EV（存档被过压 1.27 档），主体 130 只需 -2.56EV。
+  // 解析解一步到位，且不会把存档压到目标以下。
+  function solveTier0Ev(subjectMean, cfg) {
+    var c = Object.assign({}, DEFAULTS, cfg || {});
+    var mean = Number(subjectMean);
+    var target = Number(c.expTargetMean);
+    if (!isFinite(mean) || mean <= 0 || !isFinite(target) || target <= 0) return null;
+    var ev = SRGB_GAMMA * (Math.log(target / mean) / Math.LN2);
+    if (ev > 0) ev = 0;                 // 比目标更暗：不提亮（欠曝交给现场补光）
+    if (ev < c.expEvMin) ev = c.expEvMin;
+    return ev;
   }
 
   // 错误分类：fatal=true 表示不可重试（权限/无设备/安全上下文）
@@ -1030,9 +1230,44 @@
       lastSubjectRatio: null,
       adjusts: 0,
       fails: 0,
-      lastApplyAt: 0
+      lastApplyAt: 0,
+      // 有效性判定（幽灵能力检测，§7.5）：本档位开始时的主体亮度 + 每次下发后的
+      // 实测响应序列。effBaseline 为 null 时由第一个样本补上（换档后画面基准变了）
+      effBaseline: null,
+      effSamples: [],
+      effAt: 0,
+      demotions: 0,
+      lastAppliedEv: 0,   // 上一次**真的下发**到设备的补偿量
+      prevAppliedEv: 0    // 上上一次，用于识别「已经压不动了（pinned）」
     };
     var expWatch = null;
+
+    // 会话级「幽灵能力」记忆（QA 观察项 U19）：本设备哪个档位已被实测判过无效。
+    // 为什么需要：降级结论原先只在单次 engage 内有效，release 后重新 engage 会重新探测
+    // tier1 —— 幽灵设备每放一件衣物都要重走一次约 4s 的「徽标显示 -xEV、画面其实没压暗」
+    // 窗口，那正是现场投诉的形态。能力是**设备**的属性而不是流的属性，所以按 deviceId
+    // 记在会话里；换设备即失效（engageAssist 每次比对 deviceId）。
+    // 注意：只有「实测无效」才记账，apply 失败/超时不记 —— 那可能是设备忙，不是能力无效
+    var expGhost = { dev: '', tiers: {} };
+
+    function expGhostBlocked(tier) {
+      return !!(tier > 0 && expGhost.tiers[tier]);
+    }
+
+    // 当前 track 的 deviceId（拿不到时返回 ''）：幽灵记忆按设备记，不能串档
+    function devIdOf() {
+      var t = activeTrack();
+      var s = null;
+      try { s = t && typeof t.getSettings === 'function' ? t.getSettings() : null; } catch (e) { s = null; }
+      try { return s && s.deviceId ? String(s.deviceId) : ''; } catch (e2) { return ''; }
+    }
+
+    function expGhostRemember(tier, devId) {
+      if (!(tier > 0)) return;
+      var d = typeof devId === 'string' ? devId : '';
+      if (d !== expGhost.dev) { expGhost.dev = d; expGhost.tiers = {}; }
+      expGhost.tiers[tier] = true;
+    }
 
     function expEnabled() {
       if (!gridSampler) return false;
@@ -1057,7 +1292,20 @@
       expAssist.adjusts = 0;
       expAssist.fails = 0;
       expAssist.lastApplyAt = 0;
+      expAssist.demotions = 0;
+      resetEffectWatch(null);
       scheduleExposureCycle(mySeq, cfg.expEngageDelayMs);
+    }
+
+    // 有效性判定的观测序列归零（engage / 换档时调用）。换档后画面基准与量纲都变了，
+    // 旧基线与旧样本不能沿用：曝光补偿与曝光时间不是同一个量纲，继承旧 ev 没有意义。
+    // 注意 demotions 不在这里清零：换档本身是一次降级，计数要跨档位累加
+    function resetEffectWatch(baseline) {
+      expAssist.effBaseline = baseline == null ? null : baseline;
+      expAssist.effSamples = [];
+      expAssist.effAt = now();
+      expAssist.lastAppliedEv = 0;
+      expAssist.prevAppliedEv = 0;
     }
 
     function scheduleExposureCycle(mySeq, delay) {
@@ -1096,6 +1344,8 @@
       expAssist.tier = 0;
       expAssist.plan = null;
       expAssist.dirty = false;
+      expAssist.demotions = 0;
+      resetEffectWatch(null);
       emitExposure();
     }
 
@@ -1157,9 +1407,26 @@
       var settings = null;
       try { cap = track.getCapabilities(); } catch (e) { cap = null; }
       try { settings = track.getSettings(); } catch (e2) { settings = null; }
+      // 换设备即清空幽灵记忆：能力是设备的属性，另一台机器可能这条路径是好使的
+      var devId = '';
+      try { devId = (settings && settings.deviceId) ? String(settings.deviceId) : ''; } catch (e3) { devId = ''; }
+      if (devId !== expGhost.dev) { expGhost.dev = devId; expGhost.tiers = {}; }
       var plan = pickExposurePlan(cap, settings);
+      // 已知无效的档位直接跳过：不让现场每一件衣物都重看一次「徽标说在压暗、画面没变」
+      var skippedTier = 0;
+      if (expGhostBlocked(plan.tier)) {
+        var alt = demoteExposurePlan(plan, cap, settings);
+        skippedTier = plan.tier;
+        plan = alt.plan || { tier: 0, reason: alt.reason };
+      }
       expAssist.plan = plan;
       expAssist.tier = plan.tier;
+      expAssist.demotions = skippedTier ? 1 : 0;
+      if (skippedTier) {
+        log('warn', 'CAM_EXP_FALLBACK', {
+          seq: seq, reason: 'ghost-remembered', tier: plan.tier, from: skippedTier, ev: 0, drop: null
+        });
+      }
       log('info', 'CAM_EXP_ENUM', { seq: seq, tier: plan.tier, reason: plan.reason });
       if (plan.tier === 0) {
         // 硬件不支持：不发任何约束，改由拍照时软件压暗（徽标提示「软件压暗」）
@@ -1167,6 +1434,8 @@
         emitExposure();
         return;
       }
+      // 有效性判定的起点：本档位下的第一条基线 + 空观测序列
+      resetEffectWatch(cl.subjectMean);
       // 先把模式切过去（补偿从 0 起，具体压多少交给闭环），失败即降级 tier0
       var cst = buildExposureConstraints(plan, 0);
       var ok = await applyExposure(track, cst, mySeq);
@@ -1176,6 +1445,8 @@
         log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'engage-apply-failed', tier: plan.tier });
       } else {
         expAssist.dirty = true;
+        expAssist.lastAppliedEv = appliedEvOf(plan, 0, cst);
+        expAssist.prevAppliedEv = 0;
       }
       log('info', 'CAM_EXP_ENGAGE', {
         seq: seq,
@@ -1193,18 +1464,44 @@
       // 说明 AE 还在收敛，此刻测的亮度是过渡值，拿它算步长会过冲
       if (nowMs - expAssist.lastApplyAt < Math.max(cfg.expStepGapMs, cfg.expSettleMs)) return;
       var r = nextEvStep(expAssist.ev, cl.subjectMean, cfg);
+      // 记下「上一次真的下发下去的补偿」的实测响应（此刻已过 settle，量到的是稳态值）。
+      // 幽灵能力只能靠这一步测出来：约束发出去 ≠ 画面真的变暗
+      if (expAssist.tier > 0 && cl.hit && expAssist.lastApplyAt > 0) {
+        recordEffectSample(cl, nowMs, r.err > 0 &&
+          Math.abs(expAssist.lastAppliedEv - expAssist.prevAppliedEv) < 1e-6);
+      }
+      // 有效性判定：只判硬件档（tier0 根本没发过约束，也不影响预览采样）。
+      // 判定放这里而不是「apply 成功之后」：贴住下限时不会再有 apply，
+      // 而那正是现场「一直空转」的形态，必须照样判得到
+      if (expAssist.tier > 0 && expAssist.demotions < 2) {
+        var v = judgeExposureEffect({
+          baseline: expAssist.effBaseline,
+          samples: expAssist.effSamples,
+          startedAt: expAssist.effAt
+        }, cfg);
+        if (v.verdict === 'ineffective') {
+          await demoteExposureTier(mySeq, v);
+          return;
+        }
+      }
       if (r.step === 0) return;
       if (expAssist.tier === 0) {
-        // 软件兜底档：没有约束可发，EV 照样闭环推进（供拍照时 LUT 使用）。
-        // lastApplyAt 也要记账：否则每周期都来一次，日志会爆炸
-        expAssist.ev = r.ev;
+        // 软件兜底档：没有约束可发，EV 走**解析解**（solveTier0Ev）——闭环在这里是开环的，
+        // 见该函数注释。lastApplyAt 也要记账：否则每周期都来一次，日志会爆炸
+        var solved = solveTier0Ev(cl.subjectMean, cfg);
+        if (solved == null) return;
+        var jump = solved - expAssist.ev;
+        // 已在位（含抖动 <0.01EV ≈ 0.4% 亮度）就不重复记账
+        if (Math.abs(jump) < 0.01) return;
+        expAssist.ev = solved;
         expAssist.lastApplyAt = nowMs;
         expAssist.adjusts += 1;
         log('info', 'CAM_EXP_STEP', {
           seq: seq, tier: 0,
-          ev: Math.round(r.ev * 100) / 100,
-          step: Math.round(r.step * 100) / 100,
-          subjectMean: cl.subjectMean == null ? null : Math.round(cl.subjectMean)
+          ev: Math.round(solved * 100) / 100,
+          step: Math.round(jump * 100) / 100,
+          subjectMean: cl.subjectMean == null ? null : Math.round(cl.subjectMean),
+          clipRatio: clipFieldOf(cl)
         });
         emitExposure();
         return;
@@ -1224,6 +1521,8 @@
         }
         return;
       }
+      expAssist.prevAppliedEv = expAssist.lastAppliedEv;
+      expAssist.lastAppliedEv = appliedEvOf(expAssist.plan, r.ev, cst);
       expAssist.ev = r.ev;
       expAssist.lastApplyAt = nowMs;
       expAssist.adjusts += 1;
@@ -1231,8 +1530,96 @@
         seq: seq, tier: expAssist.tier,
         ev: Math.round(r.ev * 100) / 100,
         step: Math.round(r.step * 100) / 100,
-        subjectMean: cl.subjectMean == null ? null : Math.round(cl.subjectMean)
+        subjectMean: cl.subjectMean == null ? null : Math.round(cl.subjectMean),
+        clipRatio: clipFieldOf(cl)
       });
+      emitExposure();
+    }
+
+    // 高光裁剪占比（千分位）：白色鞋底/白垫板「还在被裁剪」是过曝的直接证据。
+    // classifyExposureGrid 早就算出 clip，只是没透出——调参时没有它只能靠猜
+    function clipFieldOf(cl) {
+      var v = cl && cl.clipRatio;
+      return v == null || !isFinite(Number(v)) ? null : Math.round(Number(v) * 1000) / 1000;
+    }
+
+    // 记一次「已下发补偿 → 实测亮度」的配对样本。只在硬件档且场景仍命中时记：
+    // 衣物移出画面后的亮度与补偿无关，记进去会污染判定
+    function recordEffectSample(cl, nowMs, pinned) {
+      var mean = Number(cl && cl.subjectMean);
+      if (!isFinite(mean)) return;
+      // 换档后第一帧的画面基准可能与 engage 时不同（如切 manual 冻结了 AE），
+      // 基线缺失时就用第一个样本补上
+      if (expAssist.effBaseline == null || !isFinite(expAssist.effBaseline)) expAssist.effBaseline = mean;
+      expAssist.effSamples.push({
+        ev: expAssist.lastAppliedEv,
+        mean: mean,
+        t: nowMs,
+        pinned: !!pinned
+      });
+      // 只留最近 12 条：贴住下限时每个周期都会记一条，不设上限数组会一直增长
+      if (expAssist.effSamples.length > 12) expAssist.effSamples.shift();
+    }
+
+    // 档位降级（幽灵能力 → 换一条路）：tier1 → tier2 → tier0。
+    //   ① 先把当前档位的约束还回去（补偿归零 / 切回 continuous），否则两份曝光
+    //      偏置会叠在同一台设备上，用户看到的是「莫名偏暗」；
+    //   ② 重新探测下一档（把无效的那个能力摘掉再探测）；
+    //   ③ 换量纲 → ev 归零、基线与观测序列重置，对新档位**重新做一次有效性验证**。
+    async function demoteExposureTier(mySeq, verdict) {
+      var track = activeTrack();
+      var from = expAssist.tier;
+      var oldPlan = expAssist.plan;
+      var reason = from === 2 ? 'manual-ineffective' : 'comp-ineffective';
+      expAssist.demotions += 1;
+      // 记进会话级幽灵记忆：下次 engage（下一件衣物）直接跳过这个档位
+      expGhostRemember(from, devIdOf());
+      // ① 还回去（best-effort：失败只留痕，见 restoreExposure 注释）
+      restoreExposure(reason);
+      var cap = null;
+      var settings = null;
+      try {
+        cap = track && typeof track.getCapabilities === 'function' ? track.getCapabilities() : null;
+      } catch (e) { cap = null; }
+      try {
+        settings = track && typeof track.getSettings === 'function' ? track.getSettings() : null;
+      } catch (e2) { settings = null; }
+      var next = demoteExposurePlan(oldPlan, cap, settings);
+      log('warn', 'CAM_EXP_FALLBACK', {
+        seq: seq,
+        reason: reason,
+        tier: next.tier,
+        from: from,
+        ev: Math.round(expAssist.ev * 100) / 100,
+        drop: verdict && verdict.dropRatio == null ? null : Math.round(verdict.dropRatio * 1000) / 1000
+      });
+      // ③ 换量纲：补偿与曝光时间不是同一个量纲，继承旧 ev 没有意义，从 0 重新收敛
+      expAssist.ev = 0;
+      expAssist.adjusts = 0;
+      expAssist.fails = 0;
+      resetEffectWatch(null);
+      if (next.tier === 0 || !next.plan || !track) {
+        expAssist.plan = null;
+        expAssist.tier = 0;
+        emitExposure();
+        return;
+      }
+      expAssist.plan = next.plan;
+      expAssist.tier = next.plan.tier;
+      log('info', 'CAM_EXP_ENUM', { seq: seq, tier: next.plan.tier, reason: reason });
+      // 新档位同样从 0 起（具体压多少交给闭环），失败就再降一级到软件兜底
+      var cst = buildExposureConstraints(next.plan, 0);
+      var ok = await applyExposure(track, cst, mySeq);
+      if (!ok) {
+        expAssist.plan = null;
+        expAssist.tier = 0;
+        log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'demote-apply-failed', tier: next.plan.tier });
+      } else {
+        expAssist.dirty = true;
+        expAssist.lastAppliedEv = appliedEvOf(next.plan, 0, cst);
+        expAssist.prevAppliedEv = 0;
+        expAssist.lastApplyAt = now();
+      }
       emitExposure();
     }
 
@@ -1286,6 +1673,8 @@
       expAssist.tier = 0;
       expAssist.plan = null;
       expAssist.dirty = false;
+      expAssist.demotions = 0;
+      resetEffectWatch(null);
       emitExposure();
     }
 
@@ -2237,6 +2626,15 @@
     pickExposurePlan: pickExposurePlan,
     buildExposureConstraints: buildExposureConstraints,
     buildExposureRestoreConstraints: buildExposureRestoreConstraints,
-    buildExposureLut: buildExposureLut
+    buildExposureLut: buildExposureLut,
+    // 幽灵能力检测（§7.5）：判定参数表 + 三个纯函数
+    EXP_EFFECT: EXP_EFFECT,
+    expectedDropRatio: expectedDropRatio,
+    judgeExposureEffect: judgeExposureEffect,
+    appliedEvOf: appliedEvOf,
+    demoteExposurePlan: demoteExposurePlan,
+    // sRGB 编码指数（§7.3 LUT 与 §7.5 判定共用同一个常量）
+    SRGB_GAMMA: SRGB_GAMMA,
+    solveTier0Ev: solveTier0Ev
   };
 });

@@ -125,10 +125,14 @@ const MUTATIONS = [
   },
   {
     id: 'M14',
-    name: 'LUT 退化成线性恒等（黑色衣物暗部被压成死黑，层次全丢）',
-    from: 'var g = Math.pow(2, -ev);',
-    to: 'var g = 1; /* MUTANT: 退化 */',
-    expect: ['E26', 'E27', 'E29']
+    // 锚点随 §7.3 勘误（QA DEF-1）更新：LUT 由「码值域幂次曲线」改为与 §7.5 同源的
+    // sRGB 模型 out = in × 2^(ev/gamma)，原来的 `var g = Math.pow(2, -ev);` 已不存在
+    name: 'LUT 退化成恒等（黑色衣物一点没被压暗，过曝照旧）',
+    from: 'var k = Math.pow(2, v / SRGB_GAMMA);',
+    to: 'var k = 1; /* MUTANT: 退化 */',
+    // E49（暗部 >0）在恒等 LUT 下照样绿是对的：完全不压暗当然也不会把暗部压成 0，
+    // 那条断言针对的是「过压」而不是「不压」；抓「不压」的是 E26/E27/E29/E46/E47
+    expect: ['E26', 'E27', 'E29', 'E46', 'E47']
   },
 
   /* ---------------- 纯函数层：能力探测与约束构造 ---------------- */
@@ -250,6 +254,88 @@ const MUTATIONS = [
     from: 'if (adv2.exposureTime === undefined && adv2.iso === undefined) return null;',
     to: '/* MUTANT: 不守无曝光值不变式 */',
     expect: ['E43', 'E44']
+  },
+
+  /* ---------------- 幽灵能力：有效性验证与档位自动降级（§7.5）---------------- */
+  {
+    id: 'M30',
+    // 现场 2026-10：设备报告有 exposureCompensation、applyConstraints 不报错，
+    // 但画面亮度完全不受影响。删掉这段判定 = 幽灵能力永远不降级，闭环贴着
+    // expEvMin 空转，用户看到「徽标显示 -2EV 但画面一点没暗」
+    name: '★幽灵能力★ 无效检测被删掉（发了补偿但亮度不降也不降级）',
+    from: 'if (v.verdict === \'ineffective\') {',
+    to: 'if (false) { /* MUTANT: 无效检测被删除 */',
+    expect: ['R6', 'R7', 'R9', 'R11', 'R13', 'R17', 'R19', 'R20']
+  },
+  {
+    id: 'M31',
+    // §10 待明确事项 6 已用现场数据结案：-2.0 不够，闭环贴住下限仍不达标
+    name: 'EV 累计下限改回 -2.0（闭环贴住下限空转，永远不收敛）',
+    from: 'expEvMin: -3.0,',
+    to: 'expEvMin: -2.0,',
+    // 只预期 D13/R3/R4：D15/D16 走的是「显式传入 expEvMin 的推演」，刻意不受
+    // DEFAULTS 影响（它们证明的是下限值本身的必要性，不是默认值有没有改）
+    expect: ['D13', 'R3', 'R4']
+  },
+  {
+    id: 'M32',
+    // 滞回是「防误伤」的核心：AE 收敛、衣物微动都会让单帧亮度偏高，
+    // 单帧即判会把好设备直接降成软件兜底（预览不再变化，用户以为功能坏了）
+    name: '有效性判定的滞回被删掉（单帧无响应就把好设备降级）',
+    from: 'if (drop < need) streak++; else streak = 0;',
+    to: 'if (drop < need) streak = e.hits; else streak = 0;',
+    // 只预期 O11：O18（慢热设备中途恢复响应）在变异下仍然绿是对的——它的最后
+    // 一个样本达标会把 streak 清零，本就不该被判无效。真正能抓住这条变异的是
+    // 「只有 1 次无响应时必须 pending」这条
+    expect: ['O11']
+  },
+  {
+    id: 'M33',
+    // 降级前必须先把旧档位的补偿还回去：否则两份曝光偏置叠在同一台设备上，
+    // 用户看到的是「画面莫名偏暗」而不是「辅助没生效」
+    name: '降级前不还原旧档位约束（补偿与手动档偏置叠加）',
+    from: '      restoreExposure(reason);\n      var cap = null;',
+    to: '      /* MUTANT: 降级前不还原 */\n      var cap = null;',
+    expect: ['R11']
+  },
+  {
+    id: 'M34',
+    // ★QA DEF-1 的负向对照★：把 LUT 退回旧实现的「码值域幂次曲线」。
+    // 那条曲线与 EV 的定义脱钩（线性光被取幂而不是被缩放），ev=-3 时黑衣物主体
+    // 150 → 4（近全黑）、被裁剪的白色 255 → 255（永远救不回来）、暗部全抹成 0。
+    // 这条变异必须转红，否则 E46~E50 的语义断言等于没写
+    name: '★QA DEF-1★ LUT 退回码值域幂次曲线（压暗量与 EV 脱钩）',
+    from: 'lut[i] = Math.round(i * k);',
+    to: 'lut[i] = Math.round(255 * Math.pow(i / 255, Math.pow(2, -ev)));',
+    expect: ['E46', 'E47', 'E49', 'E50', 'E57']
+  },
+  {
+    id: 'M35',
+    // ★QA DEF-2 的负向对照★：tier0 若继续用 nextEvStep 的闭环，因为只改存档图不改
+    // 预览，误差恒为正 → EV 一路撞到 expEvMin（主体 100 会被过压 1.27 档）
+    name: '★QA DEF-2★ tier0 退回闭环步进（存档被过压到下限）',
+    from: 'var solved = solveTier0Ev(cl.subjectMean, cfg);',
+    to: 'var solved = nextEvStep(expAssist.ev, cl.subjectMean, cfg).ev;',
+    // S 组是控制器层对照：E51/E52 是纯函数断言，抓不到控制器这条路径的变异
+    expect: ['S2', 'S3', 'S4']
+  },
+  {
+    id: 'M36',
+    // QA 观察项 U19：降级结论不跨 engage 持久 → 幽灵设备每放一件衣物都要重走
+    // 约 4s 的「徽标显示 -xEV、画面其实没压暗」窗口，正是现场投诉的形态
+    name: '★QA U19★ 幽灵记忆被删掉（换衣物又重走一次无效补偿窗口）',
+    from: 'if (expGhostBlocked(plan.tier)) {',
+    to: 'if (false) { /* MUTANT: 幽灵记忆被删除 */',
+    expect: ['T2', 'T3', 'T4']
+  },
+  {
+    id: 'M37',
+    // 记忆按设备记：换了一台摄像头还沿用上一台的「这条路径无效」结论，会把好设备
+    // 永久挡在硬件档之外（比误降级更难排查）
+    name: '幽灵记忆不按设备区分（换摄像头后串档）',
+    from: 'if (devId !== expGhost.dev) { expGhost.dev = devId; expGhost.tiers = {}; }',
+    to: '/* MUTANT: 不按设备区分 */',
+    expect: ['T10']
   }
 ];
 

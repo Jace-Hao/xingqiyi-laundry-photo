@@ -287,7 +287,9 @@ function makeHarness(over) {
     clearTimeout: function (id) { return clock.clearTimeout(id); },
     log: function (l, e, f) { logs.push({ level: l, event: e, fields: f || {} }); },
     frameSampler: function () { return state.gray; },
-    gridSampler: function () { return state.image; },
+    // image 允许是函数：幽灵能力 / 正常设备的对照实验需要「画面亮度随已下发补偿变化」，
+    // 静态图只能造出幽灵设备那一半场景
+    gridSampler: function () { return typeof state.image === 'function' ? state.image() : state.image; },
     pageVisible: function () { return state.visible; },
     focusBusy: function () { return state.focus; },
     exposureAssistEnabled: function () { return state.assistOn; },
@@ -513,8 +515,9 @@ async function suite() {
     const cap = C.nextEvStep(0, 255, D);
     near(Math.abs(cap.step), D.expMaxStepEv, 1e-9, 'D5 单步上限 expMaxStepEv=0.34（防画面跳变）');
 
-    const floor = C.nextEvStep(-1.9, 150, D);
-    near(floor.ev, D.expEvMin, 1e-9, 'D6 累计下限钳到 expEvMin=-2.0');
+    // 从「差一步就到底」的位置起算：单步上限 0.34，起点取下限 +0.1 才会真的撞到下限
+    const floor = C.nextEvStep(D.expEvMin + 0.1, 150, D);
+    near(floor.ev, D.expEvMin, 1e-9, 'D6 累计下限钳到 expEvMin=' + D.expEvMin);
     const atFloor = C.nextEvStep(D.expEvMin, 150, D);
     assert(atFloor.step === 0 && atFloor.ev === D.expEvMin, 'D7 已在下限时不再下发（step=0，避免空转 applyConstraints）');
 
@@ -537,6 +540,30 @@ async function suite() {
     const mono = seq.every(function (v, i) { return i === 0 || v <= seq[i - 1] + 1e-12; });
     assert(mono && seq.length >= 4, 'D11 静态过亮场景下 EV 单调下行（' + seq.length + ' 步收敛到 ' + ev.toFixed(2) + '）');
     assert(ev >= D.expEvMin - 1e-12, 'D12 收敛过程始终不越过下限');
+
+    /* --- 下限加深（设计文档 §10 待明确事项 6 的现场结论） --- */
+    assert(D.expEvMin === -3.0, 'D13 EV 累计下限已加深到 -3.0（现场：0→-2.0 全程不收敛）');
+    // 真实响应设备（亮度 = 150×2^(ev/2.2)，sRGB 编码）在 -2.0 下够不到目标：
+    // 贴住下限空转正是现场形态；加深到 -3.0 后闭环才有机会真正收敛
+    const modelAt = (evv) => 150 * Math.pow(2, evv / 2.2);
+    const runLoop = function (minEv) {
+      let e = 0;
+      let last = null;
+      for (let i = 0; i < 40; i++) {
+        const rr = C.nextEvStep(e, modelAt(e), Object.assign({}, D, { expEvMin: minEv }));
+        last = rr;
+        if (rr.step === 0) break;
+        e = rr.ev;
+      }
+      return { ev: e, err: last ? last.err : null };
+    };
+    const atOld = runLoop(-2.0);
+    const atNew = runLoop(-3.0);
+    assert(Math.abs(atOld.err) > D.expDeadzone,
+      'D14 旧下限 -2.0 下闭环贴住下限仍不达标（err=' + atOld.err.toFixed(1) + ' > 死区 ' + D.expDeadzone + '）');
+    assert(Math.abs(atNew.err) < D.expDeadzone,
+      'D15 新下限 -3.0 下闭环真的收敛（err=' + atNew.err.toFixed(1) + ' 落入死区，ev=' + atNew.ev.toFixed(2) + '）');
+    assert(atNew.ev < -2.0, 'D16 收敛点确实落在旧下限之外（' + atNew.ev.toFixed(2) + ' < -2.0，证明加深是必要的）');
   }
 
   /* ---------------------------------------------------------------- *
@@ -611,12 +638,16 @@ async function suite() {
     eq(r2, { advanced: [{ exposureMode: 'continuous' }] }, 'E22 tier2 恢复 = 切回 continuous');
     assert(C.buildExposureRestoreConstraints({ tier: 0 }) === null, 'E23 tier0 无恢复约束（本来就没改过设备）');
 
-    // LUT：gamma 压暗
+    // LUT：与 §7.5 判定同源的 sRGB 模型压暗（out = in × 2^(ev/gamma)）
     const lut = C.buildExposureLut(-1);
     assert(lut.length === 256, 'E24 LUT 长度 256');
-    assert(lut[0] === 0 && lut[255] === 255, 'E25 LUT 端点保持（0→0、255→255）');
-    assert(lut[128] === 64, 'E26 ev=-1 → 中间调 128 压到 64（gamma 2.0）');
-    assert(lut[64] < 64 && lut[64] > 0, 'E27 暗部压暗但没死黑（保住褶皱纹理，这是非线性乘的意义）');
+    assert(lut[0] === 0 && lut[255] < 255 && lut[255] === Math.round(255 * Math.pow(2, -1 / C.SRGB_GAMMA)),
+      'E25 LUT 黑点保持 0→0，且白点一起压暗（ev=-1：255 → ' + lut[255] +
+      '，不再锁 255 —— 锁 255 就是「白色鞋底一点没救」）');
+    near(lut[128], Math.round(128 * Math.pow(2, -1 / C.SRGB_GAMMA)), 0,
+      'E26 ev=-1 → 中间调 128 × 2^(-1/2.2) = ' + lut[128] + '（与 §7.5 判定同源）');
+    assert(lut[64] === Math.round(64 * Math.pow(2, -1 / C.SRGB_GAMMA)) && lut[64] > 0,
+      'E27 暗部按比例压暗且不死黑（保住褶皱纹理：64 → ' + lut[64] + '）');
     let mono = true;
     for (let i = 1; i < 256; i++) if (lut[i] < lut[i - 1]) mono = false;
     assert(mono, 'E28 LUT 单调不减');
@@ -626,6 +657,59 @@ async function suite() {
     assert(lut0[0] === 0 && lut0[128] === 128 && lut0[255] === 255, 'E30 ev=0 → 恒等 LUT（不改变画面）');
     const lutPos = C.buildExposureLut(0.5);
     assert(lutPos[128] === 128, 'E31 正 EV 也退化为恒等（本方案不做提亮）');
+
+    /* --- 【QA DEF-1】LUT 的「压暗量 vs EV」语义校验 ---
+     * 旧实现只有单调性/端点断言，于是「码值域幂次曲线」这种与 EV 定义完全脱钩的实现
+     * 也能全绿。下面 5 条把 LUT 与 §7.5 的判定模型绑死：LUT 造成的降幅必须
+     * 等于 expectedDropRatio(ev)，否则「判定说该降 27%」与「兜底实际压掉 96%」
+     * 会同时成立（现场后果：黑衣物被压成近全黑、白色鞋底永远救不回来）。
+     */
+    const G = C.SRGB_GAMMA;
+    const lutSem = (ev) => C.buildExposureLut(ev);
+    // ① 逐点语义：LUT 的降幅 == §7.5 判定的预期降幅（误差只来自取整，≤1 码值）
+    let semBad = 0;
+    [-0.5, -1, -2, -3].forEach(function (ev) {
+      const L = lutSem(ev);
+      const expDrop = C.expectedDropRatio(ev, G);
+      [40, 80, 128, 180, 220].forEach(function (v) {
+        const drop = (v - L[v]) / v;
+        if (Math.abs(drop - expDrop) * v > 1.0) semBad++;
+      });
+    });
+    eq(semBad, 0, 'E46 LUT 降幅与 §7.5 预期降幅逐点一致（差异仅来自取整，越界 ' + semBad + ' 处）');
+
+    // ② 现场取值：ev=-3（tier0 顶到 expEvMin 的真实取值）必须把主体压到目标附近
+    const lut3 = lutSem(-3);
+    near(lut3[150], C.DEFAULTS.expTargetMean, 1, 'E47 ev=-3：黑衣物主体 150 → ' + lut3[150] +
+      '（正合 expTargetMean=' + C.DEFAULTS.expTargetMean + '，旧实现是 4）');
+    // ③ 被裁剪的白色必须救得回来（现场投诉的那一项：白色鞋底完全过曝裁剪）
+    assert(lut3[255] < 255 && lut3[255] > 30,
+      'E48 被裁剪的白色 255 → ' + lut3[255] + '（拉回可辨范围，旧实现是 255 = 一点没压）');
+    // ④ 暗部层次：等比压暗，褶皱不被抹成 0
+    const shadows = [20, 30, 45, 60].map(function (v) { return lut3[v]; });
+    assert(shadows.every(function (x) { return x > 0; }),
+      'E49 ev=-3：褶皱暗部 20/30/45/60 → ' + shadows.join('/') + '（全 >0，旧实现全为 0）');
+    const ratioKept = shadows.every(function (x, i) {
+      return Math.abs(x / [20, 30, 45, 60][i] - Math.pow(2, -3 / G)) < 0.06;
+    });
+    assert(ratioKept, 'E50 暗部是等比例压暗（相对关系保留 = 层次保留，不是幂次压死）');
+
+    /* --- 【QA DEF-2】tier0 的 EV 解析解 --- */
+    const solve = (mean) => C.solveTier0Ev(mean, C.DEFAULTS);
+    near(solve(100), G * Math.log2(C.DEFAULTS.expTargetMean / 100), 1e-9,
+      'E51 tier0 解析解：主体 100 → ev=' + solve(100).toFixed(2) + '（闭环会一路撞到 -3.00 过压 1.27 档）');
+    assert(solve(100) > C.DEFAULTS.expEvMin, 'E52 主体 100 的解在下限之内（不会被 expEvMin 截断）');
+    near(solve(150), C.DEFAULTS.expEvMin, 0.02,
+      'E53 主体 150 → ev≈' + solve(150).toFixed(2) + '（贴下限，即 -3.0 这个下限值正是照 150→58 定的）');
+    assert(solve(C.DEFAULTS.expTargetMean) === 0, 'E54 已在目标亮度 → ev=0（不做无谓压暗）');
+    assert(solve(20) === 0, 'E55 比目标更暗 → 不提亮（欠曝交给现场补光，与上限锁 0 一致）');
+    assert(solve(null) === null && solve(0) === null, 'E56 无主体亮度时返回 null（采样失败不瞎算）');
+    // 解析解与 LUT 必须自洽：套用解析解出的 ev，主体应落到目标亮度
+    [100, 130, 150].forEach(function (m) {
+      const evv = solve(m);
+      near(C.buildExposureLut(evv)[m], C.DEFAULTS.expTargetMean, 6,
+        'E57 解析解自洽：主体 ' + m + ' 经 ev=' + evv.toFixed(2) + ' 压暗后落在目标附近');
+    });
 
     /* --- 收尾修复项的正向断言（QA 严过关复核提出） --- */
     // 1) 设备把 step 报成 Infinity：绝不能让 NaN 进约束
@@ -906,6 +990,522 @@ async function suite() {
     h.ctrl.unmount();
     await flush(60);
     assert(h.clock.count() === 0, 'L11 unmount 后无悬挂定时器');
+  })();
+
+  /* ---------------------------------------------------------------- *
+   * O. 幽灵能力：有效性判定（judgeExposureEffect，设计文档 §7.5）
+   * ---------------------------------------------------------------- */
+  console.log('\n· O 曝光有效性判定（幽灵能力检测，§7.5）');
+  {
+    const E = C.EXP_EFFECT;
+    // 默认判定参数：这几条是「防误伤」的量化承诺，改参数必须同步改这里
+    assert(E.hits === 2, 'O1 滞回：连续 ' + E.hits + ' 次无响应才判无效（单帧不判，防 AE 抖动误伤）');
+    assert(E.minSteps === 3 && E.minEv === 1.0,
+      'O2 证据门槛：至少 ' + E.minSteps + ' 步且累计 ≥' + E.minEv + 'EV 才判');
+    assert(E.windowMs === 2000, 'O3 收敛窗口 ' + E.windowMs + 'ms（engage/换档后先让 AE 收敛再判）');
+    assert(E.ratio === 0.5 && E.gamma === 2.2,
+      'O4 判据：实测降幅 ≥ 预期降幅×' + E.ratio + '（预期按 sRGB gamma ' + E.gamma + ' 折算）');
+
+    // 亮度模型：真实响应设备 linear ×2^ev → 8bit 码值 ×2^(ev/2.2)
+    const model = (base, ev) => base * Math.pow(2, ev / E.gamma);
+    const NoWin = { expEffectWindowMs: 0 };   // 关掉收敛窗口（虚拟时钟只跑几百毫秒）
+
+    // ① 正常设备：亮度按模型下降 → effective
+    const goodSamples = [];
+    [0.34, 0.68, 1.02, 1.36].forEach(function (d, i) {
+      goodSamples.push({ ev: -d, mean: model(170, -d), t: 1000 + i * 500 });
+    });
+    const good = C.judgeExposureEffect({ baseline: 170, samples: goodSamples, startedAt: 0 }, NoWin);
+    assert(good.verdict === 'effective', 'O5 正常设备：亮度随补偿下降 → effective（实际 ' + good.verdict + '）');
+    near(good.expectedDrop, 1 - Math.pow(2, -1.36 / E.gamma), 1e-9,
+      'O6 预期降幅按 1−2^(ev/gamma) 折算（ev=-1.36 → ' + good.expectedDrop.toFixed(3) + '）');
+    assert(good.dropRatio >= good.needDrop, 'O7 实测降幅 ' + good.dropRatio.toFixed(3) +
+      ' ≥ 门槛 ' + good.needDrop.toFixed(3) + '（留了一倍余量）');
+
+    // ② 幽灵设备：ev 一路压到 -2.0，亮度只在噪声里波动 → ineffective（现场形态）
+    const ghostSamples = [
+      { ev: -0.34, mean: 170, t: 1000 },
+      { ev: -0.68, mean: 168, t: 1500 },
+      { ev: -1.02, mean: 164, t: 2000 },
+      { ev: -1.36, mean: 170, t: 2500 },
+      { ev: -1.70, mean: 155, t: 3000 },
+      { ev: -2.00, mean: 166, t: 3500 }
+    ];
+    const ghost = C.judgeExposureEffect({ baseline: 170, samples: ghostSamples, startedAt: 0 }, NoWin);
+    assert(ghost.verdict === 'ineffective', 'O8 幽灵设备（现场日志原样）：ev 0→-2.0 亮度不降 → ineffective');
+    assert(ghost.streak >= E.hits, 'O9 判定成立前已有 ' + ghost.streak + ' 次连续无响应（不是单帧冲动）');
+    assert(ghost.dropRatio < ghost.needDrop, 'O10 实测降幅 ' + ghost.dropRatio.toFixed(3) +
+      ' < 门槛 ' + ghost.needDrop.toFixed(3) + '（判别面很干净，不是擦线）');
+
+    // ③ 滞回：只测到 1 次无响应 → pending（好设备不会因此被降级）
+    const oneMiss = C.judgeExposureEffect({
+      baseline: 170,
+      samples: [{ ev: -0.34, mean: 168, t: 1000 }, { ev: -0.68, mean: 166, t: 1500 }, { ev: -1.02, mean: 168, t: 2000 }],
+      startedAt: 0
+    }, NoWin);
+    assert(oneMiss.verdict === 'pending' && oneMiss.reason === 'hysteresis',
+      'O11 只有 1 次无响应 → pending（滞回生效，AE 抖动不会一次判死设备）');
+
+    // ④ 噪声：单帧反弹但整体在降 → 仍判有效（防误伤的核心）
+    //    数据 = 亮度模型值 + 少量噪声（AE 抖动 / 衣物微动的真实形态）
+    const noisy = C.judgeExposureEffect({
+      baseline: 170,
+      samples: [
+        { ev: -0.34, mean: model(170, -0.34) + 4, t: 1000 },
+        { ev: -0.68, mean: model(170, -0.68) - 3, t: 1500 },
+        { ev: -1.02, mean: model(170, -1.02) + 2, t: 2000 },
+        { ev: -1.36, mean: model(170, -1.36), t: 2500 }
+      ],
+      startedAt: 0
+    }, NoWin);
+    assert(noisy.verdict === 'effective', 'O12 单帧反弹 + 整体按模型下降 → 仍判有效（噪声不误伤，实际 ' + noisy.verdict + '）');
+
+    // ⑤ 证据不足：步数不够 / 补偿太浅 / 还在收敛窗口内 / 基线缺失
+    const few = C.judgeExposureEffect({
+      baseline: 170, samples: [{ ev: -0.34, mean: 170, t: 1000 }], startedAt: 0
+    }, NoWin);
+    assert(few.verdict === 'pending' && few.reason === 'need-steps', 'O13 步数不足 → pending（need-steps）');
+    const shallow = C.judgeExposureEffect({
+      baseline: 170,
+      samples: [{ ev: -0.1, mean: 170, t: 1000 }, { ev: -0.2, mean: 170, t: 1500 }, { ev: -0.3, mean: 170, t: 2000 }],
+      startedAt: 0
+    }, NoWin);
+    assert(shallow.verdict === 'pending' && shallow.reason === 'need-steps',
+      'O14 补偿不足 ' + E.minEv + 'EV → pending（浅补偿的预期降幅落在噪声里）');
+    const inWindow = C.judgeExposureEffect({
+      baseline: 170, samples: ghostSamples, startedAt: 3000
+    }, null);
+    assert(inWindow.verdict === 'pending', 'O15 收敛窗口内不判（默认 windowMs=' + E.windowMs + '，防 AE 收敛期误伤）');
+    assert(C.judgeExposureEffect({ baseline: null, samples: ghostSamples, startedAt: 0 }, NoWin).verdict === 'pending',
+      'O16 无基线 → pending（采样失败不瞎判）');
+
+    // ⑥ 反向：亮度反而上升（AE 对抗且补偿无效）→ 无效
+    const rising = C.judgeExposureEffect({
+      baseline: 170,
+      samples: [
+        { ev: -0.34, mean: 175, t: 1000 },
+        { ev: -0.68, mean: 178, t: 1500 },
+        { ev: -1.02, mean: 180, t: 2000 },
+        { ev: -1.36, mean: 182, t: 2500 }
+      ],
+      startedAt: 0
+    }, NoWin);
+    assert(rising.verdict === 'ineffective' && rising.dropRatio < 0,
+      'O17 补偿下发但亮度反而上升 → ineffective（降幅为负，实际 ' + rising.verdict + '）');
+
+    // ⑦ 中途恢复响应 → 滞回清零（设备只是慢热，不该被降级）
+    const late = C.judgeExposureEffect({
+      baseline: 170,
+      samples: [
+        { ev: -0.34, mean: 170, t: 1000 },
+        { ev: -0.68, mean: 169, t: 1500 },
+        { ev: -1.02, mean: 168, t: 2000 },
+        { ev: -1.36, mean: 120, t: 2500 }
+      ],
+      startedAt: 0
+    }, NoWin);
+    assert(late.verdict === 'effective' && late.streak === 0, 'O18 慢热设备恢复响应后滞回清零 → effective');
+
+    // ⑧ 设备把补偿钳死（pinned）：永远到不了 1EV，也必须判得出来。
+    //    步数门槛照旧生效（前两步仍混着 AE 收敛），所以是第 4 条样本才成立
+    const pinnedSeq = [
+      { ev: -0.5, mean: 170, pinned: true, t: 1000 },
+      { ev: -0.5, mean: 171, pinned: true, t: 1500 },
+      { ev: -0.5, mean: 169, pinned: true, t: 2000 },
+      { ev: -0.5, mean: 170, pinned: true, t: 2500 }
+    ];
+    const pinned = C.judgeExposureEffect({ baseline: 170, samples: pinnedSeq, startedAt: 0 }, NoWin);
+    assert(pinned.verdict === 'ineffective',
+      'O19 设备把补偿钳死在 -0.5EV（pinned）→ 仍判无效（现场「压不动」形态，实际 ' + pinned.verdict + '）');
+    const pinnedNot = C.judgeExposureEffect({
+      baseline: 170,
+      samples: [{ ev: -0.5, mean: 170, t: 1000 }, { ev: -0.5, mean: 171, t: 1500 }, { ev: -0.5, mean: 169, t: 2000 }],
+      startedAt: 0
+    }, NoWin);
+    assert(pinnedNot.verdict === 'pending',
+      'O20 同样的浅补偿但**没有** pinned 标记 → 不判（深度门槛照旧生效）');
+
+    // ⑨ 主检正对照：判据不是恒真——把达成系数拉到 1.5（要求比物理上可能的降幅还多）
+    //    后，同一条完美响应序列必须翻成 ineffective。否则说明 verdict 是写死的
+    const strict = C.judgeExposureEffect({ baseline: 170, samples: goodSamples, startedAt: 0 },
+      { expEffectWindowMs: 0, expEffectRatio: 1.5 });
+    assert(strict.verdict === 'ineffective',
+      'O21 判据随参数变化（不是恒真断言）：ratio=1.5 时完美响应序列判为 ' + strict.verdict);
+    assert(good.verdict === 'effective' && strict.verdict === 'ineffective',
+      'O22 同一条序列在 ratio=0.5 与 1.5 下结论相反（判据真的在起作用）');
+  }
+
+  /* ---------------------------------------------------------------- *
+   * P. 幽灵能力：档位降级链（demoteExposurePlan，§7.5）
+   * ---------------------------------------------------------------- */
+  console.log('\n· P 档位降级链（tier1 → tier2 → tier0）');
+  {
+    const capCompOnly = { exposureCompensation: { min: -3, max: 3, step: 0.1 } };
+    const capBoth = {
+      exposureCompensation: { min: -3, max: 3, step: 0.1 },
+      exposureMode: ['continuous', 'manual'],
+      exposureTime: { min: 10, max: 10000 }
+    };
+    const plan1 = C.pickExposurePlan(capCompOnly, { exposureCompensation: 0 });
+    assert(plan1.tier === 1, 'P1 前置：补偿能力 → tier1');
+
+    // ① 无 manual 能力可退 → 直接软件兜底
+    const d1 = C.demoteExposurePlan(plan1, capCompOnly, { exposureCompensation: 0 });
+    assert(d1.tier === 0 && d1.plan === null, 'P2 tier1 无效 + 无 manual → tier0 软件兜底');
+    assert(d1.reason === 'comp-ineffective', 'P3 降级原因可追溯（' + d1.reason + '）');
+
+    // ② 有 manual 且能产出曝光值 → 换手动档重试
+    const d2 = C.demoteExposurePlan(plan1, capBoth, { exposureCompensation: 0, exposureTime: 500 });
+    assert(d2.tier === 2 && d2.plan && d2.plan.tier === 2, 'P4 tier1 无效 + manual 可用 → 降到 tier2 重试');
+    assert(d2.reason === 'comp-ineffective', 'P5 降级原因仍是 comp-ineffective（' + d2.reason + '）');
+    const c2 = C.buildExposureConstraints(d2.plan, -1);
+    assert(c2 && c2.advanced[0].exposureMode === 'manual' && isFinite(c2.advanced[0].exposureTime),
+      'P6 新档位确实能产出 manual 曝光时间（换路有效，不是空降）');
+
+    // ③ manual 也无效 → 软件兜底
+    const d3 = C.demoteExposurePlan(d2.plan, capBoth, { exposureTime: 500 });
+    assert(d3.tier === 0 && d3.reason === 'manual-ineffective',
+      'P7 tier2 也无效 → tier0，原因 manual-ineffective（' + d3.reason + '）');
+
+    // ④ 已在 tier0：不再往下（也不会被误判成可降级）
+    const d4 = C.demoteExposurePlan({ tier: 0, reason: 'unsupported' }, capBoth, {});
+    assert(d4.tier === 0, 'P8 tier0 已经是底（不会再降，也不会误升）');
+
+    // ⑤ 能力残缺（有 manual 但拿不到基线）→ 不许降成一个「切了手动却不压暗」的档
+    const d5 = C.demoteExposurePlan(plan1, capBoth, {});
+    assert(d5.tier === 0 && d5.plan === null,
+      'P9 降级目标产不出曝光值 → 直接 tier0（换路不能换来「切手动却不压暗」）');
+    assert(C.buildExposureConstraints(d5.plan, -1) === null || d5.plan === null,
+      'P10 降级后的档位不会发出无曝光值的 manual 约束');
+
+    // ⑥ 实际下发量：设备把补偿钳死时，判定必须拿钳后的值算预期
+    const tightPlan = C.pickExposurePlan({ exposureCompensation: { min: -0.5, max: 3, step: 0.1 } }, {});
+    const tightCst = C.buildExposureConstraints(tightPlan, -2.0);
+    near(C.appliedEvOf(tightPlan, -2.0, tightCst), -0.5, 1e-9,
+      'P11 appliedEvOf 取设备钳位后的实际值（闭环要 -2.0，设备只给 -0.5）');
+    const t2Plan = C.pickExposurePlan({ exposureMode: ['manual'], exposureTime: { min: 10, max: 10000 } }, { exposureTime: 500 });
+    near(C.appliedEvOf(t2Plan, -1, C.buildExposureConstraints(t2Plan, -1)), -1, 1e-9,
+      'P12 tier2 按 exposureTime 反算实际 EV（500→250µs = -1EV）');
+    assert(C.appliedEvOf(t2Plan, -1, null) === -1, 'P13 无约束时回退为闭环值（不抛错）');
+  }
+
+  /* ---------------------------------------------------------------- *
+   * R. 控制器集成：幽灵能力自动降级 / 正常设备不误伤（§7.5）
+   * ---------------------------------------------------------------- */
+  console.log('\n· R 控制器集成（幽灵能力 → 自动降级；正常设备 → 不误伤）');
+
+  // 正常设备：画面亮度按已下发的补偿变化（sRGB 编码模型）。幽灵设备用静态图。
+  function lastAppliedComp(track) {
+    for (let i = track.calls.length - 1; i >= 0; i--) {
+      const a = track.calls[i] && track.calls[i].advanced && track.calls[i].advanced[0];
+      if (a && typeof a.exposureCompensation === 'number') return a.exposureCompensation;
+    }
+    return 0;
+  }
+  function responsiveImage(mean) {
+    const v = Math.max(5, Math.min(255, Math.round(mean)));
+    return makeImage(function (cx, cy) {
+      const inCenter = cy >= 2 && cy <= 4 && cx >= 2 && cx <= 5;
+      const below = (cy === 5 || cy === 6) && cx >= 1 && cx <= 5;
+      return inCenter || below ? [v, v, v] : PAL.pad;
+    });
+  }
+
+  await (async function () {
+    /* --- R1/R2：正常设备与幽灵设备的对照（同一套参数，只差画面响不响应） --- */
+    const mkResponsive = function () {
+      const track = makeExpTrack();
+      return makeHarness({
+        track: track,
+        image: function () { return responsiveImage(150 * Math.pow(2, lastAppliedComp(track) / 2.2)); },
+        config: { expEffectWindowMs: 0 }
+      });
+    };
+    const hGood = mkResponsive();
+    await boot(hGood);
+    await pump(hGood.clock, 400, 5);
+    const goodInfo = hGood.ctrl.getExposureInfo();
+    assert(goodInfo.tier === 1, 'R1 正常设备（亮度随补偿下降）不降级，停在 tier1（实际 tier=' + goodInfo.tier + '）');
+    assert(!reasonsOf(hGood.logs, 'CAM_EXP_FALLBACK').some(function (r) { return r.indexOf('ineffective') >= 0; }),
+      'R2 正常设备不产生任何 ineffective 降级日志（实际 ' +
+      JSON.stringify(reasonsOf(hGood.logs, 'CAM_EXP_FALLBACK')) + '）');
+    assert(goodInfo.ev < -2.0, 'R3 正常设备闭环真的压到了旧下限之外（ev=' + goodInfo.ev.toFixed(2) + '，下限已加深）');
+    assert(goodInfo.subjectMean != null && Math.abs(goodInfo.subjectMean - C.DEFAULTS.expTargetMean) < 12,
+      'R4 正常设备主体亮度收敛到目标附近（' + (goodInfo.subjectMean == null ? 'null' : goodInfo.subjectMean.toFixed(1)) +
+      ' ≈ ' + C.DEFAULTS.expTargetMean + '）');
+    hGood.ctrl.unmount();
+    await flush(60);
+    assert(hGood.clock.count() === 0, 'R5 正常设备路径无悬挂定时器');
+
+    const hGhost = makeHarness({ config: { expEffectWindowMs: 0 } });
+    await boot(hGhost);
+    await pump(hGhost.clock, 400, 5);
+    const fbGhost = reasonsOf(hGhost.logs, 'CAM_EXP_FALLBACK');
+    assert(fbGhost.indexOf('comp-ineffective') >= 0,
+      'R6 幽灵设备：补偿无效被检出并降级（实际原因集 ' + JSON.stringify(fbGhost) + '）');
+    assert(hGhost.ctrl.getExposureInfo().tier === 0,
+      'R7 无 manual 可退 → 直接降到 tier0 软件兜底（实际 tier=' + hGhost.ctrl.getExposureInfo().tier + '）');
+    const stepLogs = eventsOf(hGhost.logs, 'CAM_EXP_STEP');
+    assert(stepLogs.length >= 3, 'R8 降级前确实下发过多步补偿（' + stepLogs.length + ' 步，不是一步就判死）');
+    const downLog = eventsOf(hGhost.logs, 'CAM_EXP_FALLBACK').filter(function (x) {
+      return x.fields.reason === 'comp-ineffective';
+    })[0] || { fields: {} };
+    assert(downLog.fields.from === 1 && downLog.fields.tier === 0,
+      'R9 降级留痕带原档位与新档位（from=' + downLog.fields.from + ' → tier=' + downLog.fields.tier + '）');
+    assert(typeof downLog.fields.drop === 'number', 'R10 降级留痕带实测降幅 drop=' + downLog.fields.drop);
+
+    // 降级前必须把补偿还回去：否则设备会一直停在降曝态（用户看到「莫名偏暗」）
+    const negIdx = [];
+    hGhost.track.calls.forEach(function (cst, i) {
+      const a = cst.advanced && cst.advanced[0];
+      if (a && typeof a.exposureCompensation === 'number' && a.exposureCompensation < 0) negIdx.push(i);
+    });
+    const lastNeg = negIdx.length ? negIdx[negIdx.length - 1] : -1;
+    const restoredAfter = hGhost.track.calls.slice(lastNeg + 1).some(function (cst) {
+      const a = cst.advanced && cst.advanced[0];
+      return a && a.exposureCompensation === 0 && a.exposureMode === undefined;
+    });
+    assert(restoredAfter, 'R11 降级前先把补偿归零（最后一次负补偿之后确实下发了 { exposureCompensation: 0 }）');
+
+    // 降级后 ev 归零重新收敛（换量纲），且不再回到硬件档
+    const evAfterDemote = hGhost.ctrl.getExposureInfo().ev;
+    assert(evAfterDemote <= 0, 'R12 降级后内部 ev 从 0 重新起算（当前 ' + evAfterDemote.toFixed(2) + '）');
+    await pump(hGhost.clock, 400, 5);
+    assert(hGhost.ctrl.getExposureInfo().tier === 0, 'R13 降级是持久的（后续周期不会自己爬回硬件档）');
+    assert(hGhost.track.calls.length === lastNeg + 2,
+      'R14 降级后不再向硬件下发约束（调用数冻结在 ' + hGhost.track.calls.length + '）');
+    hGhost.ctrl.unmount();
+    await flush(60);
+    assert(hGhost.clock.count() === 0, 'R15 降级路径无悬挂定时器');
+  })();
+
+  await (async function () {
+    /* --- R16~R21：tier1 → tier2 → tier0 完整两级降级（manual 也是幽灵能力） --- */
+    const caps = {
+      exposureCompensation: { min: -3, max: 3, step: 0.1 },
+      exposureMode: ['continuous', 'manual'],
+      exposureTime: { min: 10, max: 10000 }
+    };
+    const h2 = makeHarness({
+      trackOpts: { caps: caps, settings: { exposureCompensation: 0, exposureTime: 500 } },
+      config: { expEffectWindowMs: 0 }
+    });
+    await boot(h2);
+    await pump(h2.clock, 200, 5);
+    const enums = eventsOf(h2.logs, 'CAM_EXP_ENUM').map(function (x) { return x.fields.tier; });
+    assert(enums[0] === 1, 'R16 首次探测仍优先 tier1（补偿语义最干净，实际 ' + enums[0] + '）');
+    await pump(h2.clock, 400, 5);
+    assert(enums.indexOf(2) >= 0, 'R17 tier1 判无效后自动切 tier2（manual + 曝光时间，实际档位序列 ' + JSON.stringify(enums) + '）');
+    const manualCalls = h2.track.calls.filter(function (cst) {
+      const a = cst.advanced && cst.advanced[0];
+      return a && a.exposureMode === 'manual' && typeof a.exposureTime === 'number';
+    });
+    assert(manualCalls.length >= 1, 'R18 tier2 确实下发了 manual 曝光时间约束（' + manualCalls.length + ' 次）');
+    await pump(h2.clock, 500, 5);
+    const fb2 = reasonsOf(h2.logs, 'CAM_EXP_FALLBACK');
+    assert(fb2.indexOf('manual-ineffective') >= 0,
+      'R19 manual 也是幽灵能力 → 继续降到 tier0（实际原因集 ' + JSON.stringify(fb2) + '）');
+    assert(h2.ctrl.getExposureInfo().tier === 0, 'R20 两级降级后落在 tier0（软件兜底）');
+    assert(eventsOf(h2.logs, 'CAM_EXP_STEP').some(function (x) { return x.fields.tier === 2; }),
+      'R21 tier2 期间的 EV 步长照常留痕（现场能看到换档后是否仍无效）');
+    h2.ctrl.unmount();
+    await flush(60);
+    assert(h2.clock.count() === 0, 'R22 两级降级路径无悬挂定时器');
+  })();
+
+  await (async function () {
+    /* --- R23~R26：clipRatio 进日志（白色高光裁剪证据）+ 字段纪律 --- */
+    const h3 = makeHarness({ config: { expEffectWindowMs: 0 } });
+    await boot(h3);
+    await pump(h3.clock, 150, 5);
+    const steps = eventsOf(h3.logs, 'CAM_EXP_STEP');
+    assert(steps.length > 0, 'R23 前置：产生 CAM_EXP_STEP 日志（' + steps.length + ' 条）');
+    assert(steps.every(function (x) { return typeof x.fields.clipRatio === 'number'; }),
+      'R24 CAM_EXP_STEP 带 clipRatio（高光裁剪占比，判断白色是否还在被裁剪）');
+    assert(steps[0].fields.clipRatio >= 0 && steps[0].fields.clipRatio <= 1,
+      'R25 clipRatio 是 0~1 的比例（实际 ' + steps[0].fields.clipRatio + '）');
+    const fixed = fs.readFileSync(path.join(ROOT, 'main', 'camera-log.js'), 'utf8')
+      .match(/const FIXED_KEYS = \[([^\]]+)\]/)[1]
+      .split(',').map(function (s) { return s.trim().replace(/^['"]|['"]$/g, ''); });
+    const maxExtra = steps.reduce(function (acc, x) {
+      const n = Object.keys(x.fields).filter(function (k) { return fixed.indexOf(k) < 0; }).length;
+      return n > acc ? n : acc;
+    }, 0);
+    assert(maxExtra <= 6, 'R26 clipRatio 加入后附加字段仍 ≤6（实际 ' + maxExtra + '，MAX_EXTRA_KEYS=6）');
+    h3.ctrl.unmount();
+    await flush(60);
+
+    // 现场形态（黑白相间的鞋、白色鞋底被裁剪）：画面里必须有真被裁剪的高光，
+    // clipRatio 才 > 0 —— 否则这条字段等于永远是 0，看不出白色是否还在过曝
+    const clipScene = makeImage(function (cx, cy) {
+      if (cy >= 3 && cy <= 4 && cx >= 2 && cx <= 4) return PAL.grey;   // 黑衣物主体
+      if (cy === 6 && cx >= 1 && cx <= 4) return [255, 255, 255];      // 白色鞋底：全裁剪
+      return PAL.pad;                                                  // 亮黄垫板
+    });
+    const h4 = makeHarness({ image: clipScene, config: { expEffectWindowMs: 0 } });
+    await boot(h4);
+    await pump(h4.clock, 150, 5);
+    const clipSteps = eventsOf(h4.logs, 'CAM_EXP_STEP');
+    assert(clipSteps.length > 0, 'R27 前置：裁剪场景产生 CAM_EXP_STEP（' + clipSteps.length + ' 条）');
+    assert(clipSteps[0].fields.clipRatio > 0,
+      'R28 白色鞋底被裁剪时 clipRatio > 0（实际 ' + clipSteps[0].fields.clipRatio + '，现场据此判断过曝有没有救回来）');
+    h4.ctrl.unmount();
+    await flush(60);
+  })();
+
+  /* ---------------------------------------------------------------- *
+   * S. tier0 软件兜底的 EV 语义（QA DEF-2）：解析解而不是撞下限
+   * ---------------------------------------------------------------- */
+  console.log('\n· S tier0 软件兜底（EV 取解析解，不过压存档图）');
+  await (async function () {
+    // 画面主体亮度 = 100（比 150 暗，正好落在「闭环会过压、解析解不会」的区间）
+    const imgAt = function (v) {
+      return makeImage(function (cx, cy) {
+        const inCenter = cy >= 2 && cy <= 4 && cx >= 2 && cx <= 5;
+        const below = (cy === 5 || cy === 6) && cx >= 1 && cx <= 5;
+        return inCenter || below ? [v, v, v] : PAL.pad;
+      });
+    };
+    // 无任何曝光能力的设备 → 直接 tier0
+    const hT0 = makeHarness({
+      image: imgAt(100),
+      trackOpts: { caps: { exposureMode: ['continuous'] }, settings: {} }
+    });
+    await boot(hT0);
+    await pump(hT0.clock, 400, 5);
+    const info0 = hT0.ctrl.getExposureInfo();
+    assert(info0.tier === 0 && info0.state === 'ACTIVE',
+      'S1 前置：无曝光能力的设备 → tier0 且照常 ACTIVE（实际 tier=' + info0.tier + '）');
+    const want = C.solveTier0Ev(100, C.DEFAULTS);
+    near(info0.ev, want, 0.02,
+      'S2 tier0 EV 取解析解 ' + info0.ev.toFixed(2) + '（= ' + want.toFixed(2) +
+      '，不再是撞到下限的 ' + C.DEFAULTS.expEvMin + '）');
+    assert(info0.ev > C.DEFAULTS.expEvMin + 0.5,
+      'S3 主体 100 时不撞下限（过压 1.27 档的旧行为已消除，实际 ' + info0.ev.toFixed(2) + '）');
+    near(C.buildExposureLut(info0.ev)[100], C.DEFAULTS.expTargetMean, 6,
+      'S4 解析解与 LUT 自洽：主体 100 经该 EV 压暗后落在目标亮度附近（' +
+      C.buildExposureLut(info0.ev)[100] + ' ≈ ' + C.DEFAULTS.expTargetMean + '）');
+    hT0.ctrl.unmount();
+    await flush(60);
+    assert(hT0.clock.count() === 0, 'S5 tier0 路径无悬挂定时器');
+
+    // 阳性对照：旧的「闭环步进」在同一输入上确实会一路撞到下限（证明 S2/S3 不是恒真）
+    let evOld = 0;
+    for (let i = 0; i < 40; i++) {
+      const rr = C.nextEvStep(evOld, 100, C.DEFAULTS);   // 只改存档图 → 实测恒为 100
+      if (rr.step === 0) break;
+      evOld = rr.ev;
+    }
+    near(evOld, C.DEFAULTS.expEvMin, 1e-9,
+      'S6 阳性对照：闭环写法在主体 100 上确实撞到下限 ' + evOld.toFixed(2) + '（过压 ' +
+      Math.abs(evOld - want).toFixed(2) + ' 档）');
+
+    // 主体 150（现场黑白鞋那一档）→ 解析解恰好贴下限，说明 -3.0 这个值就是照 150→58 定的
+    const hT1 = makeHarness({
+      image: imgAt(150),
+      trackOpts: { caps: { exposureMode: ['continuous'] }, settings: {} }
+    });
+    await boot(hT1);
+    await pump(hT1.clock, 400, 5);
+    near(hT1.ctrl.getExposureInfo().ev, C.DEFAULTS.expEvMin, 0.02,
+      'S7 主体 150 → 解析解贴住下限 ' + hT1.ctrl.getExposureInfo().ev.toFixed(2) +
+      '（正是 -3.0 这个下限值的定标场景）');
+    near(C.buildExposureLut(hT1.ctrl.getExposureInfo().ev)[150], C.DEFAULTS.expTargetMean, 6,
+      'S8 该 EV 下存档主体压到 ' + C.buildExposureLut(hT1.ctrl.getExposureInfo().ev)[150] +
+      '（目标 ' + C.DEFAULTS.expTargetMean + '）');
+    hT1.ctrl.unmount();
+    await flush(60);
+  })();
+
+  /* ---------------------------------------------------------------- *
+   * T. 会话级幽灵记忆（QA 观察项 U19）：换衣物不再重走无效补偿窗口
+   * ---------------------------------------------------------------- */
+  console.log('\n· T 会话级幽灵记忆（下一件衣物直接跳过无效档）');
+  await (async function () {
+    const ghostEngage = async function (h) {
+      await boot(h);
+      await pump(h.clock, 400, 5);          // 首次 engage → 检出 → 降级
+      const first = h.ctrl.getExposureInfo().tier;
+      const compsBefore = h.track.calls.length;
+      h.setImage(SCENE.D());                 // 衣物移出画面
+      await pump(h.clock, 200, 5);           // release
+      h.setImage(SCENE.A());                 // 下一件衣物入画
+      await pump(h.clock, 200, 5);           // 冷却后重新 engage
+      return { first: first, compsBefore: compsBefore };
+    };
+
+    // ① 幽灵设备：第二次 engage 直接跳过 tier1，不再下发任何补偿约束
+    const hg = makeHarness({
+      config: { expEffectWindowMs: 0 },
+      trackOpts: { settings: { exposureCompensation: 0, deviceId: 'ghost-cam-1' } }
+    });
+    const r1 = await ghostEngage(hg);
+    assert(r1.first === 0, 'T1 前置：首次 engage 已判无效并降级 tier0（实际 ' + r1.first + '）');
+    const afterRe = hg.track.calls.slice(r1.compsBefore).filter(function (cst) {
+      const a = cst.advanced && cst.advanced[0];
+      return a && typeof a.exposureCompensation === 'number';
+    });
+    const negAfter = afterRe.filter(function (cst) {
+      const a = cst.advanced && cst.advanced[0];
+      return a.exposureCompensation < 0;
+    });
+    eq(negAfter.length, 0,
+      'T2 第二次 engage 不再下发任何负补偿（幽灵记忆生效，实际 ' + negAfter.length + ' 次）');
+    const rem = reasonsOf(hg.logs, 'CAM_EXP_FALLBACK');
+    assert(rem.indexOf('ghost-remembered') >= 0,
+      'T3 跳过留痕 CAM_EXP_FALLBACK{reason:ghost-remembered}（实际 ' + JSON.stringify(rem) + '）');
+    const remLog = eventsOf(hg.logs, 'CAM_EXP_FALLBACK').filter(function (x) {
+      return x.fields.reason === 'ghost-remembered';
+    })[0] || { fields: {} };
+    assert(remLog.fields.from === 1, 'T4 留痕带原档位 from=' + remLog.fields.from + '（现场可回看跳过了哪一档）');
+    hg.ctrl.unmount();
+    await flush(60);
+    assert(hg.clock.count() === 0, 'T5 幽灵记忆路径无悬挂定时器');
+
+    // ② 好设备不受影响：从没被判过无效，第二次 engage 仍是 tier1
+    const trackOk = makeExpTrack({ settings: { exposureCompensation: 0, deviceId: 'good-cam-1' } });
+    // 注意：好设备必须始终是「可响应」的画面函数，换衣物时也不能换成静态图
+    // （静态图在判定眼里就是幽灵设备，会把对照组自己变成实验组）
+    const okImage = function () { return responsiveImage(150 * Math.pow(2, lastAppliedComp(trackOk) / 2.2)); };
+    const hOk = makeHarness({
+      track: trackOk,
+      image: okImage,
+      config: { expEffectWindowMs: 0 }
+    });
+    await boot(hOk);
+    await pump(hOk.clock, 400, 5);
+    assert(hOk.ctrl.getExposureInfo().tier === 1, 'T6 好设备首次 engage 停在 tier1');
+    hOk.setImage(SCENE.D());
+    await pump(hOk.clock, 200, 5);
+    hOk.setImage(okImage);
+    await pump(hOk.clock, 200, 5);
+    assert(hOk.ctrl.getExposureInfo().tier === 1,
+      'T7 好设备第二次 engage 仍是 tier1（记忆只记「实测无效」，不误伤）');
+    assert(reasonsOf(hOk.logs, 'CAM_EXP_FALLBACK').indexOf('ghost-remembered') < 0,
+      'T8 好设备不产生 ghost-remembered 日志');
+    hOk.ctrl.unmount();
+    await flush(60);
+
+    // ③ 换设备即失效：另一台机器的同一档位可能好使，不能串档
+    const hSwap = makeHarness({
+      config: { expEffectWindowMs: 0 },
+      trackOpts: { settings: { exposureCompensation: 0, deviceId: 'ghost-cam-2' } }
+    });
+    await boot(hSwap);
+    await pump(hSwap.clock, 400, 5);
+    assert(hSwap.ctrl.getExposureInfo().tier === 0, 'T9 前置：A 机判无效并降级 tier0');
+    hSwap.track.settings.deviceId = 'other-cam-9';   // 换了一台摄像头
+    hSwap.setImage(SCENE.D());
+    await pump(hSwap.clock, 200, 5);
+    hSwap.setImage(SCENE.A());
+    const enumsBefore = eventsOf(hSwap.logs, 'CAM_EXP_ENUM').length;
+    await pump(hSwap.clock, 200, 5);
+    const newEnums = eventsOf(hSwap.logs, 'CAM_EXP_ENUM').slice(enumsBefore);
+    assert(newEnums.length > 0 && newEnums[0].fields.tier === 1,
+      'T10 换设备后记忆失效，重新从 tier1 探测（实际 ' +
+      JSON.stringify(newEnums.map(function (x) { return x.fields.tier; })) + '）');
+    hSwap.ctrl.unmount();
+    await flush(60);
   })();
 
   /* ---------------------------------------------------------------- *
