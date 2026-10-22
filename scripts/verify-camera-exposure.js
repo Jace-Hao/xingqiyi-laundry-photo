@@ -262,8 +262,14 @@ function makeHarness(over) {
   const o = over || {};
   const clock = o.clock || makeClock(100000);
   const logs = [];
-  const track = o.track || makeExpTrack(o.trackOpts);
-  const stream = { getTracks: function () { return [track]; }, getVideoTracks: function () { return [track]; } };
+  // track 放在一个可变盒子里：QA DEF-4 的「换摄像头」用例需要把流里挂的 track
+  // 换成**另一个对象**（同一对象换图不算换设备，任何身份方案都区分不了）
+  const trackBox = { cur: o.track || makeExpTrack(o.trackOpts) };
+  const track = trackBox.cur;
+  const stream = {
+    getTracks: function () { return [trackBox.cur]; },
+    getVideoTracks: function () { return [trackBox.cur]; }
+  };
   const video = o.video || makeVideo();
   const state = {
     image: o.image !== undefined ? o.image : SCENE.A(),
@@ -304,6 +310,9 @@ function makeHarness(over) {
     md: md,
     ctrl: ctrl,
     scene: state,
+    // 换摄像头：把流里挂的 track 换成另一个对象（activeTrack() 每次现读，故立即生效）
+    setTrack(t) { trackBox.cur = t; },
+    curTrack() { return trackBox.cur; },
     setImage(img) { state.image = img; },
     setGray(arr) { state.gray = arr; },
     setVisible(v) { state.visible = !!v; },
@@ -1420,44 +1429,73 @@ async function suite() {
   /* ---------------------------------------------------------------- *
    * T. 会话级幽灵记忆（QA 观察项 U19）：换衣物不再重走无效补偿窗口
    * ---------------------------------------------------------------- */
-  console.log('\n· T 会话级幽灵记忆（下一件衣物直接跳过无效档）');
+  console.log('\n· T 会话级幽灵记忆（记账门槛 2 次；达门槛后下一件衣物直接跳过无效档）');
   await (async function () {
-    const ghostEngage = async function (h) {
-      await boot(h);
-      await pump(h.clock, 400, 5);          // 首次 engage → 检出 → 降级
-      const first = h.ctrl.getExposureInfo().tier;
-      const compsBefore = h.track.calls.length;
-      h.setImage(SCENE.D());                 // 衣物移出画面
-      await pump(h.clock, 200, 5);           // release
-      h.setImage(SCENE.A());                 // 下一件衣物入画
-      await pump(h.clock, 200, 5);           // 冷却后重新 engage
-      return { first: first, compsBefore: compsBefore };
+    // 下一件衣物进画 → release → 重新 engage，返回这一段里新产生的设备约束
+    const nextCloth = async function (h, image, ms) {
+      const from = h.curTrack().calls.length;
+      h.setImage(SCENE.D());                 // 衣物移出画面 → release
+      await pump(h.clock, 200, 5);
+      h.setImage(image || SCENE.A());        // 下一件衣物入画 → 重新 engage
+      await pump(h.clock, ms || 400, 5);
+      return h.curTrack().calls.slice(from).map(function (c) { return c.advanced && c.advanced[0]; });
+    };
+    // 「还在走硬件路径」的口径：补偿值 / manual 模式 / 曝光时间 / ISO 任一出现即算
+    const hwOf = function (list) {
+      return list.filter(function (a) {
+        return a && (typeof a.exposureCompensation === 'number' ||
+          a.exposureMode === 'manual' ||
+          typeof a.exposureTime === 'number' ||
+          typeof a.iso === 'number');
+      });
+    };
+    // 负补偿条数（tier1 真在压暗的证据）
+    const negOf = function (list) {
+      return list.filter(function (a) {
+        return a && typeof a.exposureCompensation === 'number' && a.exposureCompensation < 0;
+      });
+    };
+    const ghostLogsOf = function (h) {
+      return eventsOf(h.logs, 'CAM_EXP_FALLBACK').filter(function (x) {
+        return x.fields.reason === 'ghost-remembered';
+      });
     };
 
-    // ① 幽灵设备：第二次 engage 直接跳过 tier1，不再下发任何补偿约束
+    // ① 幽灵设备：**第一次**判无效只计证据（不记账），**第二次**才记账，
+    //    第三次 engage 起跳过 tier1。中间这一次是方案① 故意多付的探测窗口，
+    //    必须断言它仍然发生 —— 否则后人会把「多付一件衣物的窗口」当 bug 改回去
     const hg = makeHarness({
       config: { expEffectWindowMs: 0 },
       trackOpts: { settings: { exposureCompensation: 0, deviceId: 'ghost-cam-1' } }
     });
-    const r1 = await ghostEngage(hg);
-    assert(r1.first === 0, 'T1 前置：首次 engage 已判无效并降级 tier0（实际 ' + r1.first + '）');
-    const afterRe = hg.track.calls.slice(r1.compsBefore).filter(function (cst) {
-      const a = cst.advanced && cst.advanced[0];
-      return a && typeof a.exposureCompensation === 'number';
+    await boot(hg);
+    await pump(hg.clock, 400, 5);
+    assert(hg.ctrl.getExposureInfo().tier === 0,
+      'T1 前置：首次 engage 判无效并降级 tier0（实际 ' + hg.ctrl.getExposureInfo().tier + '）');
+    // engage#2：只有 1 次证据，不到门槛 → 仍要完整重探 tier1（方案① 的代价，常驻契约）
+    const calls2 = await nextCloth(hg);
+    assert(negOf(calls2).length > 0 && hg.ctrl.getExposureInfo().tier === 0,
+      'T2 第 2 次 engage 仍重新探测 tier1（记账门槛 2 次，这次是故意多付的窗口）：负补偿 ' +
+      negOf(calls2).length + ' 次、tier=' + hg.ctrl.getExposureInfo().tier);
+    assert(ghostLogsOf(hg).length === 0,
+      'T2b 门槛未达时不得跳过任何档位（ghost-remembered ' + ghostLogsOf(hg).length + ' 次）');
+    // 门槛达成的那次判无效必须留下 ghostStrike=2，现场能看出「这次开始记账了」
+    const strikeLogs = eventsOf(hg.logs, 'CAM_EXP_FALLBACK').filter(function (x) {
+      return x.fields.ghostStrike != null;
     });
-    const negAfter = afterRe.filter(function (cst) {
-      const a = cst.advanced && cst.advanced[0];
-      return a.exposureCompensation < 0;
-    });
-    eq(negAfter.length, 0,
-      'T2 第二次 engage 不再下发任何负补偿（幽灵记忆生效，实际 ' + negAfter.length + ' 次）');
-    const rem = reasonsOf(hg.logs, 'CAM_EXP_FALLBACK');
-    assert(rem.indexOf('ghost-remembered') >= 0,
-      'T3 跳过留痕 CAM_EXP_FALLBACK{reason:ghost-remembered}（实际 ' + JSON.stringify(rem) + '）');
-    const remLog = eventsOf(hg.logs, 'CAM_EXP_FALLBACK').filter(function (x) {
-      return x.fields.reason === 'ghost-remembered';
-    })[0] || { fields: {} };
-    assert(remLog.fields.from === 1, 'T4 留痕带原档位 from=' + remLog.fields.from + '（现场可回看跳过了哪一档）');
+    assert(strikeLogs.length === 2 && strikeLogs[0].fields.ghostStrike === 1 && strikeLogs[1].fields.ghostStrike === 2,
+      'T2c 判无效日志带累计次数 ghostStrike=' +
+      JSON.stringify(strikeLogs.map(function (x) { return x.fields.ghostStrike; })) + '（1 → 2，到 2 才记账）');
+    // engage#3：门槛已达 → 直接跳过
+    const calls3 = await nextCloth(hg);
+    eq(negOf(calls3).length, 0,
+      'T3 第 3 次 engage 不再下发任何负补偿（幽灵记忆生效，实际 ' + negOf(calls3).length + ' 次）');
+    assert(ghostLogsOf(hg).length === 1,
+      'T3b 跳过留痕恰好 1 条 CAM_EXP_FALLBACK{reason:ghost-remembered}（实际 ' + ghostLogsOf(hg).length + ' 条）');
+    const remLog = ghostLogsOf(hg)[0] || { fields: {} };
+    assert(remLog.fields.from === 1 && remLog.fields.tier === 0,
+      'T4 留痕带原档位 from=' + remLog.fields.from + ' tier=' + remLog.fields.tier +
+      '（现场可回看跳过了哪一档、落到哪一档）');
     hg.ctrl.unmount();
     await flush(60);
     assert(hg.clock.count() === 0, 'T5 幽灵记忆路径无悬挂定时器');
@@ -1494,18 +1532,157 @@ async function suite() {
     await boot(hSwap);
     await pump(hSwap.clock, 400, 5);
     assert(hSwap.ctrl.getExposureInfo().tier === 0, 'T9 前置：A 机判无效并降级 tier0');
+    // 攒够 2 次证据（engage#2）再换设备，否则「记忆失效」这条会变成恒真
+    await nextCloth(hSwap);
+    assert(ghostLogsOf(hSwap).length === 0 && hSwap.ctrl.getExposureInfo().tier === 0,
+      'T9b 前置：A 机累计 2 次判无效已记账门槛（此时尚未跳过，ghost-remembered ' +
+      ghostLogsOf(hSwap).length + ' 次）');
     hSwap.track.settings.deviceId = 'other-cam-9';   // 换了一台摄像头
-    hSwap.setImage(SCENE.D());
-    await pump(hSwap.clock, 200, 5);
-    hSwap.setImage(SCENE.A());
     const enumsBefore = eventsOf(hSwap.logs, 'CAM_EXP_ENUM').length;
-    await pump(hSwap.clock, 200, 5);
+    const callsSwap = await nextCloth(hSwap);
     const newEnums = eventsOf(hSwap.logs, 'CAM_EXP_ENUM').slice(enumsBefore);
     assert(newEnums.length > 0 && newEnums[0].fields.tier === 1,
-      'T10 换设备后记忆失效，重新从 tier1 探测（实际 ' +
-      JSON.stringify(newEnums.map(function (x) { return x.fields.tier; })) + '）');
+      'T10 换设备后记忆（含计数）失效，重新从 tier1 探测（实际 ' +
+      JSON.stringify(newEnums.map(function (x) { return x.fields.tier; })) + '，负补偿 ' +
+      negOf(callsSwap).length + ' 次）');
     hSwap.ctrl.unmount();
     await flush(60);
+
+    /* ④ DEF-3（QA 第 2 轮）：双档幽灵设备 —— tier1/tier2 都被实测判过无效时，
+       第二次 engage 必须把**两档一起**跳过，而不是只跳过先探测到的那一档。
+       只跳一档的话 tier2 仍会被完整重走（实测仍下发 6 次 manual 约束、耗时 3.5s） */
+    const capsBoth = {
+      exposureCompensation: { min: -3, max: 3, step: 0.1 },
+      exposureMode: ['manual', 'continuous'],
+      exposureTime: { min: 10, max: 1000, step: 1 }
+    };
+    const hBoth = makeHarness({
+      config: { expEffectWindowMs: 0 },
+      trackOpts: {
+        caps: capsBoth,
+        settings: { exposureCompensation: 0, exposureTime: 500, deviceId: 'ghost-cam-3' }
+      }
+    });
+    await boot(hBoth);
+    await pump(hBoth.clock, 800, 5);
+    assert(hBoth.ctrl.getExposureInfo().tier === 0,
+      'T11 前置：双档幽灵设备首件衣物走完 tier1→tier2→tier0（实际 ' +
+      hBoth.ctrl.getExposureInfo().tier + '）');
+    const enumsBoth = eventsOf(hBoth.logs, 'CAM_EXP_ENUM').map(function (x) { return x.fields.tier; });
+    assert(enumsBoth.join(',') === '1,2',
+      'T11b 首件衣物两个硬件档都被枚举过（ENUM=' + enumsBoth.join(',') + '）');
+    // engage#2：每档证据都才 1 次，不到门槛 → 两档仍要完整重走（方案① 的代价）
+    const callsB2 = await nextCloth(hBoth, SCENE.A(), 800);
+    assert(hwOf(callsB2).length > 0 && hBoth.ctrl.getExposureInfo().tier === 0,
+      'T12 第 2 次 engage 仍重走两个硬件档（记账门槛 2 次，这次是故意多付的窗口）：硬件约束 ' +
+      hwOf(callsB2).length + ' 条、tier=' + hBoth.ctrl.getExposureInfo().tier);
+    // engage#3：两档都达门槛 → 一起跳过，零硬件补偿约束
+    const callsB3 = await nextCloth(hBoth, SCENE.A(), 800);
+    assert(hwOf(callsB3).length === 0 && hBoth.ctrl.getExposureInfo().tier === 0,
+      'T12b 第 3 次 engage 两档一起跳过：零硬件补偿约束（' + hwOf(callsB3).length +
+      ' 条；manual ' + callsB3.filter(function (a) { return a && a.exposureMode === 'manual'; }).length +
+      '、负补偿 ' + negOf(callsB3).length +
+      '、tier=' + hBoth.ctrl.getExposureInfo().tier + '）');
+    assert(ghostLogsOf(hBoth).length >= 1,
+      'T12c 双档跳过留痕（ghost-remembered ' + ghostLogsOf(hBoth).length + ' 条）');
+    hBoth.ctrl.unmount();
+    await flush(60);
+    assert(hBoth.clock.count() === 0, 'T13 双档跳过路径无悬挂定时器');
+
+    /* ⑤ DEF-4（QA 第 2 轮）：设备标识不能只认 deviceId。
+       拿不到 deviceId 的两台设备若共用同一个空串槽，`devId !== expGhost.dev` 恒为假
+       → 记忆永不清空 → 好设备被上一台幽灵设备的记录挡在硬件补偿之外。
+       兜底链：deviceId → track.id → track.label → track 实例号 */
+    const hNoId = makeHarness({
+      config: { expEffectWindowMs: 0 },
+      trackOpts: { settings: { exposureCompensation: 0 } }   // 故意不给 deviceId
+    });
+    await boot(hNoId);
+    await pump(hNoId.clock, 800, 5);
+    assert(hNoId.ctrl.getExposureInfo().tier === 0,
+      'T14 前置：无 deviceId 的幽灵设备首件衣物仍降级 tier0（实际 ' +
+      hNoId.ctrl.getExposureInfo().tier + '）');
+    const callsN2 = await nextCloth(hNoId, SCENE.A(), 800);
+    assert(negOf(callsN2).length > 0,
+      'T14b 无 deviceId 同样受记账门槛约束：第 2 次 engage 仍在探测（负补偿 ' +
+      negOf(callsN2).length + ' 次）');
+    const callsN3 = await nextCloth(hNoId, SCENE.A(), 800);
+    const negNoId = negOf(callsN3);
+    // 这条同时钉住「engage 侧与记忆侧必须同源」：engage 若改回直接读 settings.deviceId
+    // （拿不到就是空串），与记忆侧的 track#N 永远不相等，记忆会被自己清空
+    assert(negNoId.length === 0 && hNoId.ctrl.getExposureInfo().tier === 0,
+      'T15 无 deviceId 时记忆照样生效：第二次 engage 零负补偿（实际 ' + negNoId.length + ' 次）');
+    hNoId.ctrl.unmount();
+    await flush(60);
+
+    // label 兜底：换了一台同样不上报 deviceId 的摄像头（label 变化）→ 记忆必须失效
+    const trackLbl = makeExpTrack({ settings: { exposureCompensation: 0 } });
+    trackLbl.label = 'USB Camera A';
+    const lblImage = function () { return responsiveImage(150 * Math.pow(2, lastAppliedComp(trackLbl) / 2.2)); };
+    const hLbl = makeHarness({ track: trackLbl, image: SCENE.A(), config: { expEffectWindowMs: 0 } });
+    await boot(hLbl);
+    await pump(hLbl.clock, 800, 5);
+    assert(hLbl.ctrl.getExposureInfo().tier === 0,
+      'T16 前置：A 机（无 deviceId，仅有 label）判无效降级 tier0（实际 ' +
+      hLbl.ctrl.getExposureInfo().tier + '）');
+    // 先在这台机器上攒够 2 次证据（engage#2），否则「记忆失效」无从谈起
+    await nextCloth(hLbl, SCENE.A(), 800);
+    assert(hLbl.ctrl.getExposureInfo().tier === 0,
+      'T16b 前置：A 机两次判无效（已记账门槛，仍停在 tier0）');
+    trackLbl.label = 'USB Camera B';            // 换了一台摄像头
+    hLbl.setImage(SCENE.D());
+    await pump(hLbl.clock, 200, 5);
+    hLbl.setImage(lblImage);                    // 新设备是好设备
+    const enumsLblBefore = eventsOf(hLbl.logs, 'CAM_EXP_ENUM').length;
+    await pump(hLbl.clock, 200, 5);
+    const newEnumsLbl = eventsOf(hLbl.logs, 'CAM_EXP_ENUM').slice(enumsLblBefore);
+    assert(newEnumsLbl.length > 0 && newEnumsLbl[0].fields.tier === 1,
+      'T17 label 变化（另一台同样无 deviceId 的摄像头）→ 记忆失效，重新从 tier1 探测（实际 ' +
+      JSON.stringify(newEnumsLbl.map(function (x) { return x.fields.tier; })) + '）');
+    hLbl.ctrl.unmount();
+    await flush(60);
+    assert(hLbl.clock.count() === 0, 'T18 兜底身份路径无悬挂定时器');
+
+    // 连 label 都拿不到时按 track 实例发号兜底（真实换设备必然换 track 对象）
+    const ctrlSrc = fs.readFileSync(path.join(ROOT, 'renderer', 'camera-controller.js'), 'utf8');
+    assert(/__expUid\s*==\s*null/.test(ctrlSrc) && /ghostUidSeq/.test(ctrlSrc),
+      'T19 连 label 也拿不到时按 track 实例发号兜底（不落共享空串槽）');
+
+    /* ⑥ 最严格的一版：换**真的另一台**摄像头（流里挂的 track 换成另一个对象），
+       且两台都既没有 deviceId 也没有 label —— 只能靠 track 实例号区分。
+       双向：正向「B 机不被 A 机的记录挡住」，反向「A 机自己的记录仍然命中」
+       （反向这条专门防 devIdOf 恒返回随机串那类变异：随机串会让「不串档」通过，
+       但会让「自己命中」失败） */
+    const trackA = makeExpTrack({ settings: { exposureCompensation: 0 } });   // 无 deviceId / id / label
+    const hTwo = makeHarness({ track: trackA, config: { expEffectWindowMs: 0 } });
+    await boot(hTwo);
+    await pump(hTwo.clock, 800, 5);
+    assert(hTwo.ctrl.getExposureInfo().tier === 0,
+      'T20 前置：A 机（无任何标识）判无效降级 tier0（实际 ' + hTwo.ctrl.getExposureInfo().tier + '）');
+    // engage#2：攒够 2 次证据（这次仍要探测）
+    const callsA2 = await nextCloth(hTwo, SCENE.A(), 800);
+    assert(negOf(callsA2).length > 0 && hTwo.ctrl.getExposureInfo().tier === 0,
+      'T20a 第 2 次 engage 仍在探测（门槛 2 次，负补偿 ' + negOf(callsA2).length + ' 次）');
+    // 反向：还在 A 机上，第 3 件衣物必须走记忆（自己命中）
+    const callsA3 = await nextCloth(hTwo, SCENE.A(), 800);
+    assert(negOf(callsA3).length === 0 && hTwo.ctrl.getExposureInfo().tier === 0,
+      'T20b 反向：A 机自己的记录在自己的会话里仍然命中（零负补偿，实际 ' + negOf(callsA3).length +
+      ' 次；若 devIdOf 恒返回随机串这条会红）');
+    // 正向：换到 B 机（另一个 track 对象、同样无任何标识、好设备）
+    // 必须先让衣物移出画面触发 release，否则还停在 A 机的 ACTIVE 会话里，换了 track
+    // 也不会重新 engage（记忆根本没机会被读）
+    hTwo.setImage(SCENE.D());
+    await pump(hTwo.clock, 200, 5);
+    const trackB = makeExpTrack({ settings: { exposureCompensation: 0 } });
+    hTwo.setTrack(trackB);
+    hTwo.setImage(function () { return responsiveImage(150 * Math.pow(2, lastAppliedComp(trackB) / 2.2)); });
+    await pump(hTwo.clock, 800, 5);
+    assert(hTwo.ctrl.getExposureInfo().tier === 1,
+      'T21 换摄像头（新 track 对象、同样无任何标识）→ 记忆按设备隔离，B 机正常拿到 tier1（实际 tier=' +
+      hTwo.ctrl.getExposureInfo().tier + '）');
+    hTwo.ctrl.unmount();
+    await flush(60);
+    assert(hTwo.clock.count() === 0, 'T22 换 track 路径无悬挂定时器');
   })();
 
   /* ---------------------------------------------------------------- *

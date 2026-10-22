@@ -339,6 +339,15 @@
     //   都会让单帧亮度偏高，一次误判就会把好设备降成软件兜底
   };
 
+  // 幽灵记忆的**记账门槛**（QA DEF-5，方案①）：同一设备、同一档位被实测判无效累计到
+  // 这个次数，才把「本设备这条路径无效」记进会话记忆。
+  // 为什么不是 1 次：环境光漂移（QA U4b 实测边界：持续变亮 ≥6 码值/秒）会让好设备被
+  // 误判；单次记账就把「一件衣物的误伤」放大成「整会话不可恢复地失去硬件补偿」，
+  // 而本模块全部设计原则就是「自动恢复」。付一件衣物约 4.3s 的探测窗口是**有界、自愈、
+  // 用户几乎无感**的代价 —— 风险不对称，所以选 2 而不是 1。
+  // 注意：调回 1 会让变异体 M42（记账门槛被放宽）失去判别力。
+  var EXP_GHOST = { minStrikes: 2 };
+
   function numOr(v, dflt) {
     var n = Number(v);
     return isFinite(n) ? n : dflt;
@@ -1249,24 +1258,48 @@
     // 记在会话里；换设备即失效（engageAssist 每次比对 deviceId）。
     // 注意：只有「实测无效」才记账，apply 失败/超时不记 —— 那可能是设备忙，不是能力无效
     var expGhost = { dev: '', tiers: {} };
+    // 拿不到任何设备标识时的兜底发号器：见 devIdOf() 注释（QA DEF-4）
+    var ghostUidSeq = 0;
 
     function expGhostBlocked(tier) {
-      return !!(tier > 0 && expGhost.tiers[tier]);
+      return !!(tier > 0 && (expGhost.tiers[tier] || 0) >= EXP_GHOST.minStrikes);
     }
 
-    // 当前 track 的 deviceId（拿不到时返回 ''）：幽灵记忆按设备记，不能串档
+    // 当前 track 的设备标识：幽灵记忆按设备记，不能串档（QA DEF-4）。
+    // 为什么不能「拿不到就返回空串」：两台都不上报 deviceId 的设备会落进同一个空串槽，
+    // `devId !== expGhost.dev` 恒为假 → 记忆永不清空 → 好设备被上一台幽灵设备的记录
+    // 挡在硬件补偿之外（实测：B 机全程 0 条补偿约束、直接 tier0）。兜底链按
+    // deviceId → track.id（浏览器给每条 track 的唯一串）→ track.label（设备名）→
+    // track 实例号；换设备必然换 track 对象，实例号因此能把两台设备分开。
     function devIdOf() {
       var t = activeTrack();
-      var s = null;
-      try { s = t && typeof t.getSettings === 'function' ? t.getSettings() : null; } catch (e) { s = null; }
-      try { return s && s.deviceId ? String(s.deviceId) : ''; } catch (e2) { return ''; }
+      if (!t) return '';
+      var id = '';
+      try {
+        var s = typeof t.getSettings === 'function' ? t.getSettings() : null;
+        if (s && s.deviceId) id = String(s.deviceId);
+      } catch (e) { id = ''; }
+      if (!id) { try { if (t.id) id = String(t.id); } catch (e1) { id = ''; } }
+      if (!id) { try { if (t.label) id = String(t.label); } catch (e2) { id = ''; } }
+      if (!id) {
+        try {
+          if (t.__expUid == null) t.__expUid = 'track#' + (++ghostUidSeq);
+          id = String(t.__expUid);
+        } catch (e3) { id = ''; }
+      }
+      return id;
     }
 
+    // 记一次「实测无效」，返回该档位在本设备上累计被判无效的次数（供日志回看第几次）。
+    // 计数跟着 devId 走：换设备时连计数一起清空 —— 换了一台机器，上一台还差一次才达
+    // 门槛的证据不该被继承（否则 A 机 1 次 + B 机 1 次就凑成 2 次，误伤新设备）
     function expGhostRemember(tier, devId) {
-      if (!(tier > 0)) return;
+      if (!(tier > 0)) return 0;
       var d = typeof devId === 'string' ? devId : '';
       if (d !== expGhost.dev) { expGhost.dev = d; expGhost.tiers = {}; }
-      expGhost.tiers[tier] = true;
+      var n = (expGhost.tiers[tier] || 0) + 1;
+      expGhost.tiers[tier] = n;
+      return n;
     }
 
     function expEnabled() {
@@ -1408,15 +1441,22 @@
       try { cap = track.getCapabilities(); } catch (e) { cap = null; }
       try { settings = track.getSettings(); } catch (e2) { settings = null; }
       // 换设备即清空幽灵记忆：能力是设备的属性，另一台机器可能这条路径是好使的
-      var devId = '';
-      try { devId = (settings && settings.deviceId) ? String(settings.deviceId) : ''; } catch (e3) { devId = ''; }
+      // 必须与 expGhostRemember 用**同一个** devIdOf() 兜底链，否则 engage 侧拿到空串、
+      // 记忆侧拿到 track#N，两边永远不相等 → 上一次刚记下的结论在下次 engage 被误判成
+      // 「换设备」清空（QA DEF-4 的直接后果：记忆形同不存在）
+      var devId = devIdOf();
       if (devId !== expGhost.dev) { expGhost.dev = devId; expGhost.tiers = {}; }
       var plan = pickExposurePlan(cap, settings);
       // 已知无效的档位直接跳过：不让现场每一件衣物都重看一次「徽标说在压暗、画面没变」
       var skippedTier = 0;
-      if (expGhostBlocked(plan.tier)) {
+      // 必须**循环**复查，不能只查一次入口档：双档幽灵设备（tier1 与 tier2 都被实测判过
+      // 无效）若只跳过 tier1，落到 tier2 后 tier2 仍会被完整重走一遍（QA DEF-3 实测：
+      // 第二件衣物仍下发 6 次 manual 约束，无效窗口只从 4.3s 降到 3.5s 而不是 0）。
+      // 降级链尾是 tier0（tier0 不在记忆里），循环必然终止；guard 只是防御性上限。
+      var guard = 0;
+      while (plan.tier > 0 && expGhostBlocked(plan.tier) && guard++ < 4) {
         var alt = demoteExposurePlan(plan, cap, settings);
-        skippedTier = plan.tier;
+        if (!skippedTier) skippedTier = plan.tier;
         plan = alt.plan || { tier: 0, reason: alt.reason };
       }
       expAssist.plan = plan;
@@ -1572,8 +1612,10 @@
       var oldPlan = expAssist.plan;
       var reason = from === 2 ? 'manual-ineffective' : 'comp-ineffective';
       expAssist.demotions += 1;
-      // 记进会话级幽灵记忆：下次 engage（下一件衣物）直接跳过这个档位
-      expGhostRemember(from, devIdOf());
+      // 记进会话级幽灵记忆（达到 EXP_GHOST.minStrikes 才真正生效）：下次 engage
+      // （下一件衣物）直接跳过这个档位。返回值是「这台设备这条路径第几次被判无效」，
+      // 未达门槛时现场也能从日志看出「还差一次」，不用猜为什么这次没跳过
+      var ghostStrikes = expGhostRemember(from, devIdOf());
       // ① 还回去（best-effort：失败只留痕，见 restoreExposure 注释）
       restoreExposure(reason);
       var cap = null;
@@ -1585,13 +1627,22 @@
         settings = track && typeof track.getSettings === 'function' ? track.getSettings() : null;
       } catch (e2) { settings = null; }
       var next = demoteExposurePlan(oldPlan, cap, settings);
+      // 降级后同样要查一次记忆：tier1 判无效会降到 tier2，而 tier2 可能在上一次
+      // engage 里已经单独被判过无效（双档幽灵设备，QA DEF-3）。与 engage 侧同一个循环
+      var g2 = 0;
+      while (next.tier > 0 && next.plan && expGhostBlocked(next.tier) && g2++ < 4) {
+        next = demoteExposurePlan(next.plan, cap, settings);
+      }
       log('warn', 'CAM_EXP_FALLBACK', {
         seq: seq,
         reason: reason,
         tier: next.tier,
         from: from,
         ev: Math.round(expAssist.ev * 100) / 100,
-        drop: verdict && verdict.dropRatio == null ? null : Math.round(verdict.dropRatio * 1000) / 1000
+        drop: verdict && verdict.dropRatio == null ? null : Math.round(verdict.dropRatio * 1000) / 1000,
+        // 第几次被判无效（含本次）。未达 EXP_GHOST.minStrikes 时不会记账，
+        // 现场凭这个字段就能区分「还没到门槛」和「记忆没生效」
+        ghostStrike: ghostStrikes
       });
       // ③ 换量纲：补偿与曝光时间不是同一个量纲，继承旧 ev 没有意义，从 0 重新收敛
       expAssist.ev = 0;
@@ -2629,6 +2680,8 @@
     buildExposureLut: buildExposureLut,
     // 幽灵能力检测（§7.5）：判定参数表 + 三个纯函数
     EXP_EFFECT: EXP_EFFECT,
+    // 幽灵记忆的记账门槛（§7.5 DEF-5 方案①）：同一设备同一档位累计判无效这么多次才记账
+    EXP_GHOST: EXP_GHOST,
     expectedDropRatio: expectedDropRatio,
     judgeExposureEffect: judgeExposureEffect,
     appliedEvOf: appliedEvOf,

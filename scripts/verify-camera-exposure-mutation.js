@@ -324,8 +324,8 @@ const MUTATIONS = [
     // QA 观察项 U19：降级结论不跨 engage 持久 → 幽灵设备每放一件衣物都要重走
     // 约 4s 的「徽标显示 -xEV、画面其实没压暗」窗口，正是现场投诉的形态
     name: '★QA U19★ 幽灵记忆被删掉（换衣物又重走一次无效补偿窗口）',
-    from: 'if (expGhostBlocked(plan.tier)) {',
-    to: 'if (false) { /* MUTANT: 幽灵记忆被删除 */',
+    from: 'while (plan.tier > 0 && expGhostBlocked(plan.tier) && guard++ < 4) {',
+    to: 'while (false) { /* MUTANT: 幽灵记忆被删除 */',
     expect: ['T2', 'T3', 'T4']
   },
   {
@@ -336,6 +336,53 @@ const MUTATIONS = [
     from: 'if (devId !== expGhost.dev) { expGhost.dev = devId; expGhost.tiers = {}; }',
     to: '/* MUTANT: 不按设备区分 */',
     expect: ['T10']
+  },
+  {
+    id: 'M38',
+    // QA DEF-3：双档都无效的设备，跳档只跳一次 → tier2 会被完整重走一遍，
+    // 无效窗口只从 4.3s 降到 3.5s 而不是 0
+    name: '★QA DEF-3★ 跳档只跳一次（不循环复查记忆，tier2 又被重走）',
+    from: 'while (plan.tier > 0 && expGhostBlocked(plan.tier) && guard++ < 4) {',
+    to: 'if (plan.tier > 0 && expGhostBlocked(plan.tier)) { /* MUTANT: 只跳一次 */',
+    expect: ['T12']
+  },
+  {
+    id: 'M39',
+    // QA DEF-4 的一半：engage 侧若改回直接读 settings.deviceId，拿不到时是空串，
+    // 与记忆侧的 track#N 永远不相等 → 记忆刚写下就被自己判成「换设备」清空
+    name: '★QA DEF-4★ engage 侧身份与记忆侧不同源（记忆刚记下就被清空）',
+    from: 'var devId = devIdOf();',
+    to: "var devId = (settings && settings.deviceId) ? String(settings.deviceId) : ''; /* MUTANT: 不同源 */",
+    expect: ['T15']
+  },
+  {
+    id: 'M40',
+    // QA DEF-4 的另一半：去掉 label 兜底 → 两台都不上报 deviceId 的设备落进同一个
+    // track 实例槽 → 好设备被上一台幽灵设备的记录挡住
+    name: '★QA DEF-4★ 去掉 label 兜底（无 deviceId 的两台设备串档）',
+    from: "if (!id) { try { if (t.label) id = String(t.label); } catch (e2) { id = ''; } }",
+    to: '/* MUTANT: 无 label 兜底 */',
+    expect: ['T17']
+  },
+  {
+    id: 'M41',
+    // QA DEF-4 的原始形态：整条兜底链删掉，拿不到 deviceId 就返回 '' → 两台都不上报
+    // deviceId 的设备共用同一个空串槽，好设备被上一台幽灵设备的记录挡住
+    name: '★QA DEF-4★ 兜底链整条删掉（拿不到 deviceId 就返回空串，两台设备共槽）',
+    from: "if (!id) { try { if (t.id) id = String(t.id); } catch (e1) { id = ''; } }\n      if (!id) { try { if (t.label) id = String(t.label); } catch (e2) { id = ''; } }\n      if (!id) {\n        try {\n          if (t.__expUid == null) t.__expUid = 'track#' + (++ghostUidSeq);\n          id = String(t.__expUid);\n        } catch (e3) { id = ''; }\n      }",
+    to: '/* MUTANT: 兜底链被删掉，id 恒为 "" */',
+    expect: ['T17', 'T21']
+  },
+  {
+    id: 'M42',
+    // QA DEF-5 方案① 的负向对照：记账门槛退回「判无效 1 次即记账」。
+    // 环境光漂移（U4b：持续变亮 ≥6 码值/秒）造成的一次误判就会被固化成本会话的
+    // 「永久失去硬件补偿」——正是 team-lead 拍板 2 次门槛要挡掉的风险
+    name: '★QA DEF-5★ 记账门槛退回 1 次（一次漂移误判就永久降级）',
+    from: 'var EXP_GHOST = { minStrikes: 2 };',
+    to: 'var EXP_GHOST = { minStrikes: 1 }; /* MUTANT: 一次即记账 */',
+    // T2/T2b 钉住「第 2 次 engage 仍要探测」，T12 钉住双档同样受门槛约束
+    expect: ['T2', 'T12']
   }
 ];
 
