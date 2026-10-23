@@ -634,6 +634,54 @@ v1.2.13 上线后现场反馈「循环跳亮度 + 过暗（徽标 -5.0EV）」�
 
 tier0（软件压暗）没有硬件约束可发，`appliedEv` 若不更新/不清零，从硬件档降级下来时徽标会把上一个硬件档的实测值当成「软件压暗」的档位显示（如 -2.4EV），与实际下发的解析解不符。修复：engage / release / stop / restart 四条路径一律清零 `actualEv`；tier0 分支把 `appliedEv` 置为解析解。断言 Y3/Y4 + 变异体 M47 守着（撤掉修复 Y4 精确转红：`appliedEv=0.000` vs 解析解 `-3.000`）。
 
+### 7.7 tier2 画面崩塌与 tier1 诚实化（v1.2.15 现场缺陷 3）
+
+v1.2.14 上线后现场仍反馈「循环跳亮度 + 自动调节过暗」。定位到设备 **HB-HD Camera（eba4:dc26，deviceId `6aec7138…`）**，全天日志统计：tier2 共 **87 次 engage、86 次零 STEP**——闭环在空转。根因是三条缺陷叠加，前两条 v1.2.13/1.2.14 只是「绕开」而没有「修掉」。
+
+#### 缺陷 3a：`exposureCompensation:{min:0}` —— 幽灵能力的真相
+
+该设备 `getCapabilities()` 报 **`exposureCompensation: {min:0, max:15, step:1}`**——只有正补偿、没有负补偿。`buildExposureConstraints` 把任何负 ev 钳回 0：约束发出去了、画面一点不变。闭环把 ev 一路推到 -3，实测 `subjectMean` 全程在 116~175 噪声带内不动——这正是幽灵能力的形态（v1.2.13/1.2.14 靠「连续 2 次判无效」把它绕开，代价是每件衣物白付约 4.3s 探测窗口）。
+
+**修复（F4 诚实化）**：`pickExposurePlan` 只在 `exposureCompensation.min < 0` 时才选 tier1。min≥0 的设备直接落到 manual / tier0——功能与旧的「钳到 0」完全一致，只是不再装看不出来。有 manual 能力的设备不受影响（Z1b），有负补偿的正常设备更不受影响（Z1c）。
+
+#### 缺陷 3b：tier2 切 manual 后帧崩到 -7.5EV → 闭环死锁
+
+tier1 被记 2 次后降 tier2，下发 `{exposureMode:'manual', exposureTime: 39.0625}`（= `getSettings()` 在 continuous 下上报的值）。同机探针实证：manual 下 `mean ≈ 0.45 × exposureTime`，625 以上饱和在 151.5；continuous 下画面均值 191~203 而 manual+39.06 只剩 17.5~19——**AE 实际用的时间约 424，上报的 39.06 根本不是它在用的数**。崩塌与闭环请求（ev=0）无关，是模式切换本身造成的。
+
+崩塌帧上发生一条死锁链：还原系数 `rf = refMean/rawSceneMean` 炸到 10 倍以上 → 所有格 `adjMean > 185` → `subjectRatio=0` → `subject-too-small` → `hit=false`；同时 `subjectMean` 为 null → `nextEvStep` 返回 `step=0` → **零补偿下发**，且 `recordEffectSample` 要求 `cl.hit` → **永远采集不到有效性样本** → 档位永不被判无效、幽灵记忆永不形成 → 10 帧 miss + 1.5s 最短保持后 release → 3s 冷却 → 再 engage → **每 3 秒一轮无限振荡**。用户看到的「循环跳亮度」= 每次循环手动/连续模式来回切 + 还原。
+
+**修复（崩塌守卫，`EXP_COLLAPSE = { tol: 2.0 }`）**：判据用**原始场景均值**（还原后的 `sceneMean` 被钳在 `refMean` 上，永远发现不了崩塌），参照取「**上一次 applyConstraints 之前那一帧**」的原始均值（`preApplyMean`），容许深度 = 那次 apply 实际下发的 EV + tol：
+
+```js
+collapseDepth = max(0, -lastAppliedEv) + tol
+collapseFloor = preApplyMean × 2^(-collapseDepth / SRGB_GAMMA)
+rawSceneMean < collapseFloor  →  立刻 restore + 降 tier0（会话保持 ACTIVE）
+```
+
+两个关键设计决策：
+
+- **按次取照，而不是按档位取一次**：过压设备实际压暗是请求的 3 倍（QA X 组 overDepth=2.0），按档位累计深度算会把过压误判成崩塌（实测栽过：X2 徽标测试因此失败）；按次算时每步只容许「本步请求 + 2EV」，过压（每步 ≤1.02EV）天然在容差内，而崩塌（一步 -7.5EV）必然越界。断言 Z4 双向钉住（过压 0 条误判 / 过压检测不被屏蔽），变异体 M50 删掉「每次 apply 前取照」立即转红。
+- **会话保持 ACTIVE（不 release）**：避免「还原→3s 冷却→再 engage→再崩」的二次闪跳。软件兜底只改存档图，不碰预览。幽灵记忆照记（连续两次崩塌后，下次 engage 直接跳过该档位）。
+
+#### 缺陷 3c：零调整离场的安全网
+
+崩塌守卫漏过的变体（帧部分崩塌、闸门反转但不足以触发守卫）与能力残缺设备有同一个终局：硬件档会话一次补偿都没下发成就 release——闭环永远重复「engage→零调整→release」而没有任何机制能挣脱。**修复**：`releaseAssist` 里 `tier>0 && adjusts===0` 时记一次幽灵记忆（`CAM_EXP_RELEASE` 带 `ghostStrike`），连续两次后下次 engage 直接跳过该档位落 tier0（Z5 系列 + 变异体 M51）。
+
+#### 诊断字段（现场排查用）
+
+- `CAM_EXP_FALLBACK{reason:'frame-collapse'}`：`refMean`（取照帧均值）/ `rawMean`（崩塌帧均值）/ `floorMean`（容许下限）/ `ghostStrike`——按 ENGAGE 日志的 `sceneMean` 与 `rawMean` 可现算还原系数 `rf`，区分「画面真的变了」与「还原系数失真」。
+- `CAM_EXP_RELEASE` 新增 `gate/rawMean/subjRatio/adjusts/ghostStrike`（加上原有 `ev` 恰好 6 个非固定键，`MAX_EXTRA_KEYS` 纪律内）。
+
+#### 回归矩阵
+
+| 断言 | 钉住的行为 | 负向对照 |
+| --- | --- | --- |
+| Z1/Z1b/Z1c | min≥0 不选 tier1；manual / 负补偿设备不误伤 | M48 |
+| Z2/Z2b/Z2c | min≥0 设备 engage 即 tier0，且零 tier1 约束 | M48 |
+| Z3~Z3k | 崩塌检出 / 降级 / 还原 / 无振荡 / 会话保持 / 日志字段与数值自洽 | M49、M52 |
+| Z4/Z4b | 过压设备 0 条误判崩塌、过压检测不被屏蔽 | M50 |
+| Z5~Z5g | 零调整 release 记幽灵记忆、两次后跳过该档 | M51 |
+
 ---
 
 ### 8. 关键代码逻辑
@@ -1610,6 +1658,7 @@ graph LR
 | R9 | **闭环输出杀掉自己的输入条件（v1.2.13 现场缺陷 1）**：曝光补偿/手动曝光压暗的是**整帧**（含亮垫板），而检测闸门用的是绝对亮度阈值。垫板 210 在 ev=-0.68 时被压到 169.5，跌破 `expHiMeanMin(185)` → 亮参照格归零、整帧被误判成主体（实测 hiRatio=0.000 / subjectRatio=1.000）→ miss → RELEASE(no-hit) → RESTORE 恢复 → 重新 ENGAGE，**3~6 秒一轮振荡**，用户看到「循环跳亮度」 | 功能看似生效却永不收敛，且比不修更难受（画面持续跳动） | 见 §7.6：ACTIVE 期间把四道闸的亮度按「engage 时中性场景均值 / 当前场景均值」这一**实测压暗系数**还原回中性刻度；闭环反馈仍用原始 subjectMean（控制量不被污染）；ev=0 / 无中性参照时系数=1，与旧实现逐位一致 |
 | R10 | **tier2 过压（v1.2.13 现场缺陷 2）**：手动曝光路径闭环假设「请求 ev = 实际 ev」线性 1:1；设备实际执行时间比请求更短（时间下限 / 量化 / 单位解释），实际压暗达 -5EV → 闭环看到过暗就回加 ev，加过头又太亮，再压又撞到深处 → **bang-bang 振荡 + 过暗** | 照片过暗、画面跳动；徽标若显示实际生效 EV 会露出 -5.0EV | 见 §7.6：每步用实测主体亮度反推 `measuredEv`，与请求比对超 `EXP_OVERPRESS.tol(0.5EV)` 且连续 `hits(2)` 次即记过压设备，把闭环 ev 下限收紧到实测可达深度（`cfg.expEvMin + op`），不再往更深请求；留痕 `CAM_EXP_OVERPRESS`；徽标显示实际生效 EV（诚实展示） |
 | R11 | **tier0 徽标口径（v1.2.13 回归 F1）**：tier0（软件压暗）没有硬件约束可发，若 `appliedEv` 不更新/不清零，从硬件档降级下来时徽标会把上一个硬件档的实测值当成「软件压暗」的档位显示 | 用户看到的档位与实际下发的解析解不符，误导排查 | engage / release / stop / restart 四条路径一律清零 `actualEv`；tier0 分支把 `appliedEv` 置为解析解；断言 Y3/Y4 + 变异体 M47 守着 |
+| R12 | **tier2 模式切换毁画面 + tier1 假能力（v1.2.15 现场缺陷 3）**：① `exposureCompensation:{min:0}` 的设备负 ev 全被钳回 0（幽灵能力真相，v1.2.13/1.2.14 只是靠 2 次记账绕开）；② 切 `exposureMode:'manual'` 后设备不按上报的 `exposureTime` 执行，帧崩到请求无法解释的深度（现场 -7.5EV），崩塌帧上四道闸反转为 `subject-too-small` → 闭环既不下发补偿也永不被判无效 → **每 3s 无限振荡**（全天 87 次 engage / 86 次零 STEP） | 预览循环跳亮度；闭环空转；用户说的「自动调节过暗」 | 见 §7.7：min≥0 不选 tier1（诚实化）；崩塌守卫按「上次 apply 前的帧 + 该次下发 EV + tol」判死并立刻还原降 tier0（会话保持 ACTIVE）；零调整 release 记幽灵记忆作安全网；`CAM_EXP_FALLBACK{frame-collapse}` 带 refMean/rawMean/floorMean 供现场回看；Z1~Z5 断言 + M48~M52 变异体守着 |
 
 ---
 

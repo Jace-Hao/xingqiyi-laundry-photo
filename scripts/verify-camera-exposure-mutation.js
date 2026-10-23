@@ -139,9 +139,11 @@ const MUTATIONS = [
   {
     id: 'M15',
     name: '能力探测跳过 tier1（有补偿能力的设备被降级成 tier0）',
-    from: 'if (cap.exposureCompensation && typeof cap.exposureCompensation.min === \'number\') {',
-    to: 'if (false) {',
-    expect: ['E1', 'E10', 'F4']
+    // 锚点随 F4 诚实化（缺陷 3）更新：tier1 分支现在多了 `min < 0` 条件，
+    // 旧锚点 `...min === 'number') {` 已不存在。整条禁用即「任何设备都不走 tier1」
+    from: "if (cap.exposureCompensation && typeof cap.exposureCompensation.min === 'number' &&\n        cap.exposureCompensation.min < 0) {",
+    to: "if (false) { /* MUTANT: 跳过 tier1 */",
+    expect: ['E1', 'E10', 'F4', 'Z1c']
   },
   {
     id: 'M16',
@@ -438,6 +440,68 @@ const MUTATIONS = [
     from: '        expAssist.ev = solved;\n        // 缺陷 2 / QA F1：tier0 的「实际生效 EV」就是拍照时下发的软件解析解（没有硬件约束可发）。\n        // 不清零的后果：从硬件档降级到 tier0 时，actualEv 残留上一个硬件档的实测值，\n        // 徽标会把「软件压暗」显示成那个残留值（如 -2.4EV），与实际下发的解析解不符\n        expAssist.actualEv = solved;',
     to: '        expAssist.ev = solved;\n        /* MUTANT: tier0 appliedEv 不更新（QA F1） */',
     expect: ['Y4']
+  },
+
+  /* ---------------- 缺陷 3：tier2 画面崩塌 + tier1 诚实化 + 零调整安全网（v1.2.15 现场）---------------- */
+  {
+    id: 'M48',
+    // F4 诚实化：UVC 设备报 exposureCompensation:{min:0,max:15} 表示「只能提亮」，
+    // 这类设备上负 ev 会被 buildExposureConstraints 钳回 0 —— 发了等于没发。修复让
+    // pickExposurePlan 在 min>=0 时不选 tier1。删掉 min<0 条件即回退：闭环又把每一件
+    // 衣物都拿去试探这条永远发 0 的路径（现场 HB-HD Camera 闭环把 ev 推到 -3、
+    // subjectMean 全程 116~175 不动，就是这么来的）
+    name: '★缺陷3★ tier1 诚实化被回退（min>=0 的设备也走 tier1，负 ev 全被钳成 0）',
+    from: "if (cap.exposureCompensation && typeof cap.exposureCompensation.min === 'number' &&\n        cap.exposureCompensation.min < 0) {",
+    to: "if (cap.exposureCompensation && typeof cap.exposureCompensation.min === 'number') {\n        /* MUTANT: min>=0 也走 tier1（负 ev 被钳回 0，约束发了画面不变）*/",
+    expect: ['Z1', 'Z2', 'Z2b', 'Z2c']
+  },
+  {
+    id: 'M49',
+    // 崩塌守卫本体：帧比「请求补偿深度 + tol」所能解释的更暗，就说明这条硬件路径正在
+    // 毁画面，立刻还原并降 tier0。禁用守卫 → 崩塌帧上四道闸反转为 subject-too-small →
+    // 闭环既不下发补偿也永不被判无效 → 每 3s 无限 engage/release（用户说的「循环跳亮度」）
+    name: '★缺陷3★ 崩塌守卫被禁用（帧崩到 -7.5EV 也继续走硬件路径 → 无限振荡）',
+    from: 'if (cl.rawSceneMean < collapseFloor) {',
+    to: 'if (false /* MUTANT: 崩塌守卫被禁用 */) {',
+    // Z3/Z3c~Z3j 钉住检出/还原/无振荡/日志口径。两条不在清单里：
+    // ① Z3f（会话保持 ACTIVE）——守卫禁用时两次零调整 release 后安全网把第三次
+    //    engage 送到 tier0，那一刻状态恰好也是 ACTIVE（恒真），其负向对照在 M51；
+    // ② Z3b（崩塌后落 tier0）——同理，安全网兜底最终也会把 tier 送到 0（恒真）
+    expect: ['Z3', 'Z3c', 'Z3d', 'Z3e', 'Z3g', 'Z3h', 'Z3i', 'Z3j']
+  },
+  {
+    id: 'M50',
+    // 崩塌判据的取照方式：参照必须是「上一次 applyConstraints 之前那一帧」且容许深度
+    // 取「那次 apply 实际下发的 EV + tol」。按档位只取一次照（engage 时的中性帧）时，
+    // 过压设备（实际压暗 = 请求 ×3）从第 3 步起就会被误判成崩塌 —— QA X 组实测栽过：
+    // X2 徽标测试因此失败（会话被崩塌守卫提前杀掉，ev 被冲掉）。删掉每次 apply 前的
+    // 取照即复现该误判；好设备（实际 = 请求）不受影响，所以这条变异只红 Z4/X2
+    name: '★缺陷3★ 崩塌参照不随每次 apply 更新（过压设备被误判成崩塌）',
+    from: 'expAssist.preApplyMean = (cl.rawSceneMean != null && isFinite(cl.rawSceneMean) && cl.rawSceneMean > 0)\n        ? cl.rawSceneMean : expAssist.preApplyMean;',
+    to: '/* MUTANT: 崩塌参照只按档位取一次（engage 时的中性帧），不随每次 apply 更新 */',
+    expect: ['Z4', 'X2']
+  },
+  {
+    id: 'M51',
+    // 零调整离场的安全网：硬件档会话一次补偿都没下发成就 release，说明这个档位在当前
+    // 设备上使不上力（崩塌守卫漏过的变体 / 能力残缺）。记幽灵记忆，连续两次后下次
+    // engage 直接跳过该档。禁用安全网 → 闭环永远重复「engage→零调整→release」而没有任何
+    // 机制能挣脱（这正是现场 87 次 engage、86 次零 STEP 的形态）
+    name: '★缺陷3★ 零调整 release 不记幽灵记忆（engage→零调整→release 无限循环）',
+    from: 'if (expAssist.tier > 0 && expAssist.adjusts === 0) {',
+    to: 'if (expAssist.tier > 0 && expAssist.adjusts < 0) { /* MUTANT: 零调整安全网被禁用 */',
+    expect: ['Z5', 'Z5d']
+  },
+  {
+    id: 'M52',
+    // 崩塌判据的容差深度：容许比请求深 2EV（吸收过压设备实测约 1.6EV）。容差作废到
+    // 100EV 时任何压暗都「可解释」→ 崩塌永远检不出 → 回到无限振荡
+    name: '★缺陷3★ 崩塌容差作废（tol 放到 100EV，任何压暗都判不出崩塌）',
+    from: 'tol: 2.0    // 容许比请求深这么多 EV（吸收过压设备：实测过压约 1.6EV）',
+    to: 'tol: 100    /* MUTANT: 容差作废，崩塌永远检不出 */',
+    // 同 M49：Z3b/Z3f 对该变异恒真（两次零调整 release 后安全网把会话送到 tier0，
+    // tier 与状态恰好都是「崩塌降级后」的值）
+    expect: ['Z3', 'Z3c', 'Z3d', 'Z3e', 'Z3g', 'Z3h', 'Z3i', 'Z3j']
   }
 ];
 

@@ -1220,6 +1220,36 @@ async function suite() {
     });
   }
 
+  // 过压设备模型（缺陷 2 / 缺陷 3 共用）：设备实际执行的曝光时间比请求的更短，
+  // 实际压暗深度 = 请求 ×(1+depth)。X 组用它验证过压检出与徽标诚实，
+  // Z 组用它验证「过压不被崩塌守卫误判」。乘法而非「请求 − depth」的原因见 X 组注释
+  function lastAppliedTime(track) {
+    for (let i = track.calls.length - 1; i >= 0; i--) {
+      const a = track.calls[i] && track.calls[i].advanced && track.calls[i].advanced[0];
+      if (a && typeof a.exposureTime === 'number') return a.exposureTime;
+    }
+    return null;
+  }
+  function overPressImage(track, bt, depth, sN, pN) {
+    return function () {
+      const t = lastAppliedTime(track) || bt;     // 设备收到的请求时间
+      const reqEv = Math.log2(t / bt);             // 请求的 EV
+      // 过压（乘法模型）：设备实际执行时间比请求更短，使实际压暗深度 = 请求 ×(1+depth)。
+      // 用乘法而非「请求 − depth」：后者在请求 ev=0 时已把整帧压暗 depth EV，导致中性帧
+      // 一上来就过暗、闸门永远不命中、过压检测根本没机会运行。乘法在请求 0 时给中性帧
+      // （正常 engage），只在请求变负后才越压越深，符合「用户请求压暗、设备执行得更狠」
+      const actualEv = reqEv * (1 + depth);
+      const f = Math.pow(2, actualEv / 2.2);
+      return makeImage(function (cx, cy) {
+        const inCenter = cy >= 2 && cy <= 4 && cx >= 2 && cx <= 5;
+        const below = (cy === 5 || cy === 6) && cx >= 1 && cx <= 5;
+        const base = (inCenter || below) ? sN : pN;
+        const v = Math.max(0, Math.min(255, Math.round(base * f)));
+        return [v, v, v];
+      });
+    };
+  }
+
   await (async function () {
     /* --- R1/R2：正常设备与幽灵设备的对照（同一套参数，只差画面响不响应） --- */
     const mkResponsive = function () {
@@ -1858,34 +1888,10 @@ async function suite() {
     // 单位解释都可能），实际压暗比请求深 overDepth EV。闭环假设「请求 ev = 实际 ev」
     // 1:1，看到过暗就往回加 ev → bang-bang 振荡。修复：每步用实测主体亮度反推实际
     // 生效 EV，与请求比对，超容差记过压设备并收紧 ev 下限；徽标诚实展示实际 EV。
+    // （overPressImage / lastAppliedTime 已提升为共享辅助 —— Z 组复用同一模型验证
+    //   「过压不被崩塌守卫误判」，两份实现必然漂移，故只保留一份）
     const baseTime = 1000, overDepth = 2.0;
     const subjN = 150, padN = 210;
-    function lastAppliedTime(track) {
-      for (let i = track.calls.length - 1; i >= 0; i--) {
-        const a = track.calls[i] && track.calls[i].advanced && track.calls[i].advanced[0];
-        if (a && typeof a.exposureTime === 'number') return a.exposureTime;
-      }
-      return null;
-    }
-    function overPressImage(track, bt, depth, sN, pN) {
-      return function () {
-        const t = lastAppliedTime(track) || bt;     // 设备收到的请求时间
-        const reqEv = Math.log2(t / bt);             // 请求的 EV
-        // 过压（乘法模型）：设备实际执行时间比请求更短，使实际压暗深度 = 请求 ×(1+depth)。
-        // 用乘法而非「请求 − depth」：后者在请求 ev=0 时已把整帧压暗 depth EV，导致中性帧
-        // 一上来就过暗、闸门永远不命中、过压检测根本没机会运行。乘法在请求 0 时给中性帧
-        // （正常 engage），只在请求变负后才越压越深，符合「用户请求压暗、设备执行得更狠」。
-        const actualEv = reqEv * (1 + depth);
-        const f = Math.pow(2, actualEv / 2.2);
-        return makeImage(function (cx, cy) {
-          const inCenter = cy >= 2 && cy <= 4 && cx >= 2 && cx <= 5;
-          const below = (cy === 5 || cy === 6) && cx >= 1 && cx <= 5;
-          const base = (inCenter || below) ? sN : pN;
-          const v = Math.max(0, Math.min(255, Math.round(base * f)));
-          return [v, v, v];
-        });
-      };
-    }
     const trackX = makeExpTrack({
       caps: { exposureMode: ['manual', 'continuous'], exposureTime: { min: 10, max: 100000 } },
       settings: { exposureTime: baseTime }
@@ -1896,7 +1902,10 @@ async function suite() {
       config: { expEffectWindowMs: 0 }
     });
     await boot(hX);
-    await pump(hX.clock, 600, 5);
+    // 缺陷 3 起 engage 也记 lastApplyAt（模式切换后要先等 settle 再测帧，否则崩塌守卫
+    // 会拿到过渡帧）。首步因此晚 250ms，过压需要两次间隔 500ms 的实测才记账，
+    // 窗口从 600ms 放宽到 1400ms；断言本身不变
+    await pump(hX.clock, 1400, 5);
     const infoX = hX.ctrl.getExposureInfo();
     // ① 过压被检出：打出 CAM_EXP_OVERPRESS（reason: over-press）
     const overLogs = eventsOf(hX.logs, 'CAM_EXP_OVERPRESS');
@@ -1946,6 +1955,243 @@ async function suite() {
     await flush(60);
     assert(hY.clock.count() === 0, 'Y5 无悬挂定时器');
   }
+
+  /* ---------------------------------------------------------------- *
+   * Z. 缺陷 3：画面崩塌守卫 / tier1 min>=0 诚实化 / 零调整安全网
+   *    （v1.2.15 现场：HB-HD Camera eba4:dc26，闭环每 3s 无限振荡）
+   * ---------------------------------------------------------------- */
+  console.log('\n· Z 缺陷 3：画面崩塌守卫（现场 -7.5EV → 闭环死循环）');
+  await (async function () {
+    /* ---- Z1 纯函数：exposureCompensation.min >= 0 的设备不选 tier1（F4 诚实化）---- */
+    // UVC 设备报 {min:0,max:15} 表示「只能提亮」。这类设备上 buildExposureConstraints
+    // 会把任何负 ev 钳回 0 —— 约束发出去、画面一点不变，正是幽灵能力的形态。
+    // min>=0 时直接不走这条路径：功能与旧的「钳到 0」完全一致，只是不再装看不出来
+    eq(C.pickExposurePlan({ exposureCompensation: { min: 0, max: 15, step: 1 } }, { exposureCompensation: 0 }).tier, 0,
+      'Z1 只报正补偿（min:0）的设备不选 tier1（负 ev 会被钳回 0，发了等于没发）');
+    eq(C.pickExposurePlan({
+      exposureCompensation: { min: 0, max: 15, step: 1 },
+      exposureMode: ['manual', 'continuous'],
+      exposureTime: { min: 10, max: 100000 }
+    }, { exposureTime: 1000 }).tier, 2,
+      'Z1b min>=0 但有 manual 能力的设备仍落 tier2（manual 才是真能压暗的路径，不误伤）');
+    eq(C.pickExposurePlan({ exposureCompensation: { min: -3, max: 3, step: 0.1 } }, { exposureCompensation: 0 }).tier, 1,
+      'Z1c 有负补偿能力的设备仍选 tier1（诚实化不误伤正常设备）');
+
+    /* ---- Z2 集成：min>=0 设备 engage 即落 tier0，且从未下发过 tier1 约束 ---- */
+    const trackMin0 = makeExpTrack({
+      caps: { exposureCompensation: { min: 0, max: 15, step: 1 } },
+      settings: { exposureCompensation: 0, deviceId: 'min0-cam' }
+    });
+    const hMin0 = makeHarness({ track: trackMin0, config: { expEffectWindowMs: 0 } });
+    await boot(hMin0);
+    await pump(hMin0.clock, 300, 5);
+    const infoMin0 = hMin0.ctrl.getExposureInfo();
+    eq(infoMin0.tier, 0, 'Z2 只报正补偿的设备 engage 即落 tier0（实际 tier=' + infoMin0.tier + '）');
+    const compCalls0 = trackMin0.calls.filter(function (c) {
+      const a = c.advanced && c.advanced[0];
+      return a && typeof a.exposureCompensation === 'number';
+    });
+    eq(compCalls0.length, 0,
+      'Z2b 全程未下发任何 exposureCompensation 约束（' + compCalls0.length +
+      ' 次）——旧实现会把负 ev 钳成 0 发出去，白付每件衣物 4.3s 探测窗口');
+    assert(reasonsOf(hMin0.logs, 'CAM_EXP_ENUM').indexOf('unsupported') >= 0,
+      'Z2c ENUM 如实记录 tier0 原因 unsupported（现场可从日志看出「这台设备没有可用硬件路径」）');
+    hMin0.ctrl.unmount();
+    await flush(60);
+    assert(hMin0.clock.count() === 0, 'Z2d 无悬挂定时器');
+
+    /* ---- Z3 集成：tier2 切 manual 后帧崩到请求无法解释的深度 → 守卫命中降级 ---- */
+    const trackZ = makeExpTrack({
+      caps: { exposureMode: ['manual', 'continuous'], exposureTime: { min: 10, max: 100000 } },
+      settings: { exposureTime: 1000, deviceId: 'collapse-cam' }
+    });
+    // 现场形态有两点必须复刻，少一点都测不出真故障：
+    // ① 崩塌与「设备处在 manual 模式」绑定，而不是与某一次 apply 绑定 —— restore 切回
+    //    continuous 后画面会恢复，于是形成「engage→崩→release→再 engage→再崩」的无限
+    //    振荡（v1.2.14 全天 87 次 engage / 86 次零 STEP 就是这么来的）。若把崩塌写成
+    //    一次性 latch，振荡根本不会发生，「无振荡」断言会变成恒真
+    // ② 崩塌是**非均匀**的：亮垫板几乎全灭、衣物只掉一半。均匀崩塌会被缺陷 1 的整帧
+    //    还原机制完美抵消（还原系数恰为 1/f），闸门照样命中 —— 现场日志里的反转形态
+    //    是 subject-too-small（还原系数≈6.2 后衣物格 adjMean≈460 > 185 → 主体格判失），
+    //    只有非均匀崩塌能把它造出来
+    let zInManual = false;
+    const rawApplyZ = trackZ.applyConstraints.bind(trackZ);
+    trackZ.applyConstraints = function (cst) {
+      const p = rawApplyZ(cst);
+      const a = cst && cst.advanced && cst.advanced[0];
+      if (a && a.exposureMode === 'manual') zInManual = true;
+      if (a && a.exposureMode === 'continuous') zInManual = false;   // restore 切回连续
+      return p;
+    };
+    function collapseGrid() {
+      return makeImage(function (cx, cy) {
+        const inCenter = cy >= 2 && cy <= 4 && cx >= 2 && cx <= 5;
+        const below = (cy === 5 || cy === 6) && cx >= 1 && cx <= 5;
+        const base = (inCenter || below) ? PAL.grey : PAL.pad;
+        // 衣物（灰 150）掉到 47%、垫板（亮黄）几乎全灭（2.2%）——现场 HB-HD Camera
+        // continuous→manual 后 203 → 19（≈-7.6EV）且亮部/暗部衰减不同步的形态
+        const f = (inCenter || below) ? 0.47 : 0.022;
+        return base.map(function (v) { return Math.max(0, Math.round(v * f)); });
+      });
+    }
+    const hZ = makeHarness({
+      track: trackZ,
+      image: function () { return zInManual ? collapseGrid() : SCENE.A(); },
+      config: { expEffectWindowMs: 0 }
+    });
+    await boot(hZ);
+    // 逐周期推进到崩塌命中为止（再等约 40ms 画面持续不命中就会正常 release，
+    // 必须先抓住命中瞬间的状态）
+    let fbZ = [];
+    for (let i = 0; i < 80 && fbZ.length === 0; i++) {
+      await pump(hZ.clock, 5, 5);
+      fbZ = eventsOf(hZ.logs, 'CAM_EXP_FALLBACK').filter(function (x) {
+        return x.fields.reason === 'frame-collapse';
+      });
+    }
+    const infoZ = hZ.ctrl.getExposureInfo();
+    assert(fbZ.length === 1,
+      'Z3 崩塌被守卫检出：恰好 1 条 CAM_EXP_FALLBACK{reason:frame-collapse}（实际 ' + fbZ.length + ' 条）');
+    eq(infoZ.tier, 0, 'Z3b 崩塌后立刻落 tier0（实际 tier=' + infoZ.tier + '）');
+    assert(eventsOf(hZ.logs, 'CAM_EXP_ENUM').some(function (x) {
+      return x.fields.tier === 0 && x.fields.reason === 'frame-collapse';
+    }), 'Z3c ENUM 记录 tier0 reason=frame-collapse（现场可回看「为什么掉了硬件档」）');
+    const rsZ = eventsOf(hZ.logs, 'CAM_EXP_RESTORE').filter(function (x) {
+      return x.fields.reason === 'frame-collapse';
+    });
+    assert(rsZ.length === 1 && rsZ[0].fields.ok === true,
+      'Z3d 崩塌后立刻还原（CAM_EXP_RESTORE{reason:frame-collapse,ok:true}，实际 ' + rsZ.length + ' 条）');
+    assert(eventsOf(hZ.logs, 'CAM_EXP_ENGAGE').length === 1 && eventsOf(hZ.logs, 'CAM_EXP_RELEASE').length === 0,
+      'Z3e 无振荡：ENGAGE 仅 1 次、RELEASE 0 次（缺陷未修复时是每 3s 一次的 engage/release 循环）');
+    eq(infoZ.state, 'ACTIVE',
+      'Z3f 会话保持 ACTIVE 不 release（避免「还原→冷却→再 engage→再崩」的二次闪跳，实际 ' + infoZ.state + '）');
+    // 崩塌日志的字段纪律：非固定键 ≤6（refMean/rawMean/floorMean 是现场定位「崩了多少」的唯一依据）
+    const fixedKeys = ['ts', 'level', 'event', 'seq', 'device', 'attempt', 'reason', 'err', 'res'];
+    const extraZ = fbZ.length ? Object.keys(fbZ[0].fields).filter(function (k) {
+      return fixedKeys.indexOf(k) < 0;
+    }) : [];
+    assert(extraZ.length > 0 && extraZ.length <= 6,
+      'Z3g 崩塌日志附加字段 ≤6 个（实际 ' + extraZ.length + '：' + extraZ.join(',') + '）');
+    assert(fbZ.length && fbZ[0].fields.rawMean < fbZ[0].fields.floorMean &&
+      fbZ[0].fields.floorMean < fbZ[0].fields.refMean,
+      'Z3h 崩塌日志数值自洽：rawMean(' + (fbZ.length ? fbZ[0].fields.rawMean : '?') + ') < floorMean(' +
+      (fbZ.length ? fbZ[0].fields.floorMean : '?') + ') < refMean(' + (fbZ.length ? fbZ[0].fields.refMean : '?') + ')');
+    eq(fbZ.length ? fbZ[0].fields.ghostStrike : 0, 1,
+      'Z3i 崩塌记 1 次幽灵记忆（ghostStrike=1，连续两次后下次 engage 直接跳过该档位）');
+    // 长时间也不再 engage：画面一直崩着（不命中闸门），闭环不得反复试探
+    await pump(hZ.clock, 1500, 5);
+    assert(eventsOf(hZ.logs, 'CAM_EXP_ENGAGE').length === 1,
+      'Z3j 崩塌后 1.5s 内无第二次 engage（无振荡，实际 ' +
+      eventsOf(hZ.logs, 'CAM_EXP_ENGAGE').length + ' 次）');
+    hZ.ctrl.unmount();
+    await flush(60);
+    assert(hZ.clock.count() === 0, 'Z3k 无悬挂定时器');
+
+    /* ---- Z4 过压设备不被误判成崩塌（按次取照判据的负向对照）---- */
+    // X 组模型：实际压暗 = 请求 ×3。若崩塌判据按「档位累计深度」取照，过压设备在
+    // ev≈-1.36 时就会被误判成崩塌（实测栽过：X2 徽标测试因此失败）；按次取照时
+    // 每步只容许「本步请求 + 2EV」，过压每步 ≤1.02EV 天然在容差内
+    const trackOP = makeExpTrack({
+      caps: { exposureMode: ['manual', 'continuous'], exposureTime: { min: 10, max: 100000 } },
+      settings: { exposureTime: 1000, deviceId: 'overpress-cam' }
+    });
+    const hOP = makeHarness({
+      track: trackOP,
+      image: overPressImage(trackOP, 1000, 2.0, 150, 210),
+      config: { expEffectWindowMs: 0 }
+    });
+    await boot(hOP);
+    await pump(hOP.clock, 2000, 5);
+    eq(eventsOf(hOP.logs, 'CAM_EXP_FALLBACK').filter(function (x) {
+      return x.fields.reason === 'frame-collapse';
+    }).length, 0,
+      'Z4 过压设备（实际压暗 = 请求 ×3）全程不被误判成崩塌（实际 0 条 frame-collapse）');
+    assert(eventsOf(hOP.logs, 'CAM_EXP_OVERPRESS').length >= 1,
+      'Z4b 同一设备仍能正常检出过压（崩塌守卫没有把过压检测一起屏蔽掉）');
+    hOP.ctrl.unmount();
+    await flush(60);
+    assert(hOP.clock.count() === 0, 'Z4c 无悬挂定时器');
+
+    /* ---- Z5 零调整 release 的安全网：记幽灵记忆，两次后跳过该档 ---- */
+    // 崩塌守卫漏过的变体 / 能力残缺：硬件档会话一次补偿都没下发成就被判离场
+    // （闸门反转 → subjectMean 为 null → nextEvStep 返回 step=0 → 零 apply）。
+    // 没有安全网，闭环会永远重复「engage→零调整→release」而没有任何机制能挣脱
+    const trackZA = makeExpTrack({
+      caps: { exposureCompensation: { min: -3, max: 3, step: 0.1 } },
+      settings: { exposureCompensation: 0, deviceId: 'zeroadj-cam' }
+    });
+    let zaWhite = false;
+    const rawApplyZA = trackZA.applyConstraints.bind(trackZA);
+    trackZA.applyConstraints = function (cst) {
+      const p = rawApplyZA(cst);
+      // 只在**补偿**约束（engage/STEP，带 exposureMode:'continuous'）之后翻转画面；
+      // restore 约束只有 {exposureCompensation:0}，不翻 —— 否则还原瞬间又把画面切走
+      const a = cst && cst.advanced && cst.advanced[0];
+      if (a && a.exposureMode === 'continuous') zaWhite = true;
+      return p;
+    };
+    const hZA = makeHarness({
+      track: trackZA,
+      image: function () { return zaWhite ? allWhite() : SCENE.A(); },
+      config: { expEffectWindowMs: 0 }
+    });
+    function allWhite() {
+      return makeImage(function () { return PAL.white; });
+    }
+    await boot(hZA);
+    // 第一件衣物：engage 后画面变全白（闸门反转、subjectMean 为 null）→ 零调整 release
+    await pump(hZA.clock, 400, 5);
+    const relZA = eventsOf(hZA.logs, 'CAM_EXP_RELEASE');
+    assert(relZA.length === 1 && relZA[0].fields.adjusts === 0 && relZA[0].fields.ghostStrike === 1,
+      'Z5 零调整 release 记幽灵记忆（release ' + relZA.length + ' 次，adjusts=' +
+      (relZA.length ? relZA[0].fields.adjusts : '?') + '，ghostStrike=' +
+      (relZA.length ? relZA[0].fields.ghostStrike : '?') + '）');
+    const relExtra = relZA.length ? Object.keys(relZA[0].fields).filter(function (k) {
+      return fixedKeys.indexOf(k) < 0;
+    }) : [];
+    assert(relExtra.length > 0 && relExtra.length <= 6,
+      'Z5b RELEASE 诊断字段 ≤6 个（实际 ' + relExtra.length + '：' + relExtra.join(',') +
+      '）——gate/rawMean/subjRatio/adjusts/ghostStrike 是现场区分「场景变了」与「还原系数失真」的唯一依据');
+    // 第二件衣物：strike=1 未达门槛 → 仍重新探测 tier1（没有跳过）。
+    // 注意这里与 T 组的幽灵设备不同：闸门反转后 subjectMean 为 null → nextEvStep 返回
+    // step=0，整场会话一次负补偿都不会发 —— 「仍探测」的证据是 ENUM 仍报 tier1，
+    // 而不是负补偿条数
+    zaWhite = false;
+    await pump(hZA.clock, 400, 5);
+    const enumsZA2 = eventsOf(hZA.logs, 'CAM_EXP_ENUM');
+    assert(enumsZA2.length === 2 && enumsZA2[1].fields.tier === 1,
+      'Z5c 第 2 次 engage 仍重新探测 tier1（记账门槛 2 次，这次是故意多付的窗口；ENUM tier 序列 ' +
+      JSON.stringify(enumsZA2.map(function (x) { return x.fields.tier; })) + '）');
+    eq(eventsOf(hZA.logs, 'CAM_EXP_FALLBACK').filter(function (x) {
+      return x.fields.reason === 'ghost-remembered';
+    }).length, 0, 'Z5c2 门槛未达时不得跳过任何档位（ghost-remembered 0 条）');
+    await pump(hZA.clock, 400, 5);
+    const relZA2 = eventsOf(hZA.logs, 'CAM_EXP_RELEASE');
+    assert(relZA2.length === 2 && relZA2[1].fields.ghostStrike === 2,
+      'Z5d 第二次零调整 release 累计到门槛（ghostStrike=' +
+      (relZA2.length > 1 ? relZA2[1].fields.ghostStrike : '?') + '，到 2 才记账）');
+    // 第三件衣物：门槛已达 → 直接跳过 tier1，且不再零调整空转
+    zaWhite = false;
+    const ghostBefore = eventsOf(hZA.logs, 'CAM_EXP_FALLBACK').filter(function (x) {
+      return x.fields.reason === 'ghost-remembered';
+    }).length;
+    const callsZA3from = trackZA.calls.length;
+    await pump(hZA.clock, 600, 5);
+    const callsZA3 = trackZA.calls.slice(callsZA3from).filter(function (c) {
+      const a = c.advanced && c.advanced[0];
+      return a && typeof a.exposureCompensation === 'number';
+    });
+    eq(callsZA3.length, 0,
+      'Z5e 第 3 次 engage 不再下发任何 exposureCompensation 约束（幽灵记忆生效，实际 ' +
+      callsZA3.length + ' 次）');
+    eq(eventsOf(hZA.logs, 'CAM_EXP_FALLBACK').filter(function (x) {
+      return x.fields.reason === 'ghost-remembered';
+    }).length, ghostBefore + 1,
+      'Z5f 跳过留痕恰好 1 条 CAM_EXP_FALLBACK{reason:ghost-remembered}');
+    hZA.ctrl.unmount();
+    await flush(60);
+    assert(hZA.clock.count() === 0, 'Z5g 零调整路径无悬挂定时器');
+  })();
 }
 
 /* ========================================================================== *

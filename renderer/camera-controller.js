@@ -243,7 +243,8 @@
     if (!n) {
       return {
         hit: false, reason: 'no-cells', subjectRatio: 0, hiRatio: 0,
-        centerSubjectRatio: 0, sceneMean: null, subjectMean: null, clipRatio: 0, cells: 0
+        centerSubjectRatio: 0, sceneMean: null, subjectMean: null, clipRatio: 0, cells: 0,
+        rawSceneMean: null, restoreFactor: 1
       };
     }
     // 先算「原始（未还原）场景均值」：整帧均匀缩放 → 当前场景均值 / 中性场景均值 = f。
@@ -288,7 +289,12 @@
       sceneMean: sum / n,
       subjectMean: subject ? subjSum / subject : null,
       clipRatio: clipSum / n,
-      cells: n
+      cells: n,
+      // 诊断口径：还原前的原始场景均值与还原系数。闸门判定用的是还原值（sceneMean），
+      // 现场排查「ACTIVE 后闸门为什么反转让闭环既不下发补偿也不被判无效」时，
+      // 必须同时看到这两个数才能分清「画面真的变了」与「还原系数失真」
+      rawSceneMean: rawSceneMean,
+      restoreFactor: restoreFactor
     };
     // 按序短路：每一道都对应一类必须排除的场景（设计文档 §6.1 场景表）
     if (out.sceneMean < t.expSceneMeanMin) { out.reason = 'overall-dark-or-blocked'; return out; }
@@ -396,6 +402,22 @@
     hits: 2     // 连续 2 次确认，避免单次噪声误判
   };
 
+  // 画面崩塌守卫（缺陷 3，现场 2026-10-23 复现）：tier2 切 exposureMode:'manual' 时，
+  // 部分设备并不按 getSettings() 上报的 exposureTime 执行。现场实测（HB-HD Camera
+  // eba4:dc26）：continuous 下画面均值 203、上报 exposureTime=39.06，切 manual 后
+  // 同一时间值下画面均值崩到 19（≈-7.5EV），而闭环请求的 ev=0 —— 也就是说崩塌与请求无关。
+  // （同机探针：manual 下 mean≈0.45×exposureTime，625 以上饱和在 151.5；
+  //  即 continuous 的 AE 实际用的时间约 424，上报值 39.06 根本不是它在用的数。）
+  // 崩塌帧的后果是一条死循环：还原系数 = refMean/rawSceneMean 炸到 10 倍以上，
+  // 四道闸整体反转成 subject-too-small → 闭环既不下发补偿（subjectMean 为 null），
+  // 也永远采集不到有效性样本（recordEffectSample 要求 cl.hit）→ 档位永远不被判无效、
+  // 幽灵记忆永远不形成 → 每 3s 反复 engage/release，用户看到的就是「循环跳亮度」。
+  // 判据：帧比「请求补偿深度 + tol」所能解释的更暗，就说明这条路径正在毁画面，
+  // 立刻还原并降 tier0（软件兜底只改存档图，不碰预览）。
+  var EXP_COLLAPSE = {
+    tol: 2.0    // 容许比请求深这么多 EV（吸收过压设备：实测过压约 1.6EV）
+  };
+
   function numOr(v, dflt) {
     var n = Number(v);
     return isFinite(n) ? n : dflt;
@@ -489,7 +511,13 @@
   // 且部分 UVC 的 getCapabilities() 直接抛异常，调用方必须包 try
   function pickExposurePlan(cap, settings) {
     if (!cap || typeof cap !== 'object') return { tier: 0, reason: 'no-capabilities' };
-    if (cap.exposureCompensation && typeof cap.exposureCompensation.min === 'number') {
+    // min < 0 才可能压暗：UVC 设备报 exposureCompensation:{min:0,max:15} 表示「只能提亮」。
+    // 这类设备上 buildExposureConstraints 会把任何负 ev 钳回 0 —— 约束发出去、画面一点不变，
+    // 正是幽灵能力的形态（现场 HB-HD Camera eba4:dc26 实测：闭环把 ev 推到 -3，
+    // subjectMean 全程在 116~175 噪声带内不动）。min>=0 时直接不走这条路径，
+    // 不让每一件衣物都白付 4.3s 探测窗口；功能上与旧的「钳到 0」完全一致，只是不装看不出来。
+    if (cap.exposureCompensation && typeof cap.exposureCompensation.min === 'number' &&
+        cap.exposureCompensation.min < 0) {
       return {
         tier: 1,
         reason: 'exposure-compensation',
@@ -1291,6 +1319,11 @@
       // 天然含过压带来的额外压暗、且无帧滞后；对帧不随补偿变暗的静态/幽灵设备 f≈1 → 不还原
       // → 与旧实现完全一致，不会漂移到 185 以上误判失格。
       expRefMean: 0,
+      // 缺陷 3：画面崩塌守卫的中性参照 —— 当前档位**接手前**那一帧的原始场景均值。
+      // 与 expRefMean 分开存：expRefMean 服务闸门还原（跨档位不更新，保持中性刻度），
+      // 而这个参照每次换档都要更新（tier1 压暗过的画面才是 tier2 的「中性」），
+      // 否则会把上一档合法压暗的帧误判成崩塌
+      preApplyMean: 0,
       adjusts: 0,
       fails: 0,
       lastApplyAt: 0,
@@ -1393,6 +1426,7 @@
       expAssist.evFloor = cfg.expEvMin;
       expAssist.actualEv = 0;
       expAssist.expRefMean = 0;
+      expAssist.preApplyMean = 0;
       resetEffectWatch(null);
       scheduleExposureCycle(mySeq, cfg.expEngageDelayMs);
     }
@@ -1451,6 +1485,7 @@
       expAssist.evFloor = cfg.expEvMin;
       expAssist.actualEv = 0;
       expAssist.expRefMean = 0;
+      expAssist.preApplyMean = 0;
       resetEffectWatch(null);
       emitExposure();
     }
@@ -1489,10 +1524,10 @@
         expAssist.lastSceneMean = cl.sceneMean;
         expAssist.lastSubjectMean = cl.subjectMean;
         expAssist.lastSubjectRatio = cl.subjectRatio;
-        var h = stepAssistHysteresis(expAssist.st, cl.hit, now(), cfg);
-        expAssist.st = h.st;
-        if (h.action === 'engage') await engageAssist(mySeq, cl);
-        else if (h.action === 'release') releaseAssist('no-hit');
+    var h = stepAssistHysteresis(expAssist.st, cl.hit, now(), cfg);
+    expAssist.st = h.st;
+    if (h.action === 'engage') await engageAssist(mySeq, cl);
+    else if (h.action === 'release') releaseAssist('no-hit', cl);
         else if (expAssist.state === 'ACTIVE') await tickClosedLoop(mySeq, cl);
         if (mySeq !== seq || !alive) return;
         scheduleExposureCycle(mySeq, cfg.expCycleMs);
@@ -1563,6 +1598,10 @@
       // clOpts.refMean=0 → cl.sceneMean 即原始中性场景均值）。ACTIVE 后每帧按实测压暗系数还原，
       // 亮垫板被还原回 210、黑衣物还原回 150，闸门不再自杀。
       expAssist.expRefMean = (cl && isFinite(cl.sceneMean) && cl.sceneMean > 0) ? cl.sceneMean : 0;
+      // 缺陷 3：崩塌守卫的参照取「本档 apply 之前的原始帧」。engage 时 cl 还没被任何
+      // 曝光约束碰过（clOpts.refMean=0），rawSceneMean 就是接手前的亮度。
+      // 与 tickClosedLoop 的步进同语义：只在 apply 真的成功时更新（设备没动就不能换参照）
+      var preApplyMean = (cl && isFinite(cl.rawSceneMean) && cl.rawSceneMean > 0) ? cl.rawSceneMean : 0;
       // 先把模式切过去（补偿从 0 起，具体压多少交给闭环），失败即降级 tier0
       var cst = buildExposureConstraints(plan, 0);
       var ok = await applyExposure(track, cst, mySeq);
@@ -1572,8 +1611,12 @@
         log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'engage-apply-failed', tier: plan.tier });
       } else {
         expAssist.dirty = true;
+        expAssist.preApplyMean = preApplyMean;
         expAssist.lastAppliedEv = appliedEvOf(plan, 0, cst);
         expAssist.prevAppliedEv = 0;
+        // 与 demoteExposureTier 对齐：记下这次 apply 的时刻。不记的后果是 engage 后第一个
+        // 周期就通过频率闸门，拿到的是模式切换后还没稳定的过渡帧 —— 崩塌守卫会把它当成崩塌
+        expAssist.lastApplyAt = now();
       }
       log('info', 'CAM_EXP_ENGAGE', {
         seq: seq,
@@ -1590,6 +1633,34 @@
       // 频率限制：距上次 apply 不足 max(stepGap, settle) 不动。不足 settle
       // 说明 AE 还在收敛，此刻测的亮度是过渡值，拿它算步长会过冲
       if (nowMs - expAssist.lastApplyAt < Math.max(cfg.expStepGapMs, cfg.expSettleMs)) return;
+
+      // 缺陷 3：画面崩塌守卫。tier2 切 manual 时设备不按上报的 exposureTime 执行，
+      // 帧会崩到远低于任何请求所能解释的亮度（现场 -7.5EV）。崩塌帧上四道闸整体反转、
+      // 闭环既不动也不被判无效，形成每 3s 一次的无限振荡 —— 这是用户说的「循环跳亮度」。
+      // 判据用原始场景均值（还原后的 sceneMean 被钳在 refMean 上，永远发现不了崩塌）。
+      // 参照取「上一次 applyConstraints 之前那一帧」的原始均值，容许深度 = 那次 apply 实际
+      // 下发的 EV + tol。为什么按次取照而不是按档位取一次：过压设备实际压暗是请求的 3 倍
+      // （QA X 组 overDepth=2.0），按档位累计深度算会把过压误判成崩塌；按次算时每步只容许
+      // 「本步请求 + 2EV」，过压（每步 ≤1.02EV）天然在容差内，而崩塌（一步 -7.5EV）必然越界
+      if (expAssist.tier > 0 && expAssist.preApplyMean > 0 &&
+          cl.rawSceneMean != null && isFinite(cl.rawSceneMean) && cl.rawSceneMean > 0) {
+        var collapseDepth = Math.max(0, -(expAssist.lastAppliedEv || 0)) + EXP_COLLAPSE.tol;
+        var collapseFloor = expAssist.preApplyMean *
+          Math.pow(2, -collapseDepth / SRGB_GAMMA);
+        if (cl.rawSceneMean < collapseFloor) {
+          var collapseStrikes = expGhostRemember(expAssist.tier, devIdOf());
+          log('warn', 'CAM_EXP_FALLBACK', {
+            seq: seq, reason: 'frame-collapse', tier: expAssist.tier,
+            ev: Math.round(expAssist.ev * 100) / 100,
+            refMean: Math.round(expAssist.preApplyMean),
+            rawMean: Math.round(cl.rawSceneMean),
+            floorMean: Math.round(collapseFloor),
+            ghostStrike: collapseStrikes
+          });
+          demoteForCollapse(mySeq);
+          return;
+        }
+      }
 
       // 缺陷 2：用实测主体亮度反推「实际生效 EV」。闭环假设「请求 ev = 实际 ev」线性 1:1，
       // 设备若把请求时间再乘 1/k 执行（时间下限 / 量化 / 单位解释都可能），实际压暗会更深，
@@ -1647,7 +1718,7 @@
           startedAt: expAssist.effAt
         }, cfg);
         if (v.verdict === 'ineffective') {
-          await demoteExposureTier(mySeq, v);
+          await demoteExposureTier(mySeq, v, cl);
           return;
         }
       }
@@ -1692,6 +1763,10 @@
         }
         return;
       }
+      // 缺陷 3：记下「这次 apply 之前的帧」。崩塌守卫以此为参照判断下一帧是不是
+      // 无解释地崩了；apply 失败时不该更新参照（设备没动，参照必须留在原地）
+      expAssist.preApplyMean = (cl.rawSceneMean != null && isFinite(cl.rawSceneMean) && cl.rawSceneMean > 0)
+        ? cl.rawSceneMean : expAssist.preApplyMean;
       expAssist.prevAppliedEv = expAssist.lastAppliedEv;
       expAssist.lastAppliedEv = appliedEvOf(expAssist.plan, r.ev, cst);
       // 实测反推的实际生效 EV：幽灵判定的 lastAppliedEv 保持「请求值」不变，这里单独记账，
@@ -1740,7 +1815,7 @@
     //      偏置会叠在同一台设备上，用户看到的是「莫名偏暗」；
     //   ② 重新探测下一档（把无效的那个能力摘掉再探测）；
     //   ③ 换量纲 → ev 归零、基线与观测序列重置，对新档位**重新做一次有效性验证**。
-    async function demoteExposureTier(mySeq, verdict) {
+    async function demoteExposureTier(mySeq, verdict, cl) {
       var track = activeTrack();
       var from = expAssist.tier;
       var oldPlan = expAssist.plan;
@@ -1782,6 +1857,9 @@
       expAssist.ev = 0;
       expAssist.adjusts = 0;
       expAssist.fails = 0;
+      // 缺陷 3：崩塌守卫的参照换成「上一档 apply 之前的当前帧」——新档位接手时看到的就是
+      // 这个亮度，拿它当基准才不会把上一档合法压暗的部分算成崩塌
+      var preApplyMean2 = (cl && isFinite(cl.rawSceneMean) && cl.rawSceneMean > 0) ? cl.rawSceneMean : 0;
       resetEffectWatch(null);
       if (next.tier === 0 || !next.plan || !track) {
         expAssist.plan = null;
@@ -1804,6 +1882,8 @@
         expAssist.lastAppliedEv = appliedEvOf(next.plan, 0, cst);
         expAssist.prevAppliedEv = 0;
         expAssist.lastApplyAt = now();
+        // 缺陷 3：降级 apply 成功后才生效参照——上面失败时不能更新（设备没动，参照必须留在原地）
+        expAssist.preApplyMean = preApplyMean2;
       }
       emitExposure();
     }
@@ -1847,9 +1927,28 @@
       return true;
     }
 
-    function releaseAssist(reason) {
+    function releaseAssist(reason, cl) {
       if (expAssist.state !== 'ACTIVE') return;
-      log('info', 'CAM_EXP_RELEASE', { seq: seq, reason: reason, ev: Math.round(expAssist.ev * 100) / 100 });
+      // 缺陷 3 的安全网：硬件档会话一次补偿都没下发成就被判离场，说明这个档位在当前
+      // 设备上根本使不上力（崩塌守卫漏过的变体、能力残缺等）。记一次幽灵记忆：
+      // 连续两次同样的「零调整离场」后，下次 engage 直接跳过该档位落 tier0 ——
+      // 没有这条，闭环会永远重复「engage→零调整→release」而没有任何机制能挣脱
+      var zeroAdjustStrike = 0;
+      if (expAssist.tier > 0 && expAssist.adjusts === 0) {
+        zeroAdjustStrike = expGhostRemember(expAssist.tier, devIdOf());
+      }
+      log('info', 'CAM_EXP_RELEASE', {
+        seq: seq, reason: reason,
+        ev: Math.round(expAssist.ev * 100) / 100,
+        // 闸门明细：离场时是哪一道闸没过、还原前的原始亮度、本会话下发过几次。
+        // 没有这些字段，现场只能看到「no-hit」而分不清是场景变了还是还原系数失真
+        // （rf = engage 中性均值 / rawMean，需要时可按 ENGAGE 日志的 sceneMean 现算）
+        gate: cl && cl.reason ? cl.reason : null,
+        rawMean: cl && cl.rawSceneMean != null ? Math.round(cl.rawSceneMean) : null,
+        subjRatio: cl && cl.subjectRatio != null ? Math.round(cl.subjectRatio * 100) / 100 : null,
+        adjusts: expAssist.adjusts,
+        ghostStrike: zeroAdjustStrike || null
+      });
       // 衣物移出画面时 track 还活着，这里的恢复是用户可感知的，必须真发
       restoreExposure(reason);
       expAssist.state = 'IDLE';
@@ -1865,11 +1964,34 @@
       expAssist.evFloor = cfg.expEvMin;
       expAssist.actualEv = 0;
       expAssist.expRefMean = 0;
+      expAssist.preApplyMean = 0;   // 缺陷 3：崩塌参照随会话一起清零
       resetEffectWatch(null);
       emitExposure();
     }
 
-    // 恢复曝光：best-effort，点火即忘（sleep/unmount/releaseActive 路径是同步调用它的）。
+    // 画面崩塌后的降级（缺陷 3）：这条硬件路径正在毁画面，立刻还原并落 tier0。
+    // 与 demoteExposureTier 的两点区别：① 不重新探测下一档 —— 崩塌是实测结论，
+    // 不是「证据不足」，没有值得再试的硬件路径；② 会话保持 ACTIVE（不 release），
+    // 避免「还原→3s 冷却→再 engage→再崩」的二次闪跳。软件兜底只改存档图，不碰预览。
+    // 幽灵记忆照记：达到 EXP_GHOST.minStrikes 后，下次 engage 直接跳过这个档位
+    function demoteForCollapse(mySeq) {
+      restoreExposure('frame-collapse');
+      expAssist.demotions += 1;
+      expAssist.ev = 0;
+      expAssist.adjusts = 0;
+      expAssist.fails = 0;
+      expAssist.plan = null;
+      expAssist.tier = 0;
+      expAssist.actualEv = 0;
+      expAssist.overPress = 0;
+      expAssist.overPressStreak = 0;
+      expAssist.evFloor = cfg.expEvMin;
+      expAssist.preApplyMean = 0;
+      resetEffectWatch(null);
+      log('info', 'CAM_EXP_ENUM', { seq: seq, tier: 0, reason: 'frame-collapse' });
+      emitExposure();
+    }
+
     // 刻意不挂 waitMs 竞速定时器：那些路径上 clearTimers() 往往已经跑过，
     // 再挂一颗定时器就会留下永不回收的悬挂定时 —— 而这里的流马上就停，
     // 设备重置后设置本来就会丢，失败只需留痕，不需要重排
