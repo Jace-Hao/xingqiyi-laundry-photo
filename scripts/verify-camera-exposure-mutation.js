@@ -383,6 +383,61 @@ const MUTATIONS = [
     to: 'var EXP_GHOST = { minStrikes: 1 }; /* MUTANT: 一次即记账 */',
     // T2/T2b 钉住「第 2 次 engage 仍要探测」，T12 钉住双档同样受门槛约束
     expect: ['T2', 'T12']
+  },
+
+  /* ---------------- 缺陷 1：压暗导致检测闸门自杀（v1.2.13 现场）---------------- */
+  {
+    id: 'M43',
+    // 缺陷 1 的核心回归点：整帧压暗后，亮垫板（中性 210）会跌到 expSubjectMeanMax(185) 以下，
+    // 若主体判据用「原始实测亮度」就会把垫板误判成主体 → subjectRatio 飙到 1.0 → subject-too-large
+    // 自杀 → RESTORE/ENGAGE 振荡。修复让主体判据改用「还原后亮度」(adjMean)。回退它即复现缺陷。
+    name: '★缺陷1★ 主体判据退回原始亮度（亮垫板被误判成主体 → 闸门自杀）',
+    from: 'var isSubject = adjMean <= t.expSubjectMeanMax && c.sat < t.expSubjectSatMax;',
+    to: 'var isSubject = c.mean <= t.expSubjectMeanMax && c.sat < t.expSubjectSatMax; /* MUTANT: 主体不还原 */',
+    // W2/W4 钉住缺陷 1 的集成行为（engage 仅 1 次、无自杀式 release）；
+    // X1/X2 钉住：垫板混入主体后闸门自杀、过压设备根本没机会被检出
+    expect: ['W2', 'W4', 'X1', 'X2']
+  },
+  {
+    id: 'M44',
+    // 缺陷 1 的还原机制本体：engage 时捕获的中性场景均值(expRefMean)是闸门还原的唯一参照。
+    // 删掉捕获 → 还原系数恒为 1 → 整帧压暗后亮垫板跌破 185、且混入主体计数 → 闸门自杀。
+    name: '★缺陷1★ 中性参照不捕获（整帧还原失效 → 闸门自杀）',
+    from: 'expAssist.expRefMean = (cl && isFinite(cl.sceneMean) && cl.sceneMean > 0) ? cl.sceneMean : 0;',
+    to: '/* MUTANT: 不捕获中性参照，expRefMean 恒为 0 → 整帧还原失效 */',
+    expect: ['W2', 'W4', 'X1', 'X2']
+  },
+
+  /* ---------------- 缺陷 2：tier2 过压设备（v1.2.13 现场）---------------- */
+  {
+    id: 'M45',
+    // 缺陷 2 的过压判定本体：每步用实测主体亮度反推实际生效 EV，与请求比对，超容差记过压。
+    // 把过压差值 op 清零 → 永远判不出过压 → 闭环继续按「请求=实际」1:1 假设，bang-bang 振荡、
+    // 徽标也永远不会打上 CAM_EXP_OVERPRESS（reason=over-press）。
+    name: '★缺陷2★ 过压差值被清零（永远判不出过压设备）',
+    from: 'var op = expAssist.ev - measuredEv;',
+    to: 'var op = 0; /* MUTANT: 过压差值被清零 */',
+    expect: ['X1']
+  },
+  {
+    id: 'M46',
+    // 缺陷 2 的诚实展示：appliedEv（徽标展示的实际生效 EV）必须由实测亮度反推，不能恒为 0。
+    // 回退成恒 0 → 徽标永远显示「实际 0EV」，过压设备「实际压到 -3EV」的事实被掩盖。
+    name: '★缺陷2★ 实测实际 EV 不更新（徽标撒谎，过压深度被掩盖）',
+    from: 'expAssist.actualEv = (measuredEv != null) ? measuredEv : expAssist.actualEv;',
+    to: 'expAssist.actualEv = 0; /* MUTANT: 实测实际 EV 不更新 */',
+    expect: ['X2']
+  },
+  {
+    id: 'M47',
+    // QA F1：tier0（软件压暗）的徽标口径。tier0 没有硬件约束可发，「实际生效 EV」就是
+    // 拍照时下发的解析解；不清零/不更新 → 从硬件档降级下来时徽标残留上一个硬件档的实测值，
+    // 把「软件压暗」显示成假档位（用户看到的 -5.0EV 就是这类口径问题的放大版）。
+    name: '★QA F1★ tier0 的 appliedEv 不更新（徽标把软件压暗显示成硬件档残留值）',
+    // 注意：变异框架会把源码 CRLF 归一成 LF，锚点用 \n；变异体删掉的是赋值行本身
+    from: '        expAssist.ev = solved;\n        // 缺陷 2 / QA F1：tier0 的「实际生效 EV」就是拍照时下发的软件解析解（没有硬件约束可发）。\n        // 不清零的后果：从硬件档降级到 tier0 时，actualEv 残留上一个硬件档的实测值，\n        // 徽标会把「软件压暗」显示成那个残留值（如 -2.4EV），与实际下发的解析解不符\n        expAssist.actualEv = solved;',
+    to: '        expAssist.ev = solved;\n        /* MUTANT: tier0 appliedEv 不更新（QA F1） */',
+    expect: ['Y4']
   }
 ];
 

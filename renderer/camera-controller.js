@@ -204,10 +204,41 @@
   }
 
   // 场景判定：是否命中「黑色衣物过曝」场景。四类相邻暗场景的区分见设计文档 §6.1
-  function classifyExposureGrid(cells, th) {
+  function classifyExposureGrid(cells, th, opts) {
     // 缺省阈值取 DEFAULTS：单测可以直接传 { expXxx: ... } 只覆盖关心的几项
     var t = Object.assign({}, DEFAULTS, th || {});
     var grid = t.expGridCells;
+    // 曝光还原（缺陷 1）：ACTIVE 且「实测实际生效 EV」(actualEv) < 0 时，参与「判定闸门」
+    // 的亮度要按曝光偏移还原回中性刻度，否则压暗整帧会把亮垫板压到 expHiMeanMin 以下、
+    // 甚至跌到 expSubjectMeanMax 以下混入主体计数 → 闸门自杀 → 闭环反复 RESTORE/ENGAGE
+    // 振荡（用户看到的循环跳亮）。
+    // 物理：设备压暗整帧，实测 c.mean = 中性亮度 × 2^(actualEv/gamma)。还原即乘 2^(-actualEv/gamma)。
+    // 还原口径必须覆盖全部四道闸（亮参照格 / 场景均值 / 主体格 / 中心主体），理由：
+    //   · 亮参照格（垫板）中性≈185，压暗后极易跌破 → 不还原则 hiRatio 塌陷、no-bright-reference。
+    //   · 主体格：黑衣物中性=150 本就 ≤185，但整帧压暗后亮垫板会跌到 ≤185 而被误判成主体 →
+    //     subjectRatio 飙到 1.0、subject-too-large 自杀。用还原亮度判主体可让垫板还原回 210
+    //     （>185，不算主体）、黑衣物还原回 150（≤185，仍算主体）。
+    //   · 还原系数取「实测实际生效 EV」而非「请求 EV」：帧不随补偿变暗的静态/幽灵设备
+    //     actualEv≈0 → 系数≈1 → 主体按原始亮度判，与旧实现完全一致、不漂移、不误判失格。
+    //   · ev=0（未介入 / actualEv=0）时系数为 1，所有量与原实现完全一致。
+    var ev = opts && typeof opts.ev === 'number' ? opts.ev : 0;
+    var gamma = (opts && opts.gamma) ? opts.gamma : SRGB_GAMMA;
+    if (!(gamma > 0)) gamma = SRGB_GAMMA;
+    // 曝光还原（缺陷 1）：设备压暗的是「整帧」，实测 c.mean = 中性亮度 × 2^(actualEv/gamma)。
+    // 闸门的还原不是按某个 EV 值乘系数，而是按「当前整帧相对 engage 时中性帧的实测压暗系数 f」
+    // 还原回中性刻度（f = 当前场景均值 / 中性场景均值，整帧均匀缩放 → 该比值恰为 f）。
+    // 还原口径覆盖全部四道闸（亮参照格 / 场景均值 / 主体格 / 中心主体）：
+    //   · 亮参照格（垫板）中性≈185，压暗后极易跌破 → 不还原则 hiRatio 塌陷、no-bright-reference。
+    //   · 主体格：黑衣物中性=150 本就 ≤185，但整帧压暗后亮垫板会跌到 ≤185 而被误判成主体 →
+    //     subjectRatio 飙到 1.0、subject-too-large 自杀。用还原亮度判主体可让垫板还原回 210
+    //     （>185，不算主体）、黑衣物还原回 150（≤185，仍算主体）。
+    // 用「场景均值之比」而非「请求 EV / 实测 EV」的好处：
+    //   · 无帧滞后——比值来自当前这一帧；过压设备若把帧压得更狠，比值天然含这份额外压暗，
+    //     还原仍精确（用请求 EV 还原会欠还原，垫板仍跌破 185 → subject-too-large）。
+    //   · 对帧不随补偿变暗的静态 / 幽灵设备，f≈1 → 还原系数≈1 → 主体按原始亮度判，与旧实现
+    //     完全一致、不漂移到 185 以上误判失格。
+    //   · ev=0（未介入 / 无中性参照）→ 还原系数=1，所有量与原实现完全一致。
+    var refMean = (opts && typeof opts.refMean === 'number' && opts.refMean > 0) ? opts.refMean : 0;
     var n = cells && cells.length ? cells.length : 0;
     if (!n) {
       return {
@@ -215,12 +246,17 @@
         centerSubjectRatio: 0, sceneMean: null, subjectMean: null, clipRatio: 0, cells: 0
       };
     }
+    // 先算「原始（未还原）场景均值」：整帧均匀缩放 → 当前场景均值 / 中性场景均值 = f。
+    var rawSceneSum = 0;
+    for (var k0 = 0; k0 < n; k0++) rawSceneSum += cells[k0].mean;
+    var rawSceneMean = rawSceneSum / n;
+    var restoreFactor = (refMean > 0 && rawSceneMean > 0) ? refMean / rawSceneMean : 1;
     var subject = 0;
     var hi = 0;
     var centerSubject = 0;
     var centerTotal = 0;
-    var sum = 0;
-    var subjSum = 0;
+    var sum = 0;        // 还原后的场景均值（用于闸门判定，≈ 中性场景均值）
+    var subjSum = 0;    // 原始主体均值（闭环反馈，不参与还原）
     var clipSum = 0;
     // 中心区域 = 网格中央一半（g/4 ~ 3g/4）
     var lo = Math.floor(grid / 4);
@@ -229,12 +265,14 @@
       var c = cells[i];
       var cx = i % grid;
       var cy = Math.floor(i / grid);
-      // 主体格：比垫板暗且低饱和。刻意不要求 mean<60 —— 被 AE 提亮成
-      // 灰白色的黑衣物（mean 90~185、sat≈0.1）正是要救的对象
-      var isSubject = c.mean <= t.expSubjectMeanMax && c.sat < t.expSubjectSatMax;
-      if (isSubject) { subject++; subjSum += c.mean; }
-      if (c.mean > t.expHiMeanMin) hi++;
-      sum += c.mean;
+      var adjMean = c.mean * restoreFactor;   // 四道闸共用同一还原亮度（亮参照格/场景均值/主体格/中心主体）
+      // 主体格判据用「还原后亮度」(adjMean)，与亮参照格 / 场景均值同一口径：
+      // 整帧压暗时亮垫板被还原回 210（>185，不算主体 → 否则 subject-too-large 自杀），
+      // 黑衣物被还原回 150（≤185，仍算主体）。饱和判据仍用原始 c.sat（亮度缩放不改色相）。
+      var isSubject = adjMean <= t.expSubjectMeanMax && c.sat < t.expSubjectSatMax;
+      if (isSubject) { subject++; subjSum += c.mean; }   // subjSum 仍用原始亮度，供闭环反馈
+      if (adjMean > t.expHiMeanMin) hi++;
+      sum += adjMean;
       clipSum += c.clip;
       if (cx >= lo && cx < hiEdge && cy >= lo && cy < hiEdge) {
         centerTotal++;
@@ -347,6 +385,16 @@
   // 用户几乎无感**的代价 —— 风险不对称，所以选 2 而不是 1。
   // 注意：调回 1 会让变异体 M42（记账门槛被放宽）失去判别力。
   var EXP_GHOST = { minStrikes: 2 };
+
+  // 过压设备（缺陷 2）：tier2 手动曝光路径，设备实际执行时间比请求的更短（时间下限 /
+  // 量化 / 单位解释都可能），导致实际压暗深度超过请求。闭环假设「请求 ev = 实际 ev」线性
+  // 1:1，看到过暗就往回加 ev → bang-bang 振荡，用户看到过暗且循环跳变。每步用实测主体
+  // 亮度反推实际生效 EV，与请求比对，超过容差即记过压设备，并把闭环 ev 下限收紧到
+  // 「实测可达深度」，不再往更深处请求（更深只会被设备再压更深）。
+  var EXP_OVERPRESS = {
+    tol: 0.5,   // 实际比请求深超过 0.5EV 才判（吸收 AE 抖动 / 衣物微动）
+    hits: 2     // 连续 2 次确认，避免单次噪声误判
+  };
 
   function numOr(v, dflt) {
     var n = Number(v);
@@ -1237,6 +1285,12 @@
       lastSceneMean: null,
       lastSubjectMean: null,
       lastSubjectRatio: null,
+      // 缺陷 1：engage 时（ev=0、整帧中性）捕获的「中性场景均值」，作为判定闸门的还原参照。
+      // ACTIVE 后每帧按「当前场景均值 / 中性场景均值」这一由整帧实测得出的压暗系数 f 还原回
+      // 中性刻度（亮垫板→210、黑衣物→150）。用场景均值之比而非请求/实测 EV：该比值恰为 1/f、
+      // 天然含过压带来的额外压暗、且无帧滞后；对帧不随补偿变暗的静态/幽灵设备 f≈1 → 不还原
+      // → 与旧实现完全一致，不会漂移到 185 以上误判失格。
+      expRefMean: 0,
       adjusts: 0,
       fails: 0,
       lastApplyAt: 0,
@@ -1246,8 +1300,15 @@
       effSamples: [],
       effAt: 0,
       demotions: 0,
-      lastAppliedEv: 0,   // 上一次**真的下发**到设备的补偿量
-      prevAppliedEv: 0    // 上上一次，用于识别「已经压不动了（pinned）」
+      lastAppliedEv: 0,   // 上一次**请求**下发到设备的补偿量（EV，幽灵能力判定用）
+      prevAppliedEv: 0,   // 上上一次，用于识别「已经压不动了（pinned）」
+      // 缺陷 2：过压设备。overPress = 请求 EV − 实际 EV（>0 表示过压）；
+      // evFloor 把闭环 ev 下限收紧到实测可达深度，避免往「只会被设备再压更深」处请求。
+      // actualEv 是实测反推的实际生效 EV（徽标与过压判定用，比请求值诚实）
+      overPress: 0,
+      overPressStreak: 0,
+      evFloor: -3.0,
+      actualEv: 0
     };
     var expWatch = null;
 
@@ -1319,6 +1380,7 @@
       expAssist.tier = 0;
       expAssist.plan = null;
       expAssist.dirty = false;
+      expAssist.actualEv = 0;   // 缺陷 2：实测 EV 一并清零，避免下次 engage 徽标读到残留
       expAssist.lastSceneMean = null;
       expAssist.lastSubjectMean = null;
       expAssist.lastSubjectRatio = null;
@@ -1326,6 +1388,11 @@
       expAssist.fails = 0;
       expAssist.lastApplyAt = 0;
       expAssist.demotions = 0;
+      expAssist.overPress = 0;
+      expAssist.overPressStreak = 0;
+      expAssist.evFloor = cfg.expEvMin;
+      expAssist.actualEv = 0;
+      expAssist.expRefMean = 0;
       resetEffectWatch(null);
       scheduleExposureCycle(mySeq, cfg.expEngageDelayMs);
     }
@@ -1377,7 +1444,13 @@
       expAssist.tier = 0;
       expAssist.plan = null;
       expAssist.dirty = false;
+      expAssist.actualEv = 0;   // 缺陷 2：实测 EV 一并清零，避免下次 engage 徽标读到残留
       expAssist.demotions = 0;
+      expAssist.overPress = 0;
+      expAssist.overPressStreak = 0;
+      expAssist.evFloor = cfg.expEvMin;
+      expAssist.actualEv = 0;
+      expAssist.expRefMean = 0;
       resetEffectWatch(null);
       emitExposure();
     }
@@ -1405,7 +1478,14 @@
         try { image = gridSampler(el, cfg.expGridSize); } catch (e) { image = null; }
         var cells = computeGridStats(image, cfg.expGridCells);
         if (!cells) { scheduleExposureCycle(mySeq, cfg.expCycleMs); return; }
-        var cl = classifyExposureGrid(cells, cfg);
+        // 缺陷 1 修复：把当前整帧按「engage 时中性场景均值 / 当前场景均值」这一实测压暗系数
+        // 还原回中性刻度（亮垫板→210、黑衣物→150），四道闸同一口径，闸门稳定不再自杀。
+        // 用场景均值之比（而非请求 EV / 实测 EV）的原因：整帧均匀压暗下该比值恰为 1/f、天然
+        // 含过压带来的额外压暗、且无帧滞后；对帧不随补偿变暗的静态/幽灵设备 f≈1 → 不还原 →
+        // 与旧实现完全一致。ev=0（无中性参照）→ 还原系数=1。
+        var clOpts = (expAssist.state === 'ACTIVE' && expAssist.expRefMean > 0)
+          ? { refMean: expAssist.expRefMean, gamma: SRGB_GAMMA } : { refMean: 0, gamma: SRGB_GAMMA };
+        var cl = classifyExposureGrid(cells, cfg, clOpts);
         expAssist.lastSceneMean = cl.sceneMean;
         expAssist.lastSubjectMean = cl.subjectMean;
         expAssist.lastSubjectRatio = cl.subjectRatio;
@@ -1427,6 +1507,9 @@
       var track = activeTrack();
       expAssist.state = 'ACTIVE';
       expAssist.ev = 0;
+      // 缺陷 2：实测实际生效 EV 一并清零。不清零的后果见 tier0 分支：从硬件档降级下来时
+      // 徽标会把上一个硬件档的实测值当成「软件压暗」的档位显示（QA F1）
+      expAssist.actualEv = 0;
       expAssist.adjusts = 0;
       expAssist.fails = 0;
       if (!track || typeof track.getCapabilities !== 'function') {
@@ -1476,6 +1559,10 @@
       }
       // 有效性判定的起点：本档位下的第一条基线 + 空观测序列
       resetEffectWatch(cl.subjectMean);
+      // 缺陷 1：捕获 engage 时的中性场景均值作为判定闸门还原参照（此时 ev=0、整帧中性，
+      // clOpts.refMean=0 → cl.sceneMean 即原始中性场景均值）。ACTIVE 后每帧按实测压暗系数还原，
+      // 亮垫板被还原回 210、黑衣物还原回 150，闸门不再自杀。
+      expAssist.expRefMean = (cl && isFinite(cl.sceneMean) && cl.sceneMean > 0) ? cl.sceneMean : 0;
       // 先把模式切过去（补偿从 0 起，具体压多少交给闭环），失败即降级 tier0
       var cst = buildExposureConstraints(plan, 0);
       var ok = await applyExposure(track, cst, mySeq);
@@ -1503,9 +1590,49 @@
       // 频率限制：距上次 apply 不足 max(stepGap, settle) 不动。不足 settle
       // 说明 AE 还在收敛，此刻测的亮度是过渡值，拿它算步长会过冲
       if (nowMs - expAssist.lastApplyAt < Math.max(cfg.expStepGapMs, cfg.expSettleMs)) return;
+
+      // 缺陷 2：用实测主体亮度反推「实际生效 EV」。闭环假设「请求 ev = 实际 ev」线性 1:1，
+      // 设备若把请求时间再乘 1/k 执行（时间下限 / 量化 / 单位解释都可能），实际压暗会更深，
+      // 闭环看到过暗就往回加 ev → bang-bang 振荡。先量出 actual，供过压判定与徽标使用。
+      var measuredEv = null;
+      if (cl.subjectMean != null && isFinite(cl.subjectMean) && cl.subjectMean > 0 &&
+          expAssist.effBaseline != null && isFinite(expAssist.effBaseline) && expAssist.effBaseline > 0 &&
+          expAssist.lastApplyAt > 0) {
+        measuredEv = SRGB_GAMMA * (Math.log(cl.subjectMean / expAssist.effBaseline) / Math.LN2);
+        if (!isFinite(measuredEv) || measuredEv > 0) measuredEv = null;  // 物理上不会变亮
+      }
+      // 过压判定（连续命中才记，吸收 AE 抖动 / 衣物微动）：实际比请求深超过容差即记过压设备，
+      // 并把闭环 ev 下限收紧到「实测可达深度」，不再往更深（只会被设备再压更深）处请求。
+      if (measuredEv != null && expAssist.ev < 0) {
+        var op = expAssist.ev - measuredEv;   // >0 表示实际更深
+        var prevOverPress = expAssist.overPress;
+        if (measuredEv < expAssist.ev - EXP_OVERPRESS.tol && op > 0) {
+          expAssist.overPressStreak += 1;
+        } else {
+          expAssist.overPressStreak = 0;
+        }
+        if (expAssist.overPressStreak >= EXP_OVERPRESS.hits && op > expAssist.overPress) {
+          expAssist.overPress = op;
+          expAssist.evFloor = Math.min(0, cfg.expEvMin + op);
+          // 只在「过压更深了」时记一条；稳态后 op 不再增长就不再刷日志
+          // （真实设备每周期都过压，不拦会秒级刷屏）
+          if (op > (prevOverPress + 1e-9)) {
+            log('warn', 'CAM_EXP_OVERPRESS', {
+              seq: seq, reason: 'over-press', tier: expAssist.tier,
+              requestedEv: Math.round(expAssist.ev * 100) / 100,
+              measuredEv: Math.round(measuredEv * 100) / 100,
+              overPress: Math.round(op * 100) / 100,
+              evFloor: Math.round(expAssist.evFloor * 100) / 100
+            });
+          }
+        }
+      }
+      // 闭环步长：把 ev 下限收紧到过压后可达深度，不再请求更深
       var r = nextEvStep(expAssist.ev, cl.subjectMean, cfg);
-      // 记下「上一次真的下发下去的补偿」的实测响应（此刻已过 settle，量到的是稳态值）。
-      // 幽灵能力只能靠这一步测出来：约束发出去 ≠ 画面真的变暗
+      if (r.ev < expAssist.evFloor) {
+        r = { ev: expAssist.evFloor, step: expAssist.evFloor - expAssist.ev, err: r.err };
+      }
+      // 幽灵能力只能靠这一步测出来：约束发出去 ≠ 画面真的变暗（lastAppliedEv 仍为请求值）
       if (expAssist.tier > 0 && cl.hit && expAssist.lastApplyAt > 0) {
         recordEffectSample(cl, nowMs, r.err > 0 &&
           Math.abs(expAssist.lastAppliedEv - expAssist.prevAppliedEv) < 1e-6);
@@ -1534,6 +1661,10 @@
         // 已在位（含抖动 <0.01EV ≈ 0.4% 亮度）就不重复记账
         if (Math.abs(jump) < 0.01) return;
         expAssist.ev = solved;
+        // 缺陷 2 / QA F1：tier0 的「实际生效 EV」就是拍照时下发的软件解析解（没有硬件约束可发）。
+        // 不清零的后果：从硬件档降级到 tier0 时，actualEv 残留上一个硬件档的实测值，
+        // 徽标会把「软件压暗」显示成那个残留值（如 -2.4EV），与实际下发的解析解不符
+        expAssist.actualEv = solved;
         expAssist.lastApplyAt = nowMs;
         expAssist.adjusts += 1;
         log('info', 'CAM_EXP_STEP', {
@@ -1563,6 +1694,9 @@
       }
       expAssist.prevAppliedEv = expAssist.lastAppliedEv;
       expAssist.lastAppliedEv = appliedEvOf(expAssist.plan, r.ev, cst);
+      // 实测反推的实际生效 EV：幽灵判定的 lastAppliedEv 保持「请求值」不变，这里单独记账，
+      // 供徽标诚实展示（缺陷 2）与「闭环是否已被钳在可达深度」判定
+      expAssist.actualEv = (measuredEv != null) ? measuredEv : expAssist.actualEv;
       expAssist.ev = r.ev;
       expAssist.lastApplyAt = nowMs;
       expAssist.adjusts += 1;
@@ -1724,7 +1858,13 @@
       expAssist.tier = 0;
       expAssist.plan = null;
       expAssist.dirty = false;
+      expAssist.actualEv = 0;   // 缺陷 2：实测 EV 一并清零，避免下次 engage 徽标读到残留
       expAssist.demotions = 0;
+      expAssist.overPress = 0;
+      expAssist.overPressStreak = 0;
+      expAssist.evFloor = cfg.expEvMin;
+      expAssist.actualEv = 0;
+      expAssist.expRefMean = 0;
       resetEffectWatch(null);
       emitExposure();
     }
@@ -1777,6 +1917,7 @@
       emit('exposure', {
         state: expAssist.state,
         ev: expAssist.ev,
+        appliedEv: expAssist.actualEv,   // 缺陷 2：实际生效 EV（由实测亮度反推，诚实展示）
         tier: expAssist.tier,
         sceneMean: expAssist.lastSceneMean,
         subjectMean: expAssist.lastSubjectMean,
@@ -2629,6 +2770,7 @@
         return {
           state: expAssist.state,
           ev: expAssist.ev,
+          appliedEv: expAssist.actualEv,   // 缺陷 2：实际生效 EV（徽标据此诚实展示）
           tier: expAssist.tier,
           sceneMean: expAssist.lastSceneMean,
           subjectMean: expAssist.lastSubjectMean,

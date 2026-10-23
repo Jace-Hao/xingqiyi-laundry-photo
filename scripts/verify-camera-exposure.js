@@ -1742,7 +1742,7 @@ async function suite() {
     const ENUM = (m ? m[1] : '').match(/'CAM_[A-Z_]+'/g) || [];
     const enumList = ENUM.map(function (s) { return s.replace(/'/g, ''); });
     const NEW_EVENTS = ['CAM_EXP_ENUM', 'CAM_EXP_ENGAGE', 'CAM_EXP_STEP', 'CAM_EXP_RELEASE',
-      'CAM_EXP_RESTORE', 'CAM_EXP_SKIP', 'CAM_EXP_FALLBACK', 'CAM_EXP_BLACKGATE'];
+      'CAM_EXP_RESTORE', 'CAM_EXP_SKIP', 'CAM_EXP_FALLBACK', 'CAM_EXP_BLACKGATE', 'CAM_EXP_OVERPRESS'];
     const missing = NEW_EVENTS.filter(function (e) { return enumList.indexOf(e) < 0; });
     assert(missing.length === 0, 'N2 8 个 CAM_EXP_* 事件全部登记进 ENUM（缺：' + (missing.join(',') || '无') + '）');
 
@@ -1791,6 +1791,160 @@ async function suite() {
     assert(badType === 0, 'N7 附加字段均为原始类型（对象/数组会被主进程丢弃）');
     assert(expLogs.every(function (x) { return ['info', 'warn', 'error'].indexOf(x.level) >= 0; }), 'N8 level 仅 info/warn/error');
     assert(h.clock.count() === 0, 'N9 整轮结束后无悬挂定时器');
+  }
+
+  /* ---------------------------------------------------------------- *
+   * W. 缺陷 1：压暗导致检测闸门自杀（整帧暗化 → 亮垫板跌破高亮阈值）
+   * ---------------------------------------------------------------- */
+  console.log('\n· W 缺陷 1：压暗导致检测闸门自杀（整帧暗化还原）');
+  {
+    // 整帧随已下发补偿变暗（真实设备行为：曝光补偿压暗整帧，含亮垫板）。
+    // ev<0 → 因子 <1 → 整帧变暗。缺陷 1 的修复：ACTIVE 且已介入负补偿时，
+    // 参与判定闸门的亮度按曝光偏移还原回中性刻度（只还原亮参照格与场景均值）。
+    function lastAppliedComp(track) {
+      for (let i = track.calls.length - 1; i >= 0; i--) {
+        const a = track.calls[i] && track.calls[i].advanced && track.calls[i].advanced[0];
+        if (a && typeof a.exposureCompensation === 'number') return a.exposureCompensation;
+      }
+      return 0;
+    }
+    function darkeningImage(track, subjectMean, padMean) {
+      return function () {
+        const ev = lastAppliedComp(track);
+        const f = Math.pow(2, ev / 2.2);
+        return makeImage(function (cx, cy) {
+          const inCenter = cy >= 2 && cy <= 4 && cx >= 2 && cx <= 5;
+          const below = (cy === 5 || cy === 6) && cx >= 1 && cx <= 5;
+          const base = (inCenter || below) ? subjectMean : padMean;
+          const v = Math.max(0, Math.min(255, Math.round(base * f)));
+          return [v, v, v];
+        });
+      };
+    }
+    const subjN = 150, padN = 210;
+    const trackW = makeExpTrack();
+    const hW = makeHarness({
+      track: trackW,
+      image: darkeningImage(trackW, subjN, padN),
+      config: { expEffectWindowMs: 0 }
+    });
+    await boot(hW);
+    // 注入负补偿前，先确认中性帧能正常 engage（subject 150≤185、pad 210>185、均值>45）
+    await pump(hW.clock, 60, 5);
+    assert(hW.ctrl.getExposureInfo().state === 'ACTIVE', 'W1 整帧暗化模型下中性帧正常 engage 进入 ACTIVE');
+    // 推多帧，闭环把 ev 压到负值，整帧被压暗
+    await pump(hW.clock, 400, 5);
+    const infoW = hW.ctrl.getExposureInfo();
+    // 关键：即使负补偿把整帧（含亮垫板）压暗，闸门也不该自杀 → 不会反复 RESTORE/ENGAGE 振荡
+    const engageCntW = eventsOf(hW.logs, 'CAM_EXP_ENGAGE').length;
+    assert(engageCntW === 1, 'W2 整帧被压暗后没有「engage→release→再 engage」振荡（CAM_EXP_ENGAGE 仅 1 次，实际 ' + engageCntW + '）');
+    // 闭环确实在压暗（实测主体亮度被压低，证明是「真变暗」，不是静态帧）
+    assert(infoW.subjectMean != null && infoW.subjectMean < subjN - 10,
+      'W3 闭环确实把主体压暗了（实测主体 ' + (infoW.subjectMean == null ? 'null' : infoW.subjectMean.toFixed(1)) + ' < 中性 ' + subjN + '）');
+    // 闸门自杀的判据：未翻转场景却自行 release（无 flip 的 release 才是自杀）
+    const releaseLogsW = eventsOf(hW.logs, 'CAM_EXP_RELEASE');
+    assert(releaseLogsW.length === 0, 'W4 未翻转场景却无「自杀式」自行 release（release 次数 ' + releaseLogsW.length + '，应为 0）');
+    hW.ctrl.unmount();
+    await flush(60);
+    assert(hW.clock.count() === 0, 'W5 无悬挂定时器');
+  }
+
+  /* ---------------------------------------------------------------- *
+   * X. 缺陷 2：tier2 过压设备（执行时间比请求更短 → 实际压暗超出请求）
+   * ---------------------------------------------------------------- */
+  console.log('\n· X 缺陷 2：tier2 过压设备（实际压暗深度超出请求）');
+  {
+    // 过压设备：tier2 手动曝光路径，设备实际执行时间比请求的更短（时间下限 / 量化 /
+    // 单位解释都可能），实际压暗比请求深 overDepth EV。闭环假设「请求 ev = 实际 ev」
+    // 1:1，看到过暗就往回加 ev → bang-bang 振荡。修复：每步用实测主体亮度反推实际
+    // 生效 EV，与请求比对，超容差记过压设备并收紧 ev 下限；徽标诚实展示实际 EV。
+    const baseTime = 1000, overDepth = 2.0;
+    const subjN = 150, padN = 210;
+    function lastAppliedTime(track) {
+      for (let i = track.calls.length - 1; i >= 0; i--) {
+        const a = track.calls[i] && track.calls[i].advanced && track.calls[i].advanced[0];
+        if (a && typeof a.exposureTime === 'number') return a.exposureTime;
+      }
+      return null;
+    }
+    function overPressImage(track, bt, depth, sN, pN) {
+      return function () {
+        const t = lastAppliedTime(track) || bt;     // 设备收到的请求时间
+        const reqEv = Math.log2(t / bt);             // 请求的 EV
+        // 过压（乘法模型）：设备实际执行时间比请求更短，使实际压暗深度 = 请求 ×(1+depth)。
+        // 用乘法而非「请求 − depth」：后者在请求 ev=0 时已把整帧压暗 depth EV，导致中性帧
+        // 一上来就过暗、闸门永远不命中、过压检测根本没机会运行。乘法在请求 0 时给中性帧
+        // （正常 engage），只在请求变负后才越压越深，符合「用户请求压暗、设备执行得更狠」。
+        const actualEv = reqEv * (1 + depth);
+        const f = Math.pow(2, actualEv / 2.2);
+        return makeImage(function (cx, cy) {
+          const inCenter = cy >= 2 && cy <= 4 && cx >= 2 && cx <= 5;
+          const below = (cy === 5 || cy === 6) && cx >= 1 && cx <= 5;
+          const base = (inCenter || below) ? sN : pN;
+          const v = Math.max(0, Math.min(255, Math.round(base * f)));
+          return [v, v, v];
+        });
+      };
+    }
+    const trackX = makeExpTrack({
+      caps: { exposureMode: ['manual', 'continuous'], exposureTime: { min: 10, max: 100000 } },
+      settings: { exposureTime: baseTime }
+    });
+    const hX = makeHarness({
+      track: trackX,
+      image: overPressImage(trackX, baseTime, overDepth, subjN, padN),
+      config: { expEffectWindowMs: 0 }
+    });
+    await boot(hX);
+    await pump(hX.clock, 600, 5);
+    const infoX = hX.ctrl.getExposureInfo();
+    // ① 过压被检出：打出 CAM_EXP_OVERPRESS（reason: over-press）
+    const overLogs = eventsOf(hX.logs, 'CAM_EXP_OVERPRESS');
+    assert(overLogs.length >= 1 && overLogs[0].fields.reason === 'over-press',
+      'X1 过压设备被打上 CAM_EXP_OVERPRESS（reason=over-press，实际 ' + overLogs.length + ' 条）');
+    // ② 徽标诚实展示「实际生效 EV」——比请求的更深（appliedEv 由实测亮度反推，非钳位请求 ev）
+    assert(typeof infoX.appliedEv === 'number' && isFinite(infoX.appliedEv) && infoX.appliedEv < infoX.ev - 0.5,
+      'X2 徽标诚实展示过压深度（appliedEv=' + infoX.appliedEv.toFixed(2) + ' 比请求 ev=' + infoX.ev.toFixed(2) + ' 深 ≥0.5EV）');
+    // ③ 闭环不再往更深（只会被设备再压更深）处请求：ev 被钳在可达深度（evFloor）之上，不冲到 -3 停在过暗态
+    assert(infoX.ev >= -1.6,
+      'X3 请求 ev 被钳在可达深度之上（ev=' + infoX.ev.toFixed(2) + '，未一路冲到 -3 后停在过暗态）');
+    hX.ctrl.unmount();
+    await flush(60);
+    assert(hX.clock.count() === 0, 'X4 无悬挂定时器');
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Y. QA F1：tier0（软件压暗）徽标必须显示解析解 EV，不残留硬件档实测值
+   * ---------------------------------------------------------------- */
+  console.log('\n· Y QA F1：tier0 徽标显示软件解析解，不残留硬件档实测 EV');
+  {
+    // 只报 exposureCompensation、无 manual 能力，且画面不随约束变化（幽灵）→
+    // 走完 tier1 判无效 → 降级 tier0。tier1 阶段 actualEv 被实测反推记为 ≈0；
+    // 若 tier0 不清零/不更新 actualEv，徽标会把「软件压暗」显示成那个残留值（0.0EV），
+    // 与拍照时真正下发的解析解（solveTier0Ev）不符——用户看到的档位是假的。
+    const capsCompOnly = { exposureCompensation: { min: -3, max: 3, step: 0.1 } };
+    const hY = makeHarness({
+      config: { expEffectWindowMs: 0 },
+      trackOpts: { caps: capsCompOnly, settings: { exposureCompensation: 0, deviceId: 'ghost-cam-tier0' } }
+    });
+    await boot(hY);
+    await pump(hY.clock, 800, 5);
+    const infoY = hY.ctrl.getExposureInfo();
+    assert(infoY.tier === 0,
+      'Y1 前置：tier1 幽灵设备判无效后降级 tier0（实际 tier=' + infoY.tier + '）');
+    const solvedY = C.solveTier0Ev(infoY.subjectMean, {});
+    assert(solvedY != null && solvedY < 0,
+      'Y2 前置：tier0 解析解存在且为负（' + (solvedY == null ? 'null' : solvedY.toFixed(2)) + 'EV）');
+    assert(Math.abs(infoY.ev - solvedY) < 1e-9,
+      'Y3 tier0 的 ev 即软件解析解（ev=' + infoY.ev.toFixed(3) + '，解析解=' + solvedY.toFixed(3) + '）');
+    assert(typeof infoY.appliedEv === 'number' && isFinite(infoY.appliedEv) &&
+      Math.abs(infoY.appliedEv - solvedY) < 1e-9,
+      'Y4 徽标口径：tier0 的 appliedEv 也是解析解，不残留 tier1 阶段的实测值' +
+      '（appliedEv=' + infoY.appliedEv.toFixed(3) + '，解析解=' + solvedY.toFixed(3) +
+      '；残留值会是 tier1 实测的 ≈0）');
+    hY.ctrl.unmount();
+    await flush(60);
+    assert(hY.clock.count() === 0, 'Y5 无悬挂定时器');
   }
 }
 

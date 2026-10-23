@@ -1223,8 +1223,8 @@ async function sectContract() {
   eq(Object.keys(snap.exposure).sort().join(','), 'adjusts,ev,fails,sceneMean,state,subjectMean,subjectRatio,tier',
     'Q137 snapshot.exposure 八项齐备');
   const info = hS.ctrl.getExposureInfo();
-  eq(Object.keys(info).sort().join(','), 'adjusts,ev,fails,sceneMean,state,subjectMean,tier',
-    'Q138 getExposureInfo 七项齐备（渲染层徽标 / LUT 只依赖这些）');
+  eq(Object.keys(info).sort().join(','), 'adjusts,appliedEv,ev,fails,sceneMean,state,subjectMean,tier',
+    'Q138 getExposureInfo 八项齐备（渲染层徽标 / LUT 只依赖这些；appliedEv 为实测实际生效 EV，徽标据此诚实展示）');
   let seen = 0;
   const off = hS.ctrl.onExposureChange(function () { seen++; });
   assert(typeof off === 'function', 'Q139 onExposureChange 返回退订函数');

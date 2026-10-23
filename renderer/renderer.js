@@ -1583,7 +1583,10 @@ const CapturePage = {
     const exposureBadge = Vue.computed(() => {
       const e = exposureInfo.value;
       if (!e || e.state !== 'ACTIVE') return null;
-      const ev = (Math.round(e.ev * 10) / 10).toFixed(1);
+      // 缺陷 2：徽标显示「实际生效」EV（由实测亮度反推，诚实展示）。正常设备实际≈请求，
+      // 过压设备会被闭环钳在可达深度，徽标自然回到合理范围；appliedEv 缺失时回退请求值
+      const evRaw = (e.appliedEv != null && isFinite(e.appliedEv)) ? e.appliedEv : e.ev;
+      const ev = (Math.round(evRaw * 10) / 10).toFixed(1);
       if (e.tier === 0) return { text: '软件压暗 ' + ev + 'EV', level: 'warn' };
       return { text: '曝光补偿 ' + ev + 'EV', level: 'ok' };
     });

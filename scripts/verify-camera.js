@@ -707,7 +707,8 @@ async function main() {
       'CAM_BLACK_RETRY',
       // 曝光辅助：黑色衣物过曝防护（docs/exposure-assist-design.md §9.5）
       'CAM_EXP_ENUM', 'CAM_EXP_ENGAGE', 'CAM_EXP_STEP', 'CAM_EXP_RELEASE',
-      'CAM_EXP_RESTORE', 'CAM_EXP_SKIP', 'CAM_EXP_FALLBACK', 'CAM_EXP_BLACKGATE'
+      'CAM_EXP_RESTORE', 'CAM_EXP_SKIP', 'CAM_EXP_FALLBACK', 'CAM_EXP_BLACKGATE',
+      'CAM_EXP_OVERPRESS'
     ];
     const used = new Set();
     for (const f of ['renderer/renderer.js', 'renderer/camera-controller.js']) {
