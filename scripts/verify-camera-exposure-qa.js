@@ -301,23 +301,27 @@ function docEvStep(curEv, subjectMean, cfg) {
   return { ev: next, step: next - curEv, err: err };
 }
 
-// 亮度模型：曝光补偿每 -1EV 亮度 ×0.5（AE 已收敛后近似线性光）
-const brightnessAt = (ev) => 120 * Math.pow(2, ev);
+// 亮度模型（码值域）：实现端 sRGB gamma 下，补偿每 -1EV 码值 ×2^(-1/γ)。
+// 用 120×2^(ev/γ) 而非朴素 120×2^ev：真实 8bit 管线的码值响应比线性光缓 2.2 倍，
+// 一步即可收敛（见调查报告 docs/field-2026-10-23-tier0-darkening.md §ISP 提亮）。
+// 若用朴素线性模型，本段会造出「ev 在 -0.34↔-0.08 间来回呼吸」的极限环——那是测试
+// 模型失真，不是实现行为，故收敛推演必须用真实码值响应。
+const brightnessAt = (ev) => 120 * Math.pow(2, ev / C.SRGB_GAMMA);
 
 async function sectEvSign() {
   console.log('\n· 【P0-1】nextEvStep 符号：独立数值推演 + 与设计文档写法对拍');
   const D = C.DEFAULTS;
   const S0 = 120;   // 任务书指定：subjectMean=120
-  const T = 58;     // expTargetMean
+  const T = 105;    // expTargetMean（2026-10-23 现场标定 58→105，调查报告 docs/field-2026-10-23-tier0-darkening.md）
   const G = 0.025;  // expEvGain
-  assert(D.expTargetMean === T && D.expEvGain === G, 'Q1 默认阈值确为 target=58、gain=0.025（推演前提成立）');
+  assert(D.expTargetMean === T && D.expEvGain === G, 'Q1 默认阈值确为 target=105、gain=0.025（推演前提成立）');
 
   /* --- 手工推演（以常量自身推导第一帧，不写死结论） --- */
-  const err0 = S0 - T;                       // 62
-  const step0raw = err0 * G;                 // 1.55
+  const err0 = S0 - T;                       // 15
+  const step0raw = err0 * G;                 // 0.375
   const step0 = Math.min(step0raw, D.expMaxStepEv); // 0.34（单步上限）
-  eq(err0, 62, 'Q2 首帧 err = 120 − 58 = 62（正=还太亮，需要更负的补偿）');
-  near(step0raw, 1.55, 1e-9, 'Q3 首帧原始步长 = 62 × 0.025 = 1.55 EV');
+  eq(err0, 15, 'Q2 首帧 err = 120 − 105 = 15（正=还太亮，需要更负的补偿）');
+  near(step0raw, 0.375, 1e-9, 'Q3 首帧原始步长 = 15 × 0.025 = 0.375 EV');
   near(step0, 0.34, 1e-9, 'Q4 单步上限把首帧步长钳到 0.34 EV');
 
   // 文档写法：ev + step → 正向 → 被上限锁 0 → 永远停在 0（补偿一次都没下发）
@@ -330,7 +334,7 @@ async function sectEvSign() {
   }
   assert(docSeq.every(function (x) { return x.ev === 0 && x.step === 0; }),
     'Q5 文档写法（ev + step）：20 帧后 ev 恒为 0、步长恒为 0 —— 负补偿一次都发不出去');
-  assert(docSeq.every(function (x) { return x.err === 62; }),
+  assert(docSeq.every(function (x) { return x.err === 15; }),
     'Q6 文档写法下 err 20 帧不变（亮度从未被改变），闭环在 ev=0 处死锁');
   assert(docSeq.every(function (x) { return x.ev > D.expEvMin; }),
     'Q7 文档写法永远够不到下限 expEvMin（不是「钳位过紧」，是根本不动）');
@@ -346,7 +350,7 @@ async function sectEvSign() {
     ev = r.ev;
   }
   // 打印推演表，供人工复核（不是断言，但把过程留在日志里）
-  console.log('      推演表（实现写法，亮度模型 mean = 120×2^ev）：');
+  console.log('      推演表（实现写法，亮度模型 mean = 120×2^(ev/γ)，γ=' + C.SRGB_GAMMA + '）：');
   console.log('        帧 |  curEv  | subjectMean | err   | 步长    | 新 ev');
   implSeq.forEach(function (x, i) {
     console.log('        ' + (i + 1) + '  | ' + (i === 0 ? 0 : implSeq[i - 1].ev).toFixed(4) +
@@ -360,14 +364,14 @@ async function sectEvSign() {
   const last = implSeq[implSeq.length - 1];
   assert(Math.abs(last.err) < D.expDeadzone,
     'Q10 收敛判据成立：末帧 err=' + last.err.toFixed(2) + ' 落入死区 ±' + D.expDeadzone);
-  near(last.mean, T, D.expDeadzone, 'Q11 末帧主体亮度 ' + last.mean.toFixed(1) + ' 命中目标 58±8（黑而有纹理）');
+  near(last.mean, T, D.expDeadzone, 'Q11 末帧主体亮度 ' + last.mean.toFixed(1) + ' 命中目标 105±8（黑/深色而有纹理）');
   assert(implSeq.every(function (x) { return x.ev >= D.expEvMin - 1e-12 && x.ev <= 0; }),
     'Q12 全过程中 ev 始终落在 [expEvMin, 0] 内（只防过曝，不做正补偿）');
   const mono = implSeq.every(function (x, i) { return i === 0 || x.ev <= implSeq[i - 1].ev + 1e-12; });
   assert(mono, 'Q13 步进单调不振荡（否则画面上会看到亮度来回呼吸）');
 
   // 反向（欠曝）：两个写法的方向必须相反 —— 说明这不是「等价改写」，符号确实是实质差异
-  const under = 40;                            // 比目标 58 暗 18
+  const under = 40;                            // 比目标 105 暗 65
   const implUp = C.nextEvStep(-1.0, under, D);
   const docUp = docEvStep(-1.0, under, D);
   assert(implUp.ev > -1.0, 'Q14 实现：比目标更暗时补偿回调（-1.0 → ' + implUp.ev.toFixed(3) + '），闭环自愈');

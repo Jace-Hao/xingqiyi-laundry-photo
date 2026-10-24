@@ -1578,8 +1578,9 @@ const CapturePage = {
     });
 
     // 曝光辅助徽标：只在辅助 ACTIVE 时显示，让介入行为对用户可见（不隐性）。
-    // tier 0 = 硬件不支持补偿，靠拍照时软件压暗存档图 —— 预览仍会偏亮，
-    // 用告示色 + 「软件压暗」文案明确告知，避免用户误以为没生效
+    // tier 0 = 硬件不支持补偿，靠拍照时软件压暗存档图 —— 预览通过 exposureFilter
+    // 同步压暗（见下），所见即所得；徽标用告示色 + 「软件压暗」文案说明这条路径
+    // 是显示层补上来的，硬件本身没有变暗能力
     const exposureBadge = Vue.computed(() => {
       const e = exposureInfo.value;
       if (!e || e.state !== 'ACTIVE') return null;
@@ -1589,6 +1590,26 @@ const CapturePage = {
       const ev = (Math.round(evRaw * 10) / 10).toFixed(1);
       if (e.tier === 0) return { text: '软件压暗 ' + ev + 'EV', level: 'warn' };
       return { text: '曝光补偿 ' + ev + 'EV', level: 'ok' };
+    });
+
+    // 预览同步压暗（2026-10-23 现场标定配套，调查报告 docs/field-2026-10-23-tier0-darkening.md）：
+    // tier0 软件兜底原本只改存档图，预览仍是 ISP 提亮帧——17:19 投诉第一句就是
+    // 「预览窗口没有变化，还是很亮，但是拍完的照片被调暗了」。这里给 <video> 套同一系数
+    // 的 CSS brightness：CSS brightness 是码值域乘法（feComponentTransfer linear），
+    // 与 buildExposureLut 的 out=in×2^(ev/γ) 同源同值，预览因此与存档一致。
+    // 三个边界：① 只对 tier0 生效——硬件档（tier1/2）真实压暗了摄像头输出，预览本来就是暗的；
+    // ② 只显示层生效——canvas drawImage 取的是未过滤帧，曝光检测采样与闭环口径不受影响；
+    // ③ 用 e.ev（存档拍照用的同一个值，renderer.js capture() 同源），不用徽标的 appliedEv，
+    //    保证「预览系数 == 存档系数」逐位一致。
+    const exposureFilter = Vue.computed(() => {
+      const e = exposureInfo.value;
+      if (!e || e.state !== 'ACTIVE' || e.tier !== 0) return '';
+      const ev = Number(e.ev);
+      if (!isFinite(ev) || ev >= 0) return '';
+      const gamma = (window.CameraController && isFinite(window.CameraController.SRGB_GAMMA))
+        ? window.CameraController.SRGB_GAMMA : 2.2;
+      const k = Math.pow(2, ev / gamma);
+      return 'brightness(' + (Math.round(k * 1000) / 1000) + ')';
     });
 
     function camIdleMs() {
@@ -2463,7 +2484,7 @@ const CapturePage = {
       barcode, note, saving, barcodeCount, videoEl, barcodeEl, ready,
       barcodeWarn, applyCleaned, applySimilar, barcodeLocked, unlockBarcode,
       sleeping, camState, camHint, camPrivacy, camErr, camErrCode, camAr, camMaxH,
-      exposureInfo, exposureBadge,
+      exposureInfo, exposureBadge, exposureFilter,
       startCamera, retryCamera, switchDevice, wakeCamera, sleepCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone, openPrivacySettings
     };
   },
@@ -2485,7 +2506,7 @@ const CapturePage = {
                invalid at computed-value time，var() 的 fallback 也救不回来，会退化成 auto。 -->
           <div class="camera-box"
                :style="{ '--cam-ar': camAr || '4 / 3', '--cam-max-h': (camMaxH > 0 ? camMaxH + 'px' : '68vh') }">
-            <video ref="videoEl" autoplay playsinline muted></video>
+            <video ref="videoEl" autoplay playsinline muted :style="{ filter: exposureFilter }"></video>
             <div v-if="camState !== 'LIVE'" class="camera-overlay" :class="{ error: !!cameraError }">
               <template v-if="camState === 'SLEEPING'">
                 <div class="camera-sleep-title">摄像头已休眠（已释放占用）</div>

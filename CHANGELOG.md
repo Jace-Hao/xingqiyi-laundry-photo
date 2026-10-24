@@ -1,5 +1,21 @@
 # 更新日志
 
+## v1.2.16（2026-10-24）
+
+### 修复
+- **照片压暗后「预览亮、存档暗」且黑色衣物细节仍出不来（标定偏差 + 预览不同步）**
+  - **问题**：门店反馈——压暗确实发生了，但预览窗口一点没变（仍很亮），拍出来的照片被调暗了，可黑色皮衣的细节还是看不出。
+  - **根因**：① 闭环目标 `expTargetMean=58` 在「ISP 已把黑衣物提亮约 3EV」的设备上过暗——实测皮衣被 ISP 抬到均值 ~148，按 58 为目标需压到深暗带，深色低对比的皮衣纹理被一起抹平；② tier0 软件兜底的 LUT 只改存档图、不动预览画面，造成「预览亮/照片暗」的结构性错位（调查报告 `docs/field-2026-10-23-tier0-darkening.md`）；③（顺带暴露）过压设备一步收敛进死区时 `actualEv` 没更新，徽标停在 0.0EV，与「实际生效深度」对不上。
+  - **方案**：① 现场标定 `expTargetMean` **58→105**——同设备 LUT 对照：ev=-1.5（主体 98）时清晰可读，105 对 148 主体只需压约 -1.1EV，落在验证过的可读区，深色而有纹理的皮衣细节回来；② 预览同步压暗——`renderer.js` 新增 `exposureFilter` computed，tier0 ACTIVE 且 ev<0 时给 `<video>` 加 `filter: brightness(2^(ev/γ))`，与存档 LUT **同源同系数**，所见即所得；③ 过压确认时补写 `actualEv`，徽标据实显示实际生效 EV。
+  - **行为变化（需告知门店）**：此前 tier0 路径预览不压暗、只有照片压暗，用户看到「预览和成片不一样」；修正后预览与存档一致变暗，黑色衣物细节在预览与存档里都可见。
+  - **未做（下轮迭代，均为附带发现，不混入本次）**：tier1 幽灵判定的基线窗口、能力探测跨重启一致性、卸载时 restore 失败重试。
+
+### 校验
+- **`verify-camera-exposure` 355/0、`verify-camera-exposure-mutation` 50 条变异被抓住（2 条为已知等价变异）、`verify-camera-exposure-qa` 175/0、`verify-camera-exposure-qa3` 绿**：Q13 收敛推演改用 sRGB 码值模型（真实 8bit 管线响应，比朴素线性缓 2.2 倍），消除「极限环」假阳性。
+- **`renderer.js` `exposureFilter` 等价检查（直接 eval 文件真实代码文本）**：tier0 ACTIVE + ev<0 时预览 brightness 系数逐位等于存档 LUT 系数 `2^(ev/γ)`（7 个 ev 值最大误差 0.0004），且 tier!=0 / 非 ACTIVE / ev≥0 / 非数值均正确返回空。
+- 相机子系统全绿：camera 217/0、res 98/0、res-qa2 102/0、res-mutation 12/0、res-budget 16/0、blackretry 17/0、camera-qa 59/0、camera-log 19/0。
+- `docs/exposure-assist-design.md` §6.2 阈值表 `expTargetMean` 同步为 105；调查报告补「已实施」状态。
+
 ## v1.2.15（2026-10-23）
 
 ### 修复

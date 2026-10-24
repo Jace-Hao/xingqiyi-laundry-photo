@@ -718,14 +718,18 @@ async function main() {
       'V4 tier0 时拍照路径确实走软件兜底 LUT（徽标如实显示「软件压暗」）');
 
     // ★ 语义一致性：软件兜底压暗的幅度必须与 EV 语义（sRGB 模型）一致。
-    //   expEvMin 之所以从 -2.0 加深到 -3.0，依据正是「150 → 58（expTargetMean）需要 -3EV」；
-    //   LUT 若按另一套公式执行，闭环算出的 ev 就与存档图实际得到的压暗量对不上。
+    //   历史依据：expEvMin 从 -2.0 加深到 -3.0，照的是旧目标 58（150→58 需 -3EV）。
+    //   2026-10-23 标定 expTargetMean=105 后，主体 150 的解析解是 -1.13EV、不再触下限
+    //   （护栏钳位场景改由主检 E53 直接测 solveTier0Ev(300)：超出 gamut 才钳到 -3.0）。
+    //   不变的断言：闭环算出的 ev 必须与存档图实际得到的压暗量逐点对得上。
     const evFinal = h.ctrl.getExposureInfo().ev;
-    // 第 2 轮起 tier0 的 ev 走解析解 solveTier0Ev 并被 expEvMin 兜底；
-    // 主体卡在 150 的幽灵设备解析解正好是 -3.02，钳到 -3.00
-    near(evFinal, C.DEFAULTS.expEvMin, 1e-6, 'V5 前置：tier0 下 ev 已取到解析解并被下限护栏兜住，当前 ' + evFinal.toFixed(2) + 'EV');
+    // tier0 的 ev 走解析解 solveTier0Ev；主体卡在 150 的幽灵设备解析解 = -1.13（远高于下限）
+    const solved150 = C.solveTier0Ev(150, C.DEFAULTS);
+    near(evFinal, solved150, 0.02,
+      'V5 前置：tier0 下 ev 已取到解析解 ' + evFinal.toFixed(2) + 'EV（= solveTier0Ev(150) ' +
+      solved150.toFixed(2) + '，未被下限护栏截断）');
     const lut = C.buildExposureLut(evFinal);
-    const want = Math.round(150 * Math.pow(2, evFinal / 2.2));   // sRGB 模型：-3EV → 150×0.3876 ≈ 58
+    const want = Math.round(150 * Math.pow(2, evFinal / 2.2));   // sRGB 模型：-1.13EV → 150×0.70 ≈ 105
     assert(Math.abs(lut[150] - want) <= 10,
       'V6 软件兜底幅度与 EV 语义一致：主体码值 150 在 ' + evFinal.toFixed(2) + 'EV 下应压到 ≈' +
       want + '（= expTargetMean ' + C.DEFAULTS.expTargetMean + '），实测 ' + lut[150]);

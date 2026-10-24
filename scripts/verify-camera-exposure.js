@@ -550,29 +550,36 @@ async function suite() {
     assert(mono && seq.length >= 4, 'D11 静态过亮场景下 EV 单调下行（' + seq.length + ' 步收敛到 ' + ev.toFixed(2) + '）');
     assert(ev >= D.expEvMin - 1e-12, 'D12 收敛过程始终不越过下限');
 
-    /* --- 下限加深（设计文档 §10 待明确事项 6 的现场结论） --- */
-    assert(D.expEvMin === -3.0, 'D13 EV 累计下限已加深到 -3.0（现场：0→-2.0 全程不收敛）');
-    // 真实响应设备（亮度 = 150×2^(ev/2.2)，sRGB 编码）在 -2.0 下够不到目标：
-    // 贴住下限空转正是现场形态；加深到 -3.0 后闭环才有机会真正收敛
-    const modelAt = (evv) => 150 * Math.pow(2, evv / 2.2);
-    const runLoop = function (minEv) {
+    /* --- 下限深度核算（原「加深到 -3.0」论证；2026-10-23 标定 105 后重算） --- */
+    assert(D.expEvMin === -3.0, 'D13 EV 累计下限为 -3.0');
+    // 原论证基于旧目标 58（150→58 需 -3EV，故 -2.0 不够）。expTargetMean=105 标定后：
+    //   ① 经典提亮主体 150 只需 -1.13EV——旧下限 -2.0 反而够用，标定后力度收回；
+    //   ② gamut 内最深需求 = γ×log2(105/255) ≈ -2.82EV（主体 255 的极端提亮帧），
+    //      -3.0 完整覆盖且不被任何物理输入触达——护栏应有的形态；
+    //   ③ 主体足够亮（≥250）时收敛点仍落在 -2.0 之外：下限深度对极端帧仍然必要。
+    const modelAt = (evv, base) => base * Math.pow(2, evv / C.SRGB_GAMMA);
+    const runLoop = function (minEv, base) {
       let e = 0;
       let last = null;
       for (let i = 0; i < 40; i++) {
-        const rr = C.nextEvStep(e, modelAt(e), Object.assign({}, D, { expEvMin: minEv }));
+        const rr = C.nextEvStep(e, modelAt(e, base), Object.assign({}, D, { expEvMin: minEv }));
         last = rr;
         if (rr.step === 0) break;
         e = rr.ev;
       }
       return { ev: e, err: last ? last.err : null };
     };
-    const atOld = runLoop(-2.0);
-    const atNew = runLoop(-3.0);
-    assert(Math.abs(atOld.err) > D.expDeadzone,
-      'D14 旧下限 -2.0 下闭环贴住下限仍不达标（err=' + atOld.err.toFixed(1) + ' > 死区 ' + D.expDeadzone + '）');
-    assert(Math.abs(atNew.err) < D.expDeadzone,
-      'D15 新下限 -3.0 下闭环真的收敛（err=' + atNew.err.toFixed(1) + ' 落入死区，ev=' + atNew.ev.toFixed(2) + '）');
-    assert(atNew.ev < -2.0, 'D16 收敛点确实落在旧下限之外（' + atNew.ev.toFixed(2) + ' < -2.0，证明加深是必要的）');
+    const atClassic = runLoop(D.expEvMin, 150);
+    assert(Math.abs(atClassic.err) < D.expDeadzone,
+      'D14 经典主体 150 在新目标下闭环收敛（ev=' + atClassic.ev.toFixed(2) + '，err 落入死区）');
+    const deepestNeed = C.SRGB_GAMMA * Math.log2(D.expTargetMean / 255);
+    assert(deepestNeed > D.expEvMin,
+      'D15 护栏深度核算：gamut 内最深需求 ' + deepestNeed.toFixed(2) + 'EV 仍浅于下限 ' +
+      D.expEvMin + '（-3.0 覆盖全 gamut，不被正常路径触达）');
+    const atBright = runLoop(D.expEvMin, 250);
+    assert(atBright.ev < -2.0,
+      'D16 主体足够亮（250）时收敛点仍落在旧下限之外（' + atBright.ev.toFixed(2) +
+      ' < -2.0，证明 -3.0 的下限深度对极端提亮帧仍然必要）');
   }
 
   /* ---------------------------------------------------------------- *
@@ -687,11 +694,17 @@ async function suite() {
     });
     eq(semBad, 0, 'E46 LUT 降幅与 §7.5 预期降幅逐点一致（差异仅来自取整，越界 ' + semBad + ' 处）');
 
-    // ② 现场取值：ev=-3（tier0 顶到 expEvMin 的真实取值）必须把主体压到目标附近
-    const lut3 = lutSem(-3);
-    near(lut3[150], C.DEFAULTS.expTargetMean, 1, 'E47 ev=-3：黑衣物主体 150 → ' + lut3[150] +
+    // ② 现场取值：tier0 解析解（ev=solve(150)）必须把主体压到目标附近。
+    //    2026-10-23 标定 expTargetMean=105 后，150 只需 -1.13EV（旧目标 58 下是
+    //    -2.97 贴下限）——「贴下限」不再是 tier0 的常态，护栏形态见 D15
+    const ev150 = C.solveTier0Ev(150, C.DEFAULTS);
+    const lut150 = lutSem(ev150);
+    near(lut150[150], C.DEFAULTS.expTargetMean, 1, 'E47 解析解 ev=' + ev150.toFixed(2) + '：黑衣物主体 150 → ' + lut150[150] +
       '（正合 expTargetMean=' + C.DEFAULTS.expTargetMean + '，旧实现是 4）');
-    // ③ 被裁剪的白色必须救得回来（现场投诉的那一项：白色鞋底完全过曝裁剪）
+    // ③ 被裁剪的白色必须救得回来（现场投诉的那一项：白色鞋底完全过曝裁剪）。
+    //    保留 ev=-3 的护栏档语义：标定 105 后它不再是 tier0 的常态取值（见 D15），
+    //    但 LUT 在护栏深度上的行为仍须逐点验证
+    const lut3 = lutSem(-3);
     assert(lut3[255] < 255 && lut3[255] > 30,
       'E48 被裁剪的白色 255 → ' + lut3[255] + '（拉回可辨范围，旧实现是 255 = 一点没压）');
     // ④ 暗部层次：等比压暗，褶皱不被抹成 0
@@ -705,16 +718,18 @@ async function suite() {
 
     /* --- 【QA DEF-2】tier0 的 EV 解析解 --- */
     const solve = (mean) => C.solveTier0Ev(mean, C.DEFAULTS);
-    near(solve(100), G * Math.log2(C.DEFAULTS.expTargetMean / 100), 1e-9,
-      'E51 tier0 解析解：主体 100 → ev=' + solve(100).toFixed(2) + '（闭环会一路撞到 -3.00 过压 1.27 档）');
-    assert(solve(100) > C.DEFAULTS.expEvMin, 'E52 主体 100 的解在下限之内（不会被 expEvMin 截断）');
-    near(solve(150), C.DEFAULTS.expEvMin, 0.02,
-      'E53 主体 150 → ev≈' + solve(150).toFixed(2) + '（贴下限，即 -3.0 这个下限值正是照 150→58 定的）');
+    near(solve(150), G * Math.log2(C.DEFAULTS.expTargetMean / 150), 1e-9,
+      'E51 tier0 解析解：主体 150 → ev=' + solve(150).toFixed(2) +
+      '（旧目标 58 下是 -2.97 贴下限；标定 105 后只需 -1.13，闭环撞下限过压 1.87 档的旧行为已消除）');
+    assert(solve(150) > C.DEFAULTS.expEvMin, 'E52 主体 150 的解在下限之内（不会被 expEvMin 截断）');
+    near(solve(300), C.DEFAULTS.expEvMin, 0.02,
+      'E53 主体 300（超出 gamut 的极端值）→ 解析解贴住下限 ' + solve(300).toFixed(2) +
+      '（钳位护栏仍有效；新目标 105 下 gamut 内最深需求 -2.82EV，下限不再被正常路径触达）');
     assert(solve(C.DEFAULTS.expTargetMean) === 0, 'E54 已在目标亮度 → ev=0（不做无谓压暗）');
     assert(solve(20) === 0, 'E55 比目标更暗 → 不提亮（欠曝交给现场补光，与上限锁 0 一致）');
     assert(solve(null) === null && solve(0) === null, 'E56 无主体亮度时返回 null（采样失败不瞎算）');
     // 解析解与 LUT 必须自洽：套用解析解出的 ev，主体应落到目标亮度
-    [100, 130, 150].forEach(function (m) {
+    [130, 150, 200].forEach(function (m) {
       const evv = solve(m);
       near(C.buildExposureLut(evv)[m], C.DEFAULTS.expTargetMean, 6,
         'E57 解析解自洽：主体 ' + m + ' 经 ev=' + evv.toFixed(2) + ' 压暗后落在目标附近');
@@ -1268,7 +1283,11 @@ async function suite() {
     assert(!reasonsOf(hGood.logs, 'CAM_EXP_FALLBACK').some(function (r) { return r.indexOf('ineffective') >= 0; }),
       'R2 正常设备不产生任何 ineffective 降级日志（实际 ' +
       JSON.stringify(reasonsOf(hGood.logs, 'CAM_EXP_FALLBACK')) + '）');
-    assert(goodInfo.ev < -2.0, 'R3 正常设备闭环真的压到了旧下限之外（ev=' + goodInfo.ev.toFixed(2) + '，下限已加深）');
+    // 2026-10-23 标定 expTargetMean=105 后：150 的主体只需 -1.13EV，不再需要压到旧下限
+    // -2.0 之外（「更深需求仍在」的证明搬到 D16：主体 250 时收敛点 -2.72 < -2.0）。
+    // 这里断言的是「闭环确实在压暗且深度符合标定」：死区前停在 -1.02（err=3.6 < 8）
+    assert(goodInfo.ev < -0.8 && goodInfo.ev > C.DEFAULTS.expEvMin,
+      'R3 正常设备闭环压到标定深度（150→105 需 -1.13EV，死区前实际 ' + goodInfo.ev.toFixed(2) + '）');
     assert(goodInfo.subjectMean != null && Math.abs(goodInfo.subjectMean - C.DEFAULTS.expTargetMean) < 12,
       'R4 正常设备主体亮度收敛到目标附近（' + (goodInfo.subjectMean == null ? 'null' : goodInfo.subjectMean.toFixed(1)) +
       ' ≈ ' + C.DEFAULTS.expTargetMean + '）');
@@ -1397,7 +1416,9 @@ async function suite() {
    * ---------------------------------------------------------------- */
   console.log('\n· S tier0 软件兜底（EV 取解析解，不过压存档图）');
   await (async function () {
-    // 画面主体亮度 = 100（比 150 暗，正好落在「闭环会过压、解析解不会」的区间）
+    // 画面主体亮度 = 150（现场黑白鞋/黑衣物的经典提亮档）。2026-10-23 标定
+    // expTargetMean=105 后它仍需要压暗（-1.13EV），正好落在「闭环会一路撞到
+    // 下限过压、解析解一步到位」的区间；旧目标 58 下同一输入的解析解是 -2.97
     const imgAt = function (v) {
       return makeImage(function (cx, cy) {
         const inCenter = cy >= 2 && cy <= 4 && cx >= 2 && cx <= 5;
@@ -1407,7 +1428,7 @@ async function suite() {
     };
     // 无任何曝光能力的设备 → 直接 tier0
     const hT0 = makeHarness({
-      image: imgAt(100),
+      image: imgAt(150),
       trackOpts: { caps: { exposureMode: ['continuous'] }, settings: {} }
     });
     await boot(hT0);
@@ -1415,15 +1436,16 @@ async function suite() {
     const info0 = hT0.ctrl.getExposureInfo();
     assert(info0.tier === 0 && info0.state === 'ACTIVE',
       'S1 前置：无曝光能力的设备 → tier0 且照常 ACTIVE（实际 tier=' + info0.tier + '）');
-    const want = C.solveTier0Ev(100, C.DEFAULTS);
+    const want = C.solveTier0Ev(150, C.DEFAULTS);
     near(info0.ev, want, 0.02,
       'S2 tier0 EV 取解析解 ' + info0.ev.toFixed(2) + '（= ' + want.toFixed(2) +
       '，不再是撞到下限的 ' + C.DEFAULTS.expEvMin + '）');
     assert(info0.ev > C.DEFAULTS.expEvMin + 0.5,
-      'S3 主体 100 时不撞下限（过压 1.27 档的旧行为已消除，实际 ' + info0.ev.toFixed(2) + '）');
-    near(C.buildExposureLut(info0.ev)[100], C.DEFAULTS.expTargetMean, 6,
-      'S4 解析解与 LUT 自洽：主体 100 经该 EV 压暗后落在目标亮度附近（' +
-      C.buildExposureLut(info0.ev)[100] + ' ≈ ' + C.DEFAULTS.expTargetMean + '）');
+      'S3 主体 150 时不撞下限（闭环写法会过压 ' + Math.abs(C.DEFAULTS.expEvMin - want).toFixed(2) +
+      ' 档的旧行为已消除，实际 ' + info0.ev.toFixed(2) + '）');
+    near(C.buildExposureLut(info0.ev)[150], C.DEFAULTS.expTargetMean, 6,
+      'S4 解析解与 LUT 自洽：主体 150 经该 EV 压暗后落在目标亮度附近（' +
+      C.buildExposureLut(info0.ev)[150] + ' ≈ ' + C.DEFAULTS.expTargetMean + '）');
     hT0.ctrl.unmount();
     await flush(60);
     assert(hT0.clock.count() === 0, 'S5 tier0 路径无悬挂定时器');
@@ -1431,27 +1453,28 @@ async function suite() {
     // 阳性对照：旧的「闭环步进」在同一输入上确实会一路撞到下限（证明 S2/S3 不是恒真）
     let evOld = 0;
     for (let i = 0; i < 40; i++) {
-      const rr = C.nextEvStep(evOld, 100, C.DEFAULTS);   // 只改存档图 → 实测恒为 100
+      const rr = C.nextEvStep(evOld, 150, C.DEFAULTS);   // 只改存档图 → 实测恒为 150
       if (rr.step === 0) break;
       evOld = rr.ev;
     }
     near(evOld, C.DEFAULTS.expEvMin, 1e-9,
-      'S6 阳性对照：闭环写法在主体 100 上确实撞到下限 ' + evOld.toFixed(2) + '（过压 ' +
+      'S6 阳性对照：闭环写法在主体 150 上确实撞到下限 ' + evOld.toFixed(2) + '（过压 ' +
       Math.abs(evOld - want).toFixed(2) + ' 档）');
 
-    // 主体 150（现场黑白鞋那一档）→ 解析解恰好贴下限，说明 -3.0 这个值就是照 150→58 定的
+    // 更亮的提亮帧（主体 180，仍过得动闸门：≤185 且比垫板 220 暗）→ 解析解更深，
+    // 存档同样落在目标——「越亮压得越深、落点不变」是解析解的标定语义
     const hT1 = makeHarness({
-      image: imgAt(150),
+      image: imgAt(180),
       trackOpts: { caps: { exposureMode: ['continuous'] }, settings: {} }
     });
     await boot(hT1);
     await pump(hT1.clock, 400, 5);
-    near(hT1.ctrl.getExposureInfo().ev, C.DEFAULTS.expEvMin, 0.02,
-      'S7 主体 150 → 解析解贴住下限 ' + hT1.ctrl.getExposureInfo().ev.toFixed(2) +
-      '（正是 -3.0 这个下限值的定标场景）');
-    near(C.buildExposureLut(hT1.ctrl.getExposureInfo().ev)[150], C.DEFAULTS.expTargetMean, 6,
-      'S8 该 EV 下存档主体压到 ' + C.buildExposureLut(hT1.ctrl.getExposureInfo().ev)[150] +
-      '（目标 ' + C.DEFAULTS.expTargetMean + '）');
+    const evT1 = hT1.ctrl.getExposureInfo().ev;
+    near(evT1, C.solveTier0Ev(180, C.DEFAULTS), 0.02,
+      'S7 主体 180 → 解析解 ' + evT1.toFixed(2) + '（比 150 的 ' + want.toFixed(2) + ' 更深，仍远高于下限）');
+    near(C.buildExposureLut(evT1)[180], C.DEFAULTS.expTargetMean, 6,
+      'S8 该 EV 下存档主体压到 ' + C.buildExposureLut(evT1)[180] +
+      '（目标 ' + C.DEFAULTS.expTargetMean + '；护栏钳位场景见 E53）');
     hT1.ctrl.unmount();
     await flush(60);
   })();
