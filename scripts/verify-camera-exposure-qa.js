@@ -553,7 +553,7 @@ async function sectRedline() {
     let mm;
     while ((mm = re.exec(src)) !== null) advancedLines.push(mm.index);
   }
-  eq(advancedLines.length, 5, 'Q33 return { advanced: ... } 共 5 处（tier1 施加 / tier2 施加 / tier1 恢复 / tier2 恢复×2）');
+  eq(advancedLines.length, 7, 'Q33 return { advanced: ... } 共 7 处（tier1 施加 / brightness 施加 / tier2 施加 / tier1 恢复 / brightness 恢复 / continuous 恢复 / tier2 恢复）');
   const outside = advancedLines.filter(function (i) { return i < iA || i > iEnd; });
   assert(outside.length === 0, 'Q34 5 处构造全部落在 buildExposureConstraints ~ buildExposureRestoreConstraints 区间内（区间外 ' +
     outside.length + ' 处）');
@@ -582,6 +582,8 @@ async function sectRedline() {
     ['tier1 恢复', C.buildExposureRestoreConstraints({ tier: 1 })],
     ['tier2 恢复 continuous', C.buildExposureRestoreConstraints({ tier: 2, restoreMode: 'continuous' })],
     ['tier2 恢复基线', C.buildExposureRestoreConstraints({ tier: 2, restoreMode: 'manual-baseline', baseTime: 500, baseIso: 200 })],
+    ['brightness 施加 -1.2', C.buildExposureConstraints({ tier: 'brightness', reason: 'brightness', min: 0, max: 255, step: 1, base: 128 }, -1.2)],
+    ['brightness 恢复', C.buildExposureRestoreConstraints({ tier: 'brightness', reason: 'brightness', min: 0, max: 255, step: 1, base: 128 })],
     ['tier0 施加（应为 null）', C.buildExposureConstraints({ tier: 0 }, -1)],
     ['tier0 恢复（应为 null）', C.buildExposureRestoreConstraints({ tier: 0 })]
   ];
@@ -595,9 +597,13 @@ async function sectRedline() {
     const top = Object.keys(b[1]);
     if (top.length !== 1 || top[0] !== 'advanced') violations.push(b[0] + ' 顶层键异常:' + top.join('|'));
   });
-  eq(nonNull, 9, 'Q35 9 条有产出的分支全部纳入扫描（tier0 两条为 null，不发约束）');
-  assert(violations.length === 0, 'Q36 全部 9 条分支零分辨率/帧率键（越界：' + (violations.join(',') || '无') + '）');
-  assert(branches[9][1] === null && branches[10][1] === null,
+  eq(nonNull, 11, 'Q35 11 条有产出的分支全部纳入扫描（tier1×3 / tier2×3 / tier1 恢复 / tier2 恢复×2 / brightness 施加 / brightness 恢复；tier0 两条为 null，不发约束）');
+  assert(violations.length === 0, 'Q36 全部 11 条分支零分辨率/帧率键（越界：' + (violations.join(',') || '无') + '）');
+  // 按名字取 tier0 两条，不要按索引：branches 里插入 brightness 分支后索引整体后移，
+  // 写死下标会让这条断言悄悄指向别的分支（Q37 曾因此指向 brightness 而误报红）。
+  const branchByName = {};
+  branches.forEach(function (b) { branchByName[b[0]] = b[1]; });
+  assert(branchByName['tier0 施加（应为 null）'] === null && branchByName['tier0 恢复（应为 null）'] === null,
     'Q37 tier0 两条路径返回 null（软件兜底不发任何约束，物理上不可能碰分辨率）');
 
   /* --- 3. 阳性对照：把 width 塞进去，检查器必须变红（证明不是空跑） --- */
@@ -1118,13 +1124,194 @@ async function sectLutOrder() {
   assert(/typeof window\.CameraController\.buildExposureLut === 'function'/.test(body),
     'Q111 LUT 取用前做能力检查（UMD 未加载时不炸拍照主链）');
 
-  // 预览与存档同一条 LUT：预览改走 SVG feComponentTransfer（不再用 CSS brightness 均匀乘法）
-  assert(/id="xqy-exposure-lut"/.test(rSrc) && /feComponentTransfer/.test(rSrc),
-    'Q150 预览用 SVG feComponentTransfer 套 LUT（不再 brightness() 均匀压暗白板）');
-  assert(/color-interpolation-filters="sRGB"/.test(rSrc),
-    'Q151 预览滤镜锁定 sRGB 色彩空间（与存档 sRGB 码值 LUT 逐点一致，所见即所得）');
-  assert(/url\(#xqy-exposure-lut\)/.test(rSrc) && /exposureLutTable/.test(rSrc),
-    'Q152 tier0 ACTIVE 时预览套用 url(#xqy-exposure-lut)，且曲线由 exposureLutTable 同源生成');
+  // v1.2.17 曾给 <video> 套 SVG feComponentTransfer 滤镜，在 Electron/Chromium 下
+  // 把视频硬件合成层渲染挂掉 → 整片白屏。回归防护：源码里不得再出现该滤镜定义。
+  assert(/id="xqy-exposure-lut"/.test(rSrc) === false,
+    'Q150 预览已彻底移除 SVG feComponentTransfer 滤镜定义（防白屏回归）');
+  // 预览 <video> 不得绑定任何 :style 滤镜（任何 CSS/SVG filter 作用在 video 合成层都可能白屏）
+  assert(/<video[^>]*:style/.test(rSrc) === false,
+    'Q151 预览 <video> 不绑定任何后期 :style 滤镜（白屏根因防护）');
+
+  // 亮度参数档（brightness）：相机原生 ISP 亮度偏移，预览与成片在 ISP 层同源压暗，所见即所得。
+  assert(/e\.tier === 'brightness'/.test(rSrc) && /'亮度调节 '\s*\+/.test(rSrc),
+    'Q152 徽标在 brightness 档显示「亮度调节」且 level ok（原生 ISP 压暗、预览即所见）');
+  // tier0 软件兜底与 brightness 档必须可区分（一个是显示层补暗 warn、一个是硬件压暗 ok）
+  assert(/tier === 0/.test(rSrc) && /'软件压暗 '/.test(rSrc),
+    'Q153 徽标在 tier0 显示「软件压暗」且为 warn 色（与 brightness 硬件档区隔）');
+
+  // 控制器层确认：brightness 档确实从 ISP 层下发，而非任何预览期滤镜
+  const cSrc = fs.readFileSync(path.join(ROOT, 'renderer', 'camera-controller.js'), 'utf8');
+  assert(/tier:\s*'brightness'/.test(cSrc) && /reason:\s*'brightness'/.test(cSrc),
+    'Q154 pickExposurePlan 在 cap.brightness 可用时优先返回 brightness 档');
+  assert(/advanced:\s*\[\{\s*brightness:\s*bVal\s*\}\]/.test(cSrc),
+    'Q155 brightness 档通过 track.applyConstraints({advanced:[{brightness}]}) 在 ISP 层压暗');
+}
+
+/* ========================================================================== *
+ * 八、【P1】亮度参数档（brightness）的档位语义
+ *
+ * 背景：brightness 是**字符串档**（'brightness'），而 tier1/tier2 是数字档。
+ * `'brightness' > 0 === false` —— 凡是用 `tier > 0` 判「是不是硬件档」的地方，
+ * 字符串档都会被静默误判成 tier0。已修复的三条不变量在此锁死：
+ *   ① cfg 未定义（模块级纯函数引用闭包变量 → 真机每次 apply 都抛 ReferenceError，
+ *      曝光辅助彻底失效）；
+ *   ② 幽灵记忆记不进字符串档（expGhostRemember 的 `tier > 0` 恒 false → 打击计数
+ *      永远为 0 → 幽灵设备反复走 brightness 档浪费探测窗口）；
+ *   ③ 降级链断裂 + 原地打转（tier1 → brightness → tier1 循环）。
+ * ======================================================================== */
+async function sectBrightnessTier() {
+  console.log('\n· 【P1】亮度参数档（brightness）：字符串档的语义与降级链');
+
+  /* --- ① 档位身份的唯一判定源 --- */
+  eq(C.tierRank(0), 0, 'Q156 tierRank(0)=0（软件兜底，底档）');
+  eq(C.tierRank(1), 1, 'Q157 tierRank(1)=1（曝光补偿，硬件档）');
+  eq(C.tierRank('brightness'), 1, 'Q158 tierRank(\'brightness\')=1（原生亮度，同属硬件档）');
+  eq(C.tierRank(2), 2, 'Q159 tierRank(2)=2（手动曝光，最重档）');
+  eq(C.tierRank('未知档'), 0, 'Q160 tierRank 对未知档位返回 0（不抛异常、不猜）');
+  // 反向对照：字符串档与 0 的数值比较恒为 false —— 这正是本轮三类缺陷的共同根因
+  assert(('brightness' > 0) === false,
+    'Q161 反向对照：\'brightness\' > 0 恒为 false（这就是字符串档必须走 tierRank 的根因）');
+
+  /* --- ② 幽灵记忆的键归一化 --- */
+  eq(C.expGhostKey(1), 't1', 'Q162 数字档 1 的记忆键是 t1');
+  eq(C.expGhostKey(2), 't2', 'Q163 数字档 2 的记忆键是 t2');
+  eq(C.expGhostKey('brightness'), 's:brightness', 'Q164 字符串档的记忆键是 s:brightness（不与数字撞车）');
+  eq(C.expGhostKey(0), '', 'Q165 tier0 不进幽灵记忆（键为空串）');
+
+  /* --- ③ buildExposureConstraints 的 cfg 形参（ReferenceError 防护）--- */
+  const bPlan = { tier: 'brightness', reason: 'brightness', min: 0, max: 255, step: 1, base: 128 };
+  // 不传 cfg：必须退回 DEFAULTS.expEvMin，不能抛 ReferenceError
+  let noCfg = null;
+  try {
+    noCfg = C.buildExposureConstraints(bPlan, -1.5);
+  } catch (e) {
+    noCfg = { error: String(e && e.message) };
+  }
+  assert(noCfg && !noCfg.error && noCfg.advanced && noCfg.advanced[0].brightness !== undefined,
+    'Q166 buildExposureConstraints 不传 cfg 时不抛 ReferenceError（模块级纯函数不得引用闭包变量）' +
+    (noCfg && noCfg.error ? '（实际抛：' + noCfg.error + '）' : ''));
+  // 传 cfg：EV 下限换了，满量程参照必须跟着换（映射与闭环深度同源）
+  const withCfgA = C.buildExposureConstraints(bPlan, -1.5, { expEvMin: -3.0 });
+  const withCfgB = C.buildExposureConstraints(bPlan, -1.5, { expEvMin: -1.5 });
+  assert(withCfgA.advanced[0].brightness !== withCfgB.advanced[0].brightness,
+    'Q167 cfg.expEvMin 变化会改变 brightness 映射（EV 下限是满量程参照，必须同源）');
+  // 满量程边界：请求到 EV 下限时恰好吃满 BRIGHT_DROP_K 比例的**可用下行空间**。
+  // 可下行空间 = base − min（不是 span = max − min）：基线在量程中点时，
+  // 从 base 往下最多只能走到 min，能吃掉的量程只有 span 的一半。
+  const bPlan2 = { tier: 'brightness', reason: 'brightness', min: 0, max: 255, step: 1, base: 128 };
+  const atFloor = C.buildExposureConstraints(bPlan2, -3.0, { expEvMin: -3.0 });
+  const drop = 128 - atFloor.advanced[0].brightness;
+  const usable = 128 - 0;   // base → min
+  near(drop / usable, 0.7, 0.01,
+    'Q168 请求到 EV 下限时吃满可用下行空间的 70%（BRIGHT_DROP_K，给 ISP 留余量）');
+  // 单调性：EV 越负 → brightness 码值越低（越暗）
+  const seq = [-0.5, -1.0, -1.5, -2.0, -3.0].map(function (ev) {
+    return C.buildExposureConstraints(bPlan, ev, { expEvMin: -3.0 }).advanced[0].brightness;
+  });
+  let mono = true;
+  for (let i = 1; i < seq.length; i++) if (seq[i] > seq[i - 1]) mono = false;
+  assert(mono, 'Q169 brightness 码值随 EV 加深单调不增（方向反了就是越压越亮）');
+  eq(seq[seq.length - 1], C.buildExposureConstraints(bPlan, -3.0, { expEvMin: -3.0 }).advanced[0].brightness,
+    'Q170 同一 EV 多次构造结果一致（纯函数，无隐藏状态）');
+  // 恢复约束：必须回到基线码值，否则 release 后画面永久偏暗
+  eq(C.buildExposureRestoreConstraints(bPlan).advanced[0].brightness, 128,
+    'Q171 brightness 恢复约束回到基线码值 128（release 后画面不残留偏暗）');
+  // 越界钳位：码值不得超出能力量程
+  const clamped = C.buildExposureConstraints({ tier: 'brightness', reason: 'brightness', min: 10, max: 100, step: 1, base: 50 }, -3.0, { expEvMin: -3.0 });
+  assert(clamped.advanced[0].brightness >= 10 && clamped.advanced[0].brightness <= 100,
+    'Q172 brightness 码值被钳在能力量程内（实际 ' + clamped.advanced[0].brightness + '）');
+
+  /* --- ④ 降级链：tier1 → brightness → tier2 → tier0，且不原地打转 --- */
+  const capAll = {
+    exposureCompensation: { min: -3, max: 3, step: 0.1 },
+    brightness: { min: 0, max: 255, step: 1 },
+    exposureMode: ['manual', 'continuous'],
+    exposureTime: { min: 10, max: 100000 }
+  };
+  const settingsAll = { exposureCompensation: 0, brightness: 128, exposureTime: 1000 };
+
+  // 只摘当前档的能力键 → 会退成 brightness；再摘 brightness → 又选回 tier1（原地打转）
+  const d1 = C.demoteExposurePlan({ tier: 1, reason: 'x', min: -3, max: 3, step: 0.1 }, capAll, settingsAll, {});
+  eq(d1.tier, 'brightness', 'Q173 降级链第一跳：tier1 无效 → 落到 brightness 档（不是直接掉 tier0）');
+  assert(d1.plan && d1.plan.tier === 'brightness', 'Q174 降级到 brightness 时必须带上可用的 plan');
+  eq(d1.reason, 'comp-ineffective', 'Q175 brightness 降级原因记为 comp-ineffective（不是 manual-ineffective）');
+
+  // 累积 banned 后再降：brightness 也无效 → 必须继续往下（tier2），且不回到 tier1
+  const d2 = C.demoteExposurePlan(d1.plan, capAll, settingsAll, d1.banned || {});
+  assert(d2.tier === 2 || d2.tier === 0,
+    'Q176 累积 banned 后降级不会回到 tier1（原地打转已消除），实际落到 tier=' + d2.tier);
+  assert(d2.tier !== 1, 'Q177 降级链绝不回到已被判无效的 tier1');
+  assert(d2.banned && d2.banned.exposureCompensation && d2.banned.brightness,
+    'Q178 banned 集合累积了两个已失效能力键（探测空间单调收缩）');
+
+  // brightness 档自身被判无效 → 也能降级。
+  // 契约：demoteExposurePlan 只摘**当前档**的能力键；「不回到 tier1」靠的是调用方
+  // 跨调用累积 banned（否则只摘 brightness → tier1 又复活 → 原地打转）。
+  // 因此这里必须带上「tier1 已被摘掉」的 banned 才能断言降级成功。
+  const d3 = C.demoteExposurePlan(
+    { tier: 'brightness', reason: 'brightness', min: 0, max: 255, step: 1, base: 128 },
+    capAll, settingsAll, { exposureCompensation: true });
+  assert(d3.tier === 2 || d3.tier === 0,
+    'Q179 brightness 档被判无效时能继续降级（不是掉进 tier0），实际 tier=' + d3.tier);
+  assert(d3.tier !== 1,
+    'Q180 brightness 降级后不回 tier1（banned 已累积摘掉该键，否则原地打转）');
+  assert(d3.banned && d3.banned.brightness && d3.banned.exposureCompensation,
+    'Q181 从 brightness 降级时 banned 累积了 brightness 与已摘掉的 exposureCompensation');
+
+  // 手动档是硬件链最后一环 → 只能落 tier0
+  const d4 = C.demoteExposurePlan({ tier: 2, reason: 'x', baseTime: 500, baseIso: null, timeMin: 10, timeMax: 10000, isoMin: null, isoMax: null, restoreMode: 'continuous' }, capAll, settingsAll, {});
+  eq(d4.tier, 0, 'Q183 手动档（tier2）判无效后只能落 tier0（硬件链终点）');
+  eq(d4.reason, 'manual-ineffective', 'Q184 手动档降级原因记为 manual-ineffective（与硬件档可区分）');
+  const d5 = C.demoteExposurePlan({ tier: 0 }, capAll, settingsAll, {});
+  eq(d5.tier, 0, 'Q185 tier0 传入降级函数仍是 tier0（不产生非法档位）');
+
+  /* --- ⑤ 运行时：brightness 设备真的走 brightness 档并下发 brightness 约束 --- */
+  const bTrack = makeTrack({
+    caps: { brightness: { min: 0, max: 255, step: 1 } },
+    settings: { brightness: 128 }
+  });
+  const hB = makeHarness({ track: bTrack });
+  await boot(hB);
+  await pump(hB.clock, 200, 5);
+  const infoB = hB.ctrl.getExposureInfo();
+  eq(infoB.tier, 'brightness', 'Q186 只有 brightness 能力的设备落到 brightness 档');
+  const bCalls = bTrack.calls.filter(function (c) {
+    return c && c.advanced && c.advanced[0] && typeof c.advanced[0].brightness === 'number';
+  });
+  assert(bCalls.length > 0, 'Q187 brightness 档真的下发了 brightness 约束（' + bCalls.length + ' 次）');
+  // 绝不能同时下发曝光补偿（两个偏置叠在同一台设备上 = 画面莫名偏暗）
+  const compCalls = bTrack.calls.filter(function (c) {
+    return c && c.advanced && c.advanced[0] && typeof c.advanced[0].exposureCompensation === 'number';
+  });
+  eq(compCalls.length, 0, 'Q188 brightness 档不下发 exposureCompensation（两个偏置不叠加）');
+  // 约束形状：只允许 advanced 一个顶层键
+  const badShape = bCalls.filter(function (c) {
+    const t = Object.keys(c);
+    return t.length !== 1 || t[0] !== 'advanced';
+  });
+  eq(badShape.length, 0, 'Q189 brightness 约束只有 advanced 一个顶层键（最小约束原则）');
+
+  /* --- ⑥ 运行时：brightness 设备被重复判无效后，记忆能拦住它（不再反复探测）--- */
+  // 设备报告 brightness 但实际不响应 → 有效性判定会判无效 → 连续两次后应被记住
+  const zTrack = makeTrack({
+    caps: { brightness: { min: 0, max: 255, step: 1 } },
+    settings: { brightness: 128 }
+  });
+  const hZ = makeHarness({ track: zTrack });
+  await boot(hZ);
+  await pump(hZ.clock, 400, 5);
+  await flush(80);
+  const zFallback = logsOf(hZ.logs, 'CAM_EXP_FALLBACK');
+  const zEnum = logsOf(hZ.logs, 'CAM_EXP_ENUM').map(function (x) { return x.fields.tier; });
+  // 记忆是否被触发：出现 ghost-remembered 说明字符串档的打击真被记进并读出了
+  const ghostSkips = zFallback.filter(function (x) { return x.fields.reason === 'ghost-remembered'; });
+  const ghostStrikes = zFallback.map(function (x) { return x.fields.ghostStrike; }).filter(function (v) { return v != null; });
+  assert(ghostStrikes.every(function (v) { return v >= 1; }),
+    'Q190 brightness 档的幽灵打击被记进记忆（strike≥1，字符串档没被当成 tier0 吞掉）');
+  assert(zEnum.indexOf('brightness') >= 0 || ghostSkips.length > 0,
+    'Q191 brightness 档确实被启用过（ENUM 里出现 brightness 或走了跳档路径）');
+  hZ.ctrl.unmount();
+  await flush(40);
 }
 
 /* ========================================================================== *
@@ -1262,6 +1449,7 @@ async function main() {
   await sectBoundary();
   await sectMutants();
   await sectLutOrder();
+  await sectBrightnessTier();
   await sectContract();
 
   assert(unhandled.length === 0, 'Q142 全程无未处理的 Promise 拒绝（实际 ' + unhandled.length + ' 条）');

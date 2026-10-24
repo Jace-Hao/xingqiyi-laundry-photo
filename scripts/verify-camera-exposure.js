@@ -1228,6 +1228,79 @@ async function suite() {
   }
 
   /* ---------------------------------------------------------------- *
+   * P2. 亮度参数档（brightness）：字符串档的档位语义与降级链
+   *
+   * brightness 是**字符串档**（'brightness'），tier1/tier2 是数字档。
+   * `'brightness' > 0 === false` —— 凡是用 `tier > 0` 判「是不是硬件档」的地方，
+   * 字符串档都被静默误判成 tier0。这组断言锁死四条不变量：
+   *   ① 档位身份走 tierRank（唯一判定源）；
+   *   ② 幽灵记忆的键走 expGhostKey（字符串档也得能记进读出）；
+   *   ③ buildExposureConstraints 的 cfg 形参（模块级纯函数不得引用闭包变量）；
+   *   ④ 降级链不原地打转（banned 跨调用累积）。
+   * ---------------------------------------------------------------- */
+  console.log('\n· P2 亮度参数档（brightness）：字符串档的档位语义与降级链');
+  {
+    // ① 档位身份
+    assert(C.tierRank(0) === 0, 'P14 tierRank(0)=0（软件兜底）');
+    assert(C.tierRank(1) === 1, 'P15 tierRank(1)=1（曝光补偿，硬件档）');
+    assert(C.tierRank('brightness') === 1, 'P16 tierRank(\'brightness\')=1（原生亮度，同属硬件档）');
+    assert(C.tierRank(2) === 2, 'P17 tierRank(2)=2（手动曝光，最重档）');
+    assert(('brightness' > 0) === false,
+      'P18 反向对照：\'brightness\' > 0 恒为 false（字符串档必须走 tierRank 的根因）');
+
+    // ② 幽灵记忆的键
+    assert(C.expGhostKey(1) === 't1' && C.expGhostKey(2) === 't2',
+      'P19 数字档的记忆键是 t1/t2');
+    assert(C.expGhostKey('brightness') === 's:brightness',
+      'P20 字符串档的记忆键是 s:brightness（不与数字撞车）');
+    assert(C.expGhostKey(0) === '', 'P21 tier0 不进幽灵记忆');
+
+    // ③ cfg 形参 + 映射口径
+    const bPlan = { tier: 'brightness', reason: 'brightness', min: 0, max: 255, step: 1, base: 128 };
+    let noCfg = null, threw = null;
+    try { noCfg = C.buildExposureConstraints(bPlan, -1.5); } catch (e) { threw = String(e && e.message); }
+    assert(threw === null && noCfg && noCfg.advanced && typeof noCfg.advanced[0].brightness === 'number',
+      'P22 buildExposureConstraints 不传 cfg 时不抛 ReferenceError（模块级纯函数不得引用闭包变量）' +
+      (threw ? '（实际抛：' + threw + '）' : ''));
+    // 满量程参照必须是「可用下行空间」（base − min），不是 span：
+    // 基线在量程中点时用 span 算会算出超过可用空间的 drop → 码值直接撞 min 钳位，
+    // 「吃 70% 量程」实际变成「吃满到底」，ISP 余量被吃掉（真机基线多在中点，是常态）
+    const atFloor = C.buildExposureConstraints(bPlan, -3.0, { expEvMin: -3.0 });
+    near((128 - atFloor.advanced[0].brightness) / (128 - 0), 0.7, 0.01,
+      'P23 请求到 EV 下限时吃满可用下行空间的 70%（BRIGHT_DROP_K，给 ISP 留余量）');
+    // EV 越深码值越低（方向反了就是越压越亮）
+    const seq = [-0.5, -1.0, -1.5, -2.0, -3.0].map(function (ev) {
+      return C.buildExposureConstraints(bPlan, ev, { expEvMin: -3.0 }).advanced[0].brightness;
+    });
+    let mono = true;
+    for (let i = 1; i < seq.length; i++) if (seq[i] > seq[i - 1]) mono = false;
+    assert(mono, 'P24 brightness 码值随 EV 加深单调不增（方向反了就是越压越亮）');
+    assert(C.buildExposureRestoreConstraints(bPlan).advanced[0].brightness === 128,
+      'P25 brightness 恢复约束回到基线码值（release 后画面不残留偏暗）');
+
+    // ④ 降级链：tier1 → brightness → tier2，且 banned 累积后不原地打转
+    const capAll = {
+      exposureCompensation: { min: -3, max: 3, step: 0.1 },
+      brightness: { min: 0, max: 255, step: 1 },
+      exposureMode: ['manual', 'continuous'],
+      exposureTime: { min: 10, max: 100000 }
+    };
+    const setAll = { exposureCompensation: 0, brightness: 128, exposureTime: 1000 };
+    const plan1b = C.pickExposurePlan(capAll, setAll);
+    assert(plan1b.tier === 1, 'P26 前置：同时有补偿与 brightness 能力 → 先走 tier1');
+    const d1b = C.demoteExposurePlan(plan1b, capAll, setAll, {});
+    assert(d1b.tier === 'brightness',
+      'P27 tier1 无效 → 降到 brightness 档（字符串档没被误判成 tier0 而直接掉底）');
+    assert(d1b.plan && d1b.plan.tier === 'brightness', 'P28 降到 brightness 时带上了可用的 plan');
+    assert(d1b.reason === 'comp-ineffective', 'P29 brightness 降级原因是 comp-ineffective');
+    const d2b = C.demoteExposurePlan(d1b.plan, capAll, setAll, d1b.banned || {});
+    assert(d2b.tier !== 1,
+      'P30 累积 banned 后降级不回 tier1（原地打转已消除），实际 tier=' + d2b.tier);
+    assert(d2b.banned && d2b.banned.exposureCompensation && d2b.banned.brightness,
+      'P31 banned 累积了两个已失效能力键（探测空间单调收缩）');
+  }
+
+  /* ---------------------------------------------------------------- *
    * R. 控制器集成：幽灵能力自动降级 / 正常设备不误伤（§7.5）
    * ---------------------------------------------------------------- */
   console.log('\n· R 控制器集成（幽灵能力 → 自动降级；正常设备 → 不误伤）');
@@ -2240,15 +2313,29 @@ async function runAll(mod) {
   fail = 0;
   failures = [];
   console.log('=== verify-camera-exposure：曝光辅助（黑色衣物过曝防护） ===');
-  await suite();
+  // 套件自身抛异常时**保留已累积的失败**再上抛：
+  // 变异测试靠「哪些断言变红」判定缺陷被抓住，而崩溃型缺陷（如纯函数引用
+  // 闭包变量 → 每次调用都抛 ReferenceError）会在跑到一半时炸掉整个套件。
+  // 若只上抛异常，已变红的那几条断言（如 P22「不传 cfg 不抛错」）就被丢掉，
+  // 变异体只能报一条无归属的「脚本异常」，无法归因到具体判据。
+  let crashed = null;
+  try {
+    await suite();
+  } catch (e) {
+    crashed = e;
+  }
   console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');
   if (fail) {
     console.log('\n失败清单：');
     failures.forEach(function (m) { console.log('  - ' + m); });
   }
+  if (crashed) {
+    console.error('脚本异常：', (crashed && crashed.stack) || crashed);
+    failures.push('脚本异常：' + ((crashed && crashed.message) || crashed));
+  }
   // 注意：这里不改 process.exitCode —— 变异测试会在同一进程内反复调用 runAll()，
   // 逐轮污染退出码会让「全部变异都被抓住」的脚本仍然以非 0 退出
-  return { pass: pass, fail: fail, failures: failures.slice() };
+  return { pass: pass, fail: fail + (crashed ? 1 : 0), failures: failures.slice() };
 }
 
 if (require.main === module) {

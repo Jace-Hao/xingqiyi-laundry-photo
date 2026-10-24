@@ -1578,9 +1578,10 @@ const CapturePage = {
     });
 
     // 曝光辅助徽标：只在辅助 ACTIVE 时显示，让介入行为对用户可见（不隐性）。
-    // tier 0 = 硬件不支持补偿，靠拍照时软件压暗存档图 —— 预览通过 exposureFilter
-    // 同步压暗（见下），所见即所得；徽标用告示色 + 「软件压暗」文案说明这条路径
-    // 是显示层补上来的，硬件本身没有变暗能力
+    // 2026-10-24 改为相机原生亮度参数（brightness 档）：压暗在 ISP 层面发生，
+    // 预览与成片同源，无需任何后期 LUT，也不再给 <video> 套 SVG 滤镜（那会导致白屏）。
+    // tier 'brightness' = 原生亮度参数压暗（硬件能力，ok 色）；tier 0 = 硬件不支持、
+    // 靠拍照时软件压暗存档图（预览为原始 ISP 提亮帧，warn 色说明是显示层补的）。
     const exposureBadge = Vue.computed(() => {
       const e = exposureInfo.value;
       if (!e || e.state !== 'ACTIVE') return null;
@@ -1588,52 +1589,15 @@ const CapturePage = {
       // 过压设备会被闭环钳在可达深度，徽标自然回到合理范围；appliedEv 缺失时回退请求值
       const evRaw = (e.appliedEv != null && isFinite(e.appliedEv)) ? e.appliedEv : e.ev;
       const ev = (Math.round(evRaw * 10) / 10).toFixed(1);
+      if (e.tier === 'brightness') return { text: '亮度调节 ' + ev + 'EV', level: 'ok' };
       if (e.tier === 0) return { text: '软件压暗 ' + ev + 'EV', level: 'warn' };
       return { text: '曝光补偿 ' + ev + 'EV', level: 'ok' };
     });
 
-    // 预览同步压暗（2026-10-23 现场标定配套，调查报告 docs/field-2026-10-23-tier0-darkening.md；
-    // 2026-10-24 改为保高光色调曲线，见下）：tier0 软件兜底原本只改存档图，预览仍是 ISP
-    // 提亮帧——17:19 投诉第一句就是「预览窗口没有变化，还是很亮，但是拍完的照片被调暗了」。
-    // 这里给 <video> 套与存档完全同一条 LUT（SVG feComponentTransfer 的 tableValues），
-    // 而非 CSS brightness()：brightness() 只能做均匀乘法，会把白垫板也压成灰平台（用户
-    // 原话「软件应该调整的是亮度而不是压暗」）。feComponentTransfer 的 table 直接吃
-    // buildExposureLut 的 256 项曲线，预览因此与存档逐点一致（所见即所得）。
-    // 三个边界同前：① 只对 tier0 生效；② 只显示层生效（drawImage 取未过滤帧，检测/闭环不受影响）；
-    // ③ 用 e.ev（与 capture() 同源），保证「预览曲线 == 存档曲线」。
-    const IDENTITY_LUT_STR = (function () {
-      const a = [];
-      for (let i = 0; i < 256; i++) a.push(i);
-      return a.join(' ');
-    })();
-    const lutR = Vue.ref(null), lutG = Vue.ref(null), lutB = Vue.ref(null);
-    // 与存档同源的 256 项曲线字符串（恒等 / 保高光 LUT）；feComponentTransfer 直接消费
-    const exposureLutTable = Vue.computed(() => {
-      const e = exposureInfo.value;
-      if (!e || e.state !== 'ACTIVE' || e.tier !== 0) return IDENTITY_LUT_STR;
-      const ev = Number(e.ev);
-      if (!isFinite(ev) || ev >= 0) return IDENTITY_LUT_STR;
-      const fn = window.CameraController && window.CameraController.buildExposureLut;
-      const lut = fn ? fn(ev) : null;
-      if (!lut) return IDENTITY_LUT_STR;
-      let s = '';
-      for (let i = 0; i < 256; i++) s += (i ? ' ' : '') + lut[i];
-      return s;
-    });
-    function syncExposureLutTable(str) {
-      [lutR.value, lutG.value, lutB.value].forEach(function (el) {
-        if (el) el.setAttribute('tableValues', str);
-      });
-    }
-    Vue.watch(exposureLutTable, syncExposureLutTable);
-    Vue.onMounted(function () { syncExposureLutTable(exposureLutTable.value); });
-    const exposureFilter = Vue.computed(() => {
-      const e = exposureInfo.value;
-      if (!e || e.state !== 'ACTIVE' || e.tier !== 0) return '';
-      const ev = Number(e.ev);
-      if (!isFinite(ev) || ev >= 0) return '';
-      return 'url(#xqy-exposure-lut)';
-    });
+    // 预览不再做任何后期滤镜：亮度参数档（brightness）在 ISP 层面压暗，预览即所见；
+    // 软件兜底档（tier0）只改存档图，预览保持原始 ISP 提亮帧（与 v1.2.16 行为一致）。
+    // 注：曾给 <video> 套 SVG feComponentTransfer 滤镜（v1.2.17），在 Electron/Chromium
+    // 下会把视频渲染挂掉致白屏，已移除。
 
     function camIdleMs() {
       const v = Number(window.__xqyCamIdleMs);
@@ -2507,25 +2471,12 @@ const CapturePage = {
       barcode, note, saving, barcodeCount, videoEl, barcodeEl, ready,
       barcodeWarn, applyCleaned, applySimilar, barcodeLocked, unlockBarcode,
       sleeping, camState, camHint, camPrivacy, camErr, camErrCode, camAr, camMaxH,
-      exposureInfo, exposureBadge, exposureFilter, exposureLutTable, lutR, lutG, lutB,
+      exposureInfo, exposureBadge,
       startCamera, retryCamera, switchDevice, wakeCamera, sleepCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone, openPrivacySettings
     };
   },
   template: `
     <div>
-      <!-- tier0 软件兜底预览 LUT：SVG feComponentTransfer 直接消费 buildExposureLut 的 256 项
-           曲线，color-interpolation-filters="sRGB" 保证与存档 sRGB 码值 LUT 逐点一致 -->
-      <svg class="exposure-lut-defs" width="0" height="0" aria-hidden="true" style="position:absolute">
-        <defs>
-          <filter id="xqy-exposure-lut" color-interpolation-filters="sRGB">
-            <feComponentTransfer>
-              <feFuncR ref="lutR" type="table"></feFuncR>
-              <feFuncG ref="lutG" type="table"></feFuncG>
-              <feFuncB ref="lutB" type="table"></feFuncB>
-            </feComponentTransfer>
-          </filter>
-        </defs>
-      </svg>
       <div class="page-head">
         <h2>衣物拍照</h2>
         <p>扫码后自动进入拍摄状态，可连续拍多张、全部保存后自动编号；快捷键：<b>空格 = 拍照</b>，<b>回车 = 保存</b></p>
@@ -2542,7 +2493,7 @@ const CapturePage = {
                invalid at computed-value time，var() 的 fallback 也救不回来，会退化成 auto。 -->
           <div class="camera-box"
                :style="{ '--cam-ar': camAr || '4 / 3', '--cam-max-h': (camMaxH > 0 ? camMaxH + 'px' : '68vh') }">
-            <video ref="videoEl" autoplay playsinline muted :style="{ filter: exposureFilter }"></video>
+            <video ref="videoEl" autoplay playsinline muted></video>
             <div v-if="camState !== 'LIVE'" class="camera-overlay" :class="{ error: !!cameraError }">
               <template v-if="camState === 'SLEEPING'">
                 <div class="camera-sleep-title">摄像头已休眠（已释放占用）</div>

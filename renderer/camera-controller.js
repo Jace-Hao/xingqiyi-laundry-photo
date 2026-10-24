@@ -516,6 +516,36 @@
     return out;
   }
 
+  // 档位身份判定（纯函数，全模块唯一来源）。
+  // tier 可能是数字（0=软件兜底 / 1=曝光补偿 / 2=手动曝光）或字符串（'brightness'=原生亮度）。
+  // 为什么需要它：`tier > 0` 这类数值比较对字符串档恒为 false（'brightness' > 0 === false），
+  // 凡是用它判断「是不是硬件档 / 是不是数字档」的地方，字符串档都会被静默误判成 tier0 ——
+  // 后果是幽灵打击记不进记忆、降级链断裂、零调整安全网失效。
+  // 排名语义：0 = 软件兜底（底），1 = 硬件档（可压暗），2 = 手动档（最重）。
+  // brightness 排在 1 与 2 之间：它比手动曝光轻、不切曝光模式、不会触发帧崩塌。
+  function tierRank(tier) {
+    if (tier === 1) return 1;
+    if (tier === 'brightness') return 1;
+    if (tier === 2) return 2;
+    return 0;
+  }
+
+  // 幽灵记忆的档位键归一化（纯函数，全模块唯一来源）：把 tier 值映射成记忆表里
+  // 唯一且稳定的键。tier 可能是数字（0/1/2）或字符串（'brightness'），直接当
+  // 对象键用会出两类问题：
+  //   ① 数字 1 与字符串 '1' 撞车；
+  //   ② `tier > 0` 这类数值比较对字符串恒为 false（'brightness' > 0 === false），
+  //      凡是用它当「是否为硬件档」的判据，字符串档都会被误判成 tier0。
+  // 统一走这里之后，档位语义（是否为硬件档）与键的取法彻底分离。
+  // 与 tierRank 并列放在模块级：两者都是「档位身份」的唯一判定源，
+  // 放闭包里就只能被内部调用，外部无法独立验证。
+  function expGhostKey(tier) {
+    if (tier === 1) return 't1';
+    if (tier === 2) return 't2';
+    if (tier === 'brightness') return 's:brightness';
+    return '';
+  }
+
   // 能力探测 → 三档降级路径（设计文档 §7.1）。摄像头能力差异极大，
   // 且部分 UVC 的 getCapabilities() 直接抛异常，调用方必须包 try
   function pickExposurePlan(cap, settings) {
@@ -533,6 +563,24 @@
         min: cap.exposureCompensation.min,
         max: typeof cap.exposureCompensation.max === 'number' ? cap.exposureCompensation.max : 0,
         step: cap.exposureCompensation.step || 0
+      };
+    }
+    // 亮度参数档（用户 2026-10-24 现场要求「软件应该调整的是亮度而不是压暗」）：
+    // 相机原生 brightness 是 ISP 黑电平/亮度偏移控制，下压即整体变暗，且预览与成片同源
+    // （无需任何后期 LUT，也没有 SVG 滤镜套 <video> 的白屏风险）。比 tier2(manual) 轻、
+    // 不会触发帧崩塌，故排在 manual 之前。
+    if (cap.brightness && typeof cap.brightness.min === 'number' &&
+        typeof cap.brightness.max === 'number' && cap.brightness.max > cap.brightness.min) {
+      var bBase = (settings && typeof settings.brightness === 'number')
+        ? settings.brightness
+        : (cap.brightness.min + cap.brightness.max) / 2;
+      return {
+        tier: 'brightness',
+        reason: 'brightness',
+        min: cap.brightness.min,
+        max: cap.brightness.max,
+        step: cap.brightness.step || 0,
+        base: bBase
       };
     }
     var modes = cap.exposureMode || [];
@@ -562,7 +610,12 @@
 
   // 按档位构造曝光约束。红线：绝不夹带 width/height/frameRate ——
   // 曝光调整碰分辨率键会破坏 applyMaxResolution 的锁定（项目纪律）
-  function buildExposureConstraints(plan, ev) {
+  //
+  // cfg：可选。brightness 档要把 EV 深度换算成 brightness 码值，需要「EV 下限」
+  // 作为满量程参照（与闭环用同一个常量，否则映射与实际下发深度对不上）。
+  // 本函数是模块级纯函数、拿不到控制器闭包里的 cfg，故由调用方显式传入；
+  // 不传时退回 DEFAULTS.expEvMin（与 nextEvStep/solveTier0Ev 的取值约定一致）。
+  function buildExposureConstraints(plan, ev, cfg) {
     if (!plan || plan.tier === 0) return null;
     if (plan.tier === 1) {
       var v = ev;
@@ -575,6 +628,33 @@
       if (v < plan.min) v = plan.min;
       if (v > plan.max) v = plan.max;
       return { advanced: [{ exposureMode: 'continuous', exposureCompensation: v }] };
+    }
+    // 亮度参数档：ISP 黑电平偏移，下压即变暗（与 EV 非严格幂关系，线性近似）。
+    // BRIGHT_DROP_K 留 ISP 余量，满压暗也只吃「可用下行空间」的 70%，避免压到极值
+    // 出现色偏/噪声。
+    if (plan.tier === 'brightness') {
+      var bCfg = Object.assign({}, DEFAULTS, cfg || {});
+      var bSpan = plan.max - plan.min;
+      if (!(bSpan > 0)) return null;
+      var bBase = (typeof plan.base === 'number') ? plan.base : plan.max;
+      // 压暗只能往下走：可用下行空间 = base − min，**不是** span = max − min。
+      // 用 span 算会在基线位于量程中点时算出一个超过实际可用空间的 drop，
+      // 结果码值直接撞 min 钳位 —— 于是「吃 70% 量程」实际变成「吃满到底」，
+      // ISP 余量被吃掉，压到极值出现色偏/噪声。真实设备基线多在中点附近（默认 128/255），
+      // 这条路径是常态而非边缘情况。
+      var bRoom = bBase - plan.min;
+      if (!(bRoom > 0)) return null;      // 基线已在量程底部，无处可压
+      // 满量程参照用「EV 下限」：闭环最深只会请求到 expEvMin，用它做分母才能保证
+      // 「请求到最深 EV」恰好对应「吃满 70% 可用空间」，两者不会脱节。
+      var evFloor = Math.abs(numOr(bCfg.expEvMin, DEFAULTS.expEvMin));
+      if (!(evFloor > 0)) evFloor = 1;
+      var bFrac = (ev < 0) ? Math.min(1, -ev / evFloor) : 0;
+      var bDrop = bFrac * bRoom * BRIGHT_DROP_K;
+      var bVal = bBase - bDrop;
+      if (plan.step > 0 && isFinite(plan.step)) bVal = Math.round(bVal / plan.step) * plan.step;
+      if (bVal < plan.min) bVal = plan.min;
+      if (bVal > plan.max) bVal = plan.max;
+      return { advanced: [{ brightness: bVal }] };
     }
     // tier2 手动档：EV 负补偿 = 曝光时间 ×2^ev；优先压时间不升 iso
     // （升 iso 只加噪点不救过曝，时间才是曝光量的主轴）
@@ -606,6 +686,7 @@
   function buildExposureRestoreConstraints(plan) {
     if (!plan || plan.tier === 0) return null;
     if (plan.tier === 1) return { advanced: [{ exposureCompensation: 0 }] };
+    if (plan.tier === 'brightness') return { advanced: [{ brightness: (typeof plan.base === 'number' ? plan.base : plan.max) }] };
     if (plan.restoreMode === 'continuous') return { advanced: [{ exposureMode: 'continuous' }] };
     var adv = { exposureMode: 'manual' };
     if (plan.baseTime) adv.exposureTime = plan.baseTime;
@@ -619,6 +700,7 @@
   function appliedEvOf(plan, ev, cst) {
     if (!cst || !cst.advanced || !cst.advanced[0]) return ev;
     var a = cst.advanced[0];
+    if (!plan || plan.tier === 'brightness') return ev;
     if (!plan || plan.tier === 1) {
       return typeof a.exposureCompensation === 'number' ? a.exposureCompensation : ev;
     }
@@ -632,35 +714,56 @@
   }
 
   /**
-   * 有效性判定失败后的档位降级（纯函数）：tier1 → tier2 → tier0，一路只往下走。
+   * 有效性判定失败后的档位降级（纯函数）：tier1 → brightness → tier2 → tier0，一路只往下走。
    * tier1 的 exposureCompensation 是幽灵能力时，把该能力从 cap 里摘掉再探测，
-   * 让 pickExposurePlan 有机会落到 manual 路径；manual 同样无效就只剩软件兜底。
+   * 让 pickExposurePlan 有机会落到 brightness / manual 路径；manual 同样无效就只剩软件兜底。
+   *
+   * 档位比较不能用 `tier > 0`：字符串档（'brightness'）与 0 比较恒为 false，
+   * 会被误判成 tier0 而直接掉到软件兜底，降级链就断了。统一用 tierRank 判档位身份。
+   *
+   * banned：可选，累积「已判无效的能力键」集合。必须**跨调用累积**而不是每次只摘当前档：
+   * 只摘当前档的话，tier1 被判无效 → 探测到 brightness → brightness 也被判无效 →
+   * 摘掉 brightness 后重新探测，exposureCompensation 又回来了 → 选回刚被判无效的 tier1，
+   * 降级链原地打转（每次都重新走一遍已知无效的档）。累积 banned 后探测空间单调收缩，
+   * 链必然收敛到 tier2 或 tier0。
    *
    * @param {object} plan 当前档位（pickExposurePlan 的产物）
    * @param {object} cap track.getCapabilities()
    * @param {object} settings track.getSettings()
-   * @returns {{tier:number, reason:string, plan:(object|null)}}
+   * @param {object} [banned] 已失效能力键的累积集合（形如 {exposureCompensation:true}）
+   * @returns {{tier:number|string, reason:string, plan:(object|null)}}
    */
-  function demoteExposurePlan(plan, cap, settings) {
-    var tier = plan && typeof plan.tier === 'number' ? plan.tier : 0;
-    if (tier === 2) return { tier: 0, reason: 'manual-ineffective', plan: null };
-    if (tier !== 1) return { tier: 0, reason: 'unsupported', plan: null };
-    // 把 exposureCompensation 摘掉再探测：它可能只是「报告有、实际无效」
+  function demoteExposurePlan(plan, cap, settings, banned) {
+    var tier = plan ? plan.tier : 0;
+    var rank = tierRank(tier);
+    // 手动档（tier2）是硬件链的最后一环，再降只能落软件兜底
+    if (rank === 2) return { tier: 0, reason: 'manual-ineffective', plan: null, banned: banned || {} };
+    if (rank !== 1) return { tier: 0, reason: 'unsupported', plan: null, banned: banned || {} };
+    // 把「刚被判无效」的那个能力从 cap 里摘掉再探测：它可能只是「报告有、实际无效」。
+    // 不摘的话重新探测会选回同一个刚被判无效的档位，降级原地打转。
+    var ban = {};
+    var bk;
+    if (banned && typeof banned === 'object') {
+      for (bk in banned) {
+        if (Object.prototype.hasOwnProperty.call(banned, bk)) ban[bk] = true;
+      }
+    }
+    ban[(tier === 'brightness') ? 'brightness' : 'exposureCompensation'] = true;
     var cap2 = {};
     var k;
     if (cap && typeof cap === 'object') {
       for (k in cap) {
-        if (Object.prototype.hasOwnProperty.call(cap, k) && k !== 'exposureCompensation') cap2[k] = cap[k];
+        if (Object.prototype.hasOwnProperty.call(cap, k) && !ban[k]) cap2[k] = cap[k];
       }
     }
     var next = pickExposurePlan(cap2, settings);
-    // 只有真能产出曝光值的 manual 才值得切：构造不出曝光值等于「切了手动却不压暗」，
+    // 只有真能产出曝光值的下一档才值得切：构造不出曝光值等于「切了却不压暗」，
     // 与幽灵能力是同一个用户可见后果（徽标说在压暗、画面其实没压）
-    if (next.tier === 2 && !buildExposureConstraints(next, -EXP_EFFECT.minEv)) {
-      return { tier: 0, reason: 'comp-ineffective', plan: null };
+    if (tierRank(next.tier) === 0) return { tier: 0, reason: 'comp-ineffective', plan: null, banned: ban };
+    if (!buildExposureConstraints(next, -EXP_EFFECT.minEv)) {
+      return { tier: 0, reason: 'comp-ineffective', plan: null, banned: ban };
     }
-    if (next.tier === 2) return { tier: 2, reason: 'comp-ineffective', plan: next };
-    return { tier: 0, reason: 'comp-ineffective', plan: null };
+    return { tier: next.tier, reason: 'comp-ineffective', plan: next, banned: ban };
   }
 
   // 软件兜底查找表：out = in × 2^(ev/gamma)（与 §7.5 判定同源的 sRGB 模型）
@@ -681,6 +784,9 @@
   // 均匀灰平台——对洗衣店而言白板变灰 = 看着像脏了，比过曝更糟。
   // 约束：whiteStart ≤ whiteOut 保证整条曲线对任意 ev∈[expEvMin,0] 单调不减。
   var EXP_LUT = { whiteStart: 200, whiteOut: 238 };
+  // 亮度参数档 EV→brightness 映射系数（2026-10-24）：满压暗只吃量程的 70%，给 ISP 留余量。
+  // 真机校准：下压后实测主体均值仍过亮则调大，压到色偏/噪声则调小。
+  var BRIGHT_DROP_K = 0.7;
   function buildExposureLut(ev) {
     var lut = new Uint8ClampedArray(256);
     var v = Number(ev);
@@ -1383,8 +1489,12 @@
     // 拿不到任何设备标识时的兜底发号器：见 devIdOf() 注释（QA DEF-4）
     var ghostUidSeq = 0;
 
+    // 幽灵记忆的档位键归一化：见模块级 expGhostKey（与 tierRank 同为档位身份的唯一来源）
+
     function expGhostBlocked(tier) {
-      return !!(tier > 0 && (expGhost.tiers[tier] || 0) >= EXP_GHOST.minStrikes);
+      var key = expGhostKey(tier);
+      if (!key) return false;
+      return (expGhost.tiers[key] || 0) >= EXP_GHOST.minStrikes;
     }
 
     // 当前 track 的设备标识：幽灵记忆按设备记，不能串档（QA DEF-4）。
@@ -1415,12 +1525,18 @@
     // 记一次「实测无效」，返回该档位在本设备上累计被判无效的次数（供日志回看第几次）。
     // 计数跟着 devId 走：换设备时连计数一起清空 —— 换了一台机器，上一台还差一次才达
     // 门槛的证据不该被继承（否则 A 机 1 次 + B 机 1 次就凑成 2 次，误伤新设备）
+    //
+    // 档位键：数字档用 '1'/'2'，字符串档（'brightness'）用 's:brightness'。
+    // 为什么不能直接用 tier 值当键：数字 1 与字符串 '1' 在对象键上会撞车，
+    // 而 tier>0 这类数值比较对字符串档恒为 false（'brightness' > 0 === false），
+    // 用它做判断会让字符串档既记不进记忆也读不出记忆。
     function expGhostRemember(tier, devId) {
-      if (!(tier > 0)) return 0;
+      var key = expGhostKey(tier);
+      if (!key) return 0;
       var d = typeof devId === 'string' ? devId : '';
       if (d !== expGhost.dev) { expGhost.dev = d; expGhost.tiers = {}; }
-      var n = (expGhost.tiers[tier] || 0) + 1;
-      expGhost.tiers[tier] = n;
+      var n = (expGhost.tiers[key] || 0) + 1;
+      expGhost.tiers[key] = n;
       return n;
     }
 
@@ -1599,9 +1715,13 @@
       // 无效）若只跳过 tier1，落到 tier2 后 tier2 仍会被完整重走一遍（QA DEF-3 实测：
       // 第二件衣物仍下发 6 次 manual 约束，无效窗口只从 4.3s 降到 3.5s 而不是 0）。
       // 降级链尾是 tier0（tier0 不在记忆里），循环必然终止；guard 只是防御性上限。
+      // banned 累积已失效的能力键：否则 tier1 → brightness → tier1 原地打转
+      // （每次都重走一遍已知无效的档位，等于没降级）
       var guard = 0;
-      while (plan.tier > 0 && expGhostBlocked(plan.tier) && guard++ < 4) {
-        var alt = demoteExposurePlan(plan, cap, settings);
+      var banned = {};
+      while (plan.tier !== 0 && expGhostBlocked(plan.tier) && guard++ < 4) {
+        var alt = demoteExposurePlan(plan, cap, settings, banned);
+        banned = alt.banned || banned;
         if (!skippedTier) skippedTier = plan.tier;
         plan = alt.plan || { tier: 0, reason: alt.reason };
       }
@@ -1631,7 +1751,9 @@
       // 与 tickClosedLoop 的步进同语义：只在 apply 真的成功时更新（设备没动就不能换参照）
       var preApplyMean = (cl && isFinite(cl.rawSceneMean) && cl.rawSceneMean > 0) ? cl.rawSceneMean : 0;
       // 先把模式切过去（补偿从 0 起，具体压多少交给闭环），失败即降级 tier0
-      var cst = buildExposureConstraints(plan, 0);
+      // cfg 必须传：brightness 档要拿 expEvMin 当满量程参照，不传会退回 DEFAULTS，
+      // 与控制器实际配置不同源（用户改过 expEvMin 时映射与闭环深度脱节）
+      var cst = buildExposureConstraints(plan, 0, cfg);
       var ok = await applyExposure(track, cst, mySeq);
       if (!ok) {
         expAssist.tier = 0;
@@ -1738,14 +1860,14 @@
         r = { ev: expAssist.evFloor, step: expAssist.evFloor - expAssist.ev, err: r.err };
       }
       // 幽灵能力只能靠这一步测出来：约束发出去 ≠ 画面真的变暗（lastAppliedEv 仍为请求值）
-      if (expAssist.tier > 0 && cl.hit && expAssist.lastApplyAt > 0) {
+      if (expAssist.tier !== 0 && cl.hit && expAssist.lastApplyAt > 0) {
         recordEffectSample(cl, nowMs, r.err > 0 &&
           Math.abs(expAssist.lastAppliedEv - expAssist.prevAppliedEv) < 1e-6);
       }
       // 有效性判定：只判硬件档（tier0 根本没发过约束，也不影响预览采样）。
       // 判定放这里而不是「apply 成功之后」：贴住下限时不会再有 apply，
       // 而那正是现场「一直空转」的形态，必须照样判得到
-      if (expAssist.tier > 0 && expAssist.demotions < 2) {
+      if (expAssist.tier !== 0 && expAssist.demotions < 2) {
         var v = judgeExposureEffect({
           baseline: expAssist.effBaseline,
           samples: expAssist.effSamples,
@@ -1784,7 +1906,7 @@
       }
       var track = activeTrack();
       if (!track) return;
-      var cst = buildExposureConstraints(expAssist.plan, r.ev);
+      var cst = buildExposureConstraints(expAssist.plan, r.ev, cfg);
       var ok = await applyExposure(track, cst, mySeq);
       if (!ok) {
         // 连续失败达到上限：停硬件路径降软件兜底，并把这轮补偿恢复掉
@@ -1844,7 +1966,7 @@
       if (expAssist.effSamples.length > 12) expAssist.effSamples.shift();
     }
 
-    // 档位降级（幽灵能力 → 换一条路）：tier1 → tier2 → tier0。
+    // 档位降级（幽灵能力 → 换一条路）：tier1 → brightness → tier2 → tier0。
     //   ① 先把当前档位的约束还回去（补偿归零 / 切回 continuous），否则两份曝光
     //      偏置会叠在同一台设备上，用户看到的是「莫名偏暗」；
     //   ② 重新探测下一档（把无效的那个能力摘掉再探测）；
@@ -1853,7 +1975,9 @@
       var track = activeTrack();
       var from = expAssist.tier;
       var oldPlan = expAssist.plan;
-      var reason = from === 2 ? 'manual-ineffective' : 'comp-ineffective';
+      // 降级原因按**来源档位**区分：手动档是 manual-ineffective，其余硬件档都是
+      // comp-ineffective。字符串档也要能被区分开，否则现场日志里看不出是哪条路径失效。
+      var reason = tierRank(from) === 2 ? 'manual-ineffective' : 'comp-ineffective';
       expAssist.demotions += 1;
       // 记进会话级幽灵记忆（达到 EXP_GHOST.minStrikes 才真正生效）：下次 engage
       // （下一件衣物）直接跳过这个档位。返回值是「这台设备这条路径第几次被判无效」，
@@ -1871,10 +1995,13 @@
       } catch (e2) { settings = null; }
       var next = demoteExposurePlan(oldPlan, cap, settings);
       // 降级后同样要查一次记忆：tier1 判无效会降到 tier2，而 tier2 可能在上一次
-      // engage 里已经单独被判过无效（双档幽灵设备，QA DEF-3）。与 engage 侧同一个循环
+      // engage 里已经单独被判过无效（双档幽灵设备，QA DEF-3）。与 engage 侧同一个循环。
+      // banned 累积已失效能力键，否则 tier1 → brightness → tier1 原地打转。
       var g2 = 0;
-      while (next.tier > 0 && next.plan && expGhostBlocked(next.tier) && g2++ < 4) {
-        next = demoteExposurePlan(next.plan, cap, settings);
+      var banned2 = next.banned || {};
+      while (next.tier !== 0 && next.plan && expGhostBlocked(next.tier) && g2++ < 4) {
+        next = demoteExposurePlan(next.plan, cap, settings, banned2);
+        banned2 = next.banned || banned2;
       }
       log('warn', 'CAM_EXP_FALLBACK', {
         seq: seq,
@@ -1905,7 +2032,7 @@
       expAssist.tier = next.plan.tier;
       log('info', 'CAM_EXP_ENUM', { seq: seq, tier: next.plan.tier, reason: reason });
       // 新档位同样从 0 起（具体压多少交给闭环），失败就再降一级到软件兜底
-      var cst = buildExposureConstraints(next.plan, 0);
+      var cst = buildExposureConstraints(next.plan, 0, cfg);
       var ok = await applyExposure(track, cst, mySeq);
       if (!ok) {
         expAssist.plan = null;
@@ -1968,7 +2095,7 @@
       // 连续两次同样的「零调整离场」后，下次 engage 直接跳过该档位落 tier0 ——
       // 没有这条，闭环会永远重复「engage→零调整→release」而没有任何机制能挣脱
       var zeroAdjustStrike = 0;
-      if (expAssist.tier > 0 && expAssist.adjusts === 0) {
+      if (expAssist.tier !== 0 && expAssist.adjusts === 0) {
         zeroAdjustStrike = expGhostRemember(expAssist.tier, devIdOf());
       }
       log('info', 'CAM_EXP_RELEASE', {
@@ -2985,6 +3112,10 @@
     judgeExposureEffect: judgeExposureEffect,
     appliedEvOf: appliedEvOf,
     demoteExposurePlan: demoteExposurePlan,
+    // 档位身份的唯一判定源（数字档 0/1/2 与字符串档 'brightness' 混用时，
+    // `tier > 0` 之类数值比较会把字符串档误判成 tier0）。导出供独立断言。
+    tierRank: tierRank,
+    expGhostKey: expGhostKey,
     // sRGB 编码指数（§7.3 LUT 与 §7.5 判定共用同一个常量）
     SRGB_GAMMA: SRGB_GAMMA,
     solveTier0Ev: solveTier0Ev

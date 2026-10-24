@@ -326,7 +326,9 @@ const MUTATIONS = [
     // QA 观察项 U19：降级结论不跨 engage 持久 → 幽灵设备每放一件衣物都要重走
     // 约 4s 的「徽标显示 -xEV、画面其实没压暗」窗口，正是现场投诉的形态
     name: '★QA U19★ 幽灵记忆被删掉（换衣物又重走一次无效补偿窗口）',
-    from: 'while (plan.tier > 0 && expGhostBlocked(plan.tier) && guard++ < 4) {',
+    // 锚点用 `!== 0` 而非 `> 0`：`> 0` 对字符串档（'brightness'）恒为 false，
+    // 会把 brightness 档误判成 tier0 而跳过记忆复查。锚点必须跟源码的档位判定同源
+    from: 'while (plan.tier !== 0 && expGhostBlocked(plan.tier) && guard++ < 4) {',
     to: 'while (false) { /* MUTANT: 幽灵记忆被删除 */',
     expect: ['T2', 'T3', 'T4']
   },
@@ -344,8 +346,8 @@ const MUTATIONS = [
     // QA DEF-3：双档都无效的设备，跳档只跳一次 → tier2 会被完整重走一遍，
     // 无效窗口只从 4.3s 降到 3.5s 而不是 0
     name: '★QA DEF-3★ 跳档只跳一次（不循环复查记忆，tier2 又被重走）',
-    from: 'while (plan.tier > 0 && expGhostBlocked(plan.tier) && guard++ < 4) {',
-    to: 'if (plan.tier > 0 && expGhostBlocked(plan.tier)) { /* MUTANT: 只跳一次 */',
+    from: 'while (plan.tier !== 0 && expGhostBlocked(plan.tier) && guard++ < 4) {',
+    to: 'if (plan.tier !== 0 && expGhostBlocked(plan.tier)) { /* MUTANT: 只跳一次 */',
     expect: ['T12']
   },
   {
@@ -425,10 +427,15 @@ const MUTATIONS = [
     id: 'M46',
     // 缺陷 2 的诚实展示：appliedEv（徽标展示的实际生效 EV）必须由实测亮度反推，不能恒为 0。
     // 回退成恒 0 → 徽标永远显示「实际 0EV」，过压设备「实际压到 -3EV」的事实被掩盖。
-    name: '★缺陷2★ 实测实际 EV 不更新（徽标撒谎，过压深度被掩盖）',
-    from: 'expAssist.actualEv = (measuredEv != null) ? measuredEv : expAssist.actualEv;',
-    to: 'expAssist.actualEv = 0; /* MUTANT: 实测实际 EV 不更新 */',
-    expect: ['X2']
+    //
+    // 锚点选在 measuredEv 的**计算处**而不是 actualEv 的某个赋值点：
+    // actualEv 有两处写入（过压分支 line~1829 与 apply 路径 line~1916），
+    // 只断其中一处会被另一处兜底 —— 实测那样注入后 X2 仍绿（等价变异，测不出缺陷）。
+    // 断计算处则两处同时失去来源，X1（检出过压）与 X2（徽标诚实）同时转红。
+    name: '★缺陷2★ 实测实际 EV 算不出来（徽标撒谎，过压深度被掩盖）',
+    from: 'measuredEv = SRGB_GAMMA * (Math.log(cl.subjectMean / expAssist.effBaseline) / Math.LN2);',
+    to: 'measuredEv = null; /* MUTANT: 实测 EV 算不出来 */',
+    expect: ['X1', 'X2']
   },
   {
     id: 'M47',
@@ -471,15 +478,18 @@ const MUTATIONS = [
   },
   {
     id: 'M50',
-    // 崩塌判据的取照方式：参照必须是「上一次 applyConstraints 之前那一帧」且容许深度
-    // 取「那次 apply 实际下发的 EV + tol」。按档位只取一次照（engage 时的中性帧）时，
-    // 过压设备（实际压暗 = 请求 ×3）从第 3 步起就会被误判成崩塌 —— QA X 组实测栽过：
-    // X2 徽标测试因此失败（会话被崩塌守卫提前杀掉，ev 被冲掉）。删掉每次 apply 前的
-    // 取照即复现该误判；好设备（实际 = 请求）不受影响，所以这条变异只红 Z4/X2
-    name: '★缺陷3★ 崩塌参照不随每次 apply 更新（过压设备被误判成崩塌）',
-    from: 'expAssist.preApplyMean = (cl.rawSceneMean != null && isFinite(cl.rawSceneMean) && cl.rawSceneMean > 0)\n        ? cl.rawSceneMean : expAssist.preApplyMean;',
-    to: '/* MUTANT: 崩塌参照只按档位取一次（engage 时的中性帧），不随每次 apply 更新 */',
-    expect: ['Z4', 'X2']
+    // 崩塌判据的容差深度：容许比请求深 tol EV（吸收过压设备：实测过压约 1.6EV）。
+    // tol 归零时容许深度 = 本次请求本身 → 过压设备（实际压暗 = 请求 ×3）每步都越界
+    // → 被误判成崩塌 → 立刻降 tier0，硬件补偿彻底失效（Z4 转红）。
+    //
+    // 锚点说明：原锚点选在「preApplyMean 随每次 apply 更新」那行，注入后测不出差异 ——
+    // 那一行是**修复**（按次取照）而不是缺陷点，冻结它反而让 floor 停在亮帧高位、
+    // 判据更宽松。真正的判别力在 tol 上：它是「容许多深」的闸门。
+    // 同 M49/M52：这两条覆盖了「守卫装上但阈值不对」的两个方向。
+    name: '★缺陷3★ 崩塌容差归零（过压设备每步都越界 → 被误判成崩塌）',
+    from: 'tol: 2.0    // 容许比请求深这么多 EV（吸收过压设备：实测过压约 1.6EV）',
+    to: 'tol: 0    /* MUTANT: 容差归零，过压每步都越界 */',
+    expect: ['Z4']
   },
   {
     id: 'M51',
@@ -488,8 +498,10 @@ const MUTATIONS = [
     // engage 直接跳过该档。禁用安全网 → 闭环永远重复「engage→零调整→release」而没有任何
     // 机制能挣脱（这正是现场 87 次 engage、86 次零 STEP 的形态）
     name: '★缺陷3★ 零调整 release 不记幽灵记忆（engage→零调整→release 无限循环）',
-    from: 'if (expAssist.tier > 0 && expAssist.adjusts === 0) {',
-    to: 'if (expAssist.tier > 0 && expAssist.adjusts < 0) { /* MUTANT: 零调整安全网被禁用 */',
+    // 锚点用 `!== 0`：`> 0` 对字符串档（'brightness'）恒为 false，会让 brightness 档
+    // 的零调整安全网整条失效（该档永远记不进幽灵打击）
+    from: 'if (expAssist.tier !== 0 && expAssist.adjusts === 0) {',
+    to: 'if (expAssist.tier !== 0 && expAssist.adjusts < 0) { /* MUTANT: 零调整安全网被禁用 */',
     expect: ['Z5', 'Z5d']
   },
   {
@@ -502,6 +514,59 @@ const MUTATIONS = [
     // 同 M49：Z3b/Z3f 对该变异恒真（两次零调整 release 后安全网把会话送到 tier0，
     // tier 与状态恰好都是「崩塌降级后」的值）
     expect: ['Z3', 'Z3c', 'Z3d', 'Z3e', 'Z3g', 'Z3h', 'Z3i', 'Z3j']
+  },
+
+  /* ---------------- 亮度参数档（brightness）：字符串档的语义 ---------------- */
+  {
+    id: 'M53',
+    // 本轮修的生产级缺陷：模块级纯函数 buildExposureConstraints 引用了闭包里的 cfg
+    // → 真机每次 brightness 档 apply 都抛 ReferenceError → 曝光辅助完全失效
+    name: '★brightness★ 纯函数引用闭包 cfg（真机每次 apply 都抛 ReferenceError）',
+    from: 'var evFloor = Math.abs(numOr(bCfg.expEvMin, DEFAULTS.expEvMin));',
+    to: 'var evFloor = Math.abs(numOr(cfg.expEvMin, DEFAULTS.expEvMin)); /* MUTANT: 引用闭包变量 */',
+    // 变异体让模块级纯函数在运行期抛 TypeError → 主检的 P22（不传 cfg 不抛错）转红，
+    // 且后续依赖该函数的断言连锁失败。P22 是这条不变量的直接判据。
+    expect: ['P22']
+  },
+  {
+    id: 'M54',
+    // 本轮修的生产级缺陷：档位身份用 `tier > 0` 判定 → 字符串档恒被误判成 tier0
+    // → 幽灵打击记不进记忆、降级链断裂、零调整安全网失效
+    name: '★brightness★ 档位身份退回 `tier > 0`（字符串档被误判成 tier0）',
+    from: "if (tier === 'brightness') return 1;",
+    to: "/* MUTANT: 字符串档不再算硬件档 */",
+    // P16（tierRank 语义）+ P27（降级链不直接掉底）+ P28（降级带上可用 plan）
+    // + P31（banned 累积两个键）：这四条是字符串档语义的直接判据。
+    // P20 不在此列：expGhostKey 与 tierRank 相互独立，改 tierRank 不影响键归一化。
+    expect: ['P16', 'P27', 'P28', 'P31']
+  },
+  {
+    id: 'M55',
+    // 本轮修的生产级缺陷：banned 只摘当前档的能力键 → tier1 → brightness → tier1
+    // 原地打转（每次都重走一遍已知无效的档，等于没降级）
+    name: '★brightness★ banned 不累积（降级链原地打转）',
+    from: "ban[(tier === 'brightness') ? 'brightness' : 'exposureCompensation'] = true;",
+    to: "/* MUTANT: 不摘任何能力键 */",
+    expect: ['P27', 'P30', 'P31']
+  },
+  {
+    id: 'M56',
+    // 本轮修的生产级缺陷：满量程参照用 span（max−min）而非可用下行空间（base−min）
+    // → 基线在量程中点时 drop 超过可用空间 → 码值直接撞 min 钳位
+    // → 「吃 70% 量程」实际变成「吃满到底」，ISP 余量被吃掉（真机基线多在中点，是常态）
+    name: '★brightness★ 满量程参照用 span 而非可用下行空间（码值撞 min 钳位）',
+    from: 'var bDrop = bFrac * bRoom * BRIGHT_DROP_K;',
+    to: 'var bDrop = bFrac * (plan.max - plan.min) * BRIGHT_DROP_K; /* MUTANT: 用 span */',
+    expect: ['P23']
+  },
+  {
+    id: 'M57',
+    // 本轮修的生产级缺陷：幽灵记忆的键直接用 tier 值当对象键 → 数字 1 与字符串 '1'
+    // 撞车；且字符串档用 `tier > 0` 判定 → 打击永远记不进记忆
+    name: '★brightness★ 幽灵记忆的键不做归一化（字符串档记不进记忆）',
+    from: "if (tier === 'brightness') return 's:brightness';",
+    to: "/* MUTANT: 字符串档没有独立键 */",
+    expect: ['P20']
   }
 ];
 
