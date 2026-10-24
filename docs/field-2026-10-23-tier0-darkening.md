@@ -94,9 +94,16 @@
 - **B — 预览同步压暗**：`renderer/renderer.js` 新增 `exposureFilter` computed（line 1604），tier0 ACTIVE 且 ev<0 时给 `<video>` 加 `filter: brightness(2^(ev/γ))`（line 2509），与存档 LUT 同源同系数；`exposureFilter` 已加入模板 return（line 2487）。
 - **顺带修复（标定后暴露的真实 bug）**：过压确认时补写 `expAssist.actualEv`（camera-controller.js 过压确认分支），徽标据实显示实际生效 EV，不再停在 0.0EV。
 
+**2026-10-24 二次修复（方向 B，用户「软件应该调整的是亮度而不是压暗」）**：v1.2.16 发布后用户预览仍反馈「蒙灰」。根因不在 A+B，而在 `buildExposureLut` 的**均匀乘法**把已削顶白板（255）压成均匀灰平台（k=0.75 时 255→192）——整帧像蒙了一层灰、白板变脏。日志佐证：设备 `346ecdd1`（eba4:dc26）本应走 tier2（manual exposure）做真实曝光校正，但切 manual 模式时帧崩塌（rawMean 13 vs refMean 169，见 camera-controller.js 414-417 注释），崩塌守卫降档到 tier0（软件压暗），于是落到用户最不想要的「压暗」路径。
+  - **tier0 LUT 改为保高光色调曲线**（`renderer/camera-controller.js` `buildExposureLut`，line ~678；新增 `EXP_LUT={whiteStart:200, whiteOut:238}`）：中间调/暗部仍按 `in×2^(ev/γ)` 均匀压暗（主体曝光校正不变，主体 140→105），码值 ≥ `whiteStart` 的已削顶高光走线性肩线压到 `whiteOut`（255→238，仍读成白），不再压成灰。约束 `whiteStart ≤ whiteOut` 保证整条曲线单调不减。
+  - **预览与存档同源**：`renderer/renderer.js` 的 `exposureFilter` 由 CSS `brightness()`（只能均匀乘法）改为 SVG `feComponentTransfer`（表值直接吃 `buildExposureLut` 的 256 项曲线，且 `color-interpolation-filters="sRGB"` 锁定色彩空间），保证预览==存档逐点一致（所见即所得）。模板新增 `#xqy-exposure-lut` 滤镜 + 三个 feFunc 引用，由 `exposureLutTable` computed + `watch`/`onMounted` 同步 `tableValues`。
+  - **仍为软件后处理**：削顶高光细节无法恢复（摄像机已裁剪），但白板保白、衣物有层次，符合洗衣店「白垫板要干净」的诉求。彻底根治需让硬件曝光档在该设备真正可用（方向 A：tier1 负补偿或 manual 崩塌规避），属待实机攻关项。
+
 **验证**：
-- 逻辑层全绿：`verify-camera-exposure` 355/0、`verify-camera-exposure-mutation` 50 抓 2 等价漏、`verify-camera-exposure-qa` 175/0（Q13 收敛推演改用 sRGB 码值模型，消除线性模型导致的极限环假阳性）、`verify-camera-exposure-qa3` 绿；相机子系统 camera 217/0、res 98/0、res-qa2 102/0、res-mutation 12/0、res-budget 16/0、blackretry 17/0、camera-qa 59/0、camera-log 19/0。
-- `exposureFilter` 等价检查（直接 eval `renderer.js` 真实代码文本）：tier0 ACTIVE + ev<0 时预览 brightness 系数逐位等于存档 LUT 系数 `2^(ev/γ)`（7 个 ev 值最大误差 0.0004），且 tier!=0 / 非 ACTIVE / ev≥0 / 非数值均正确返回空。
+- 逻辑层全绿（本轮重跑曝光相关套件）：`verify-camera-exposure` **357/0**、`verify-camera-exposure-mutation` **50 抓 2 等价漏**（M46/M50，与 2026-10-23 基线一致，非本次引入）、`verify-camera-exposure-qa` **178/0**（新增 Q150-152 钉住预览 SVG 滤镜与存档同源）、`verify-camera-exposure-qa3` 绿（V7 白点 <250：实测 238）。相机子系统（camera/res/blackretry/camera-qa/camera-log 等）2026-10-23 全绿、本轮未重跑。
+- **LUT 数值自检（用户场景 ev≈-0.91）**：白点 255→**238**（旧均匀乘法=192 灰平台）、灰平台 192→144、主体 140→**105**（命中目标）、0/128/200/255=0/96/150/238、单调不减 ✓；`solveTier0Ev(150)=-1.13` → `lut[150]=105` 自洽。
+- 预览==存档等价：`exposureLutTable` 直接复用 `buildExposureLut(ev)` 的 256 项数组喂给 SVG `feComponentTransfer` 的 `tableValues`，`color-interpolation-filters="sRGB"` 锁定 sRGB 码值空间，与存档逐点一致；tier!=0 / 非 ACTIVE / ev≥0 / 非数值时 `exposureFilter` 返回空、表值回落恒等串。
+- `node --check` 两个源文件语法 OK；CRLF 全仓保住（bareLF=0）。
 - `node --check renderer.js` 语法 OK；CRLF 全仓保住。
 - **待实机**：本沙箱无显示/无摄像头，无法做真正「人眼看到视频被压暗」的实机验证。上线前请在门店真机用 `electron.exe` 跑一次照片页（参考 UI 验证纪律命令），确认预览与存档同系数变暗、徽标显示实际生效 EV。
 

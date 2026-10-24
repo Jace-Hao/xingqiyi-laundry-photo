@@ -1592,24 +1592,47 @@ const CapturePage = {
       return { text: '曝光补偿 ' + ev + 'EV', level: 'ok' };
     });
 
-    // 预览同步压暗（2026-10-23 现场标定配套，调查报告 docs/field-2026-10-23-tier0-darkening.md）：
-    // tier0 软件兜底原本只改存档图，预览仍是 ISP 提亮帧——17:19 投诉第一句就是
-    // 「预览窗口没有变化，还是很亮，但是拍完的照片被调暗了」。这里给 <video> 套同一系数
-    // 的 CSS brightness：CSS brightness 是码值域乘法（feComponentTransfer linear），
-    // 与 buildExposureLut 的 out=in×2^(ev/γ) 同源同值，预览因此与存档一致。
-    // 三个边界：① 只对 tier0 生效——硬件档（tier1/2）真实压暗了摄像头输出，预览本来就是暗的；
-    // ② 只显示层生效——canvas drawImage 取的是未过滤帧，曝光检测采样与闭环口径不受影响；
-    // ③ 用 e.ev（存档拍照用的同一个值，renderer.js capture() 同源），不用徽标的 appliedEv，
-    //    保证「预览系数 == 存档系数」逐位一致。
+    // 预览同步压暗（2026-10-23 现场标定配套，调查报告 docs/field-2026-10-23-tier0-darkening.md；
+    // 2026-10-24 改为保高光色调曲线，见下）：tier0 软件兜底原本只改存档图，预览仍是 ISP
+    // 提亮帧——17:19 投诉第一句就是「预览窗口没有变化，还是很亮，但是拍完的照片被调暗了」。
+    // 这里给 <video> 套与存档完全同一条 LUT（SVG feComponentTransfer 的 tableValues），
+    // 而非 CSS brightness()：brightness() 只能做均匀乘法，会把白垫板也压成灰平台（用户
+    // 原话「软件应该调整的是亮度而不是压暗」）。feComponentTransfer 的 table 直接吃
+    // buildExposureLut 的 256 项曲线，预览因此与存档逐点一致（所见即所得）。
+    // 三个边界同前：① 只对 tier0 生效；② 只显示层生效（drawImage 取未过滤帧，检测/闭环不受影响）；
+    // ③ 用 e.ev（与 capture() 同源），保证「预览曲线 == 存档曲线」。
+    const IDENTITY_LUT_STR = (function () {
+      const a = [];
+      for (let i = 0; i < 256; i++) a.push(i);
+      return a.join(' ');
+    })();
+    const lutR = Vue.ref(null), lutG = Vue.ref(null), lutB = Vue.ref(null);
+    // 与存档同源的 256 项曲线字符串（恒等 / 保高光 LUT）；feComponentTransfer 直接消费
+    const exposureLutTable = Vue.computed(() => {
+      const e = exposureInfo.value;
+      if (!e || e.state !== 'ACTIVE' || e.tier !== 0) return IDENTITY_LUT_STR;
+      const ev = Number(e.ev);
+      if (!isFinite(ev) || ev >= 0) return IDENTITY_LUT_STR;
+      const fn = window.CameraController && window.CameraController.buildExposureLut;
+      const lut = fn ? fn(ev) : null;
+      if (!lut) return IDENTITY_LUT_STR;
+      let s = '';
+      for (let i = 0; i < 256; i++) s += (i ? ' ' : '') + lut[i];
+      return s;
+    });
+    function syncExposureLutTable(str) {
+      [lutR.value, lutG.value, lutB.value].forEach(function (el) {
+        if (el) el.setAttribute('tableValues', str);
+      });
+    }
+    Vue.watch(exposureLutTable, syncExposureLutTable);
+    Vue.onMounted(function () { syncExposureLutTable(exposureLutTable.value); });
     const exposureFilter = Vue.computed(() => {
       const e = exposureInfo.value;
       if (!e || e.state !== 'ACTIVE' || e.tier !== 0) return '';
       const ev = Number(e.ev);
       if (!isFinite(ev) || ev >= 0) return '';
-      const gamma = (window.CameraController && isFinite(window.CameraController.SRGB_GAMMA))
-        ? window.CameraController.SRGB_GAMMA : 2.2;
-      const k = Math.pow(2, ev / gamma);
-      return 'brightness(' + (Math.round(k * 1000) / 1000) + ')';
+      return 'url(#xqy-exposure-lut)';
     });
 
     function camIdleMs() {
@@ -2484,12 +2507,25 @@ const CapturePage = {
       barcode, note, saving, barcodeCount, videoEl, barcodeEl, ready,
       barcodeWarn, applyCleaned, applySimilar, barcodeLocked, unlockBarcode,
       sleeping, camState, camHint, camPrivacy, camErr, camErrCode, camAr, camMaxH,
-      exposureInfo, exposureBadge, exposureFilter,
+      exposureInfo, exposureBadge, exposureFilter, exposureLutTable, lutR, lutG, lutB,
       startCamera, retryCamera, switchDevice, wakeCamera, sleepCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone, openPrivacySettings
     };
   },
   template: `
     <div>
+      <!-- tier0 软件兜底预览 LUT：SVG feComponentTransfer 直接消费 buildExposureLut 的 256 项
+           曲线，color-interpolation-filters="sRGB" 保证与存档 sRGB 码值 LUT 逐点一致 -->
+      <svg class="exposure-lut-defs" width="0" height="0" aria-hidden="true" style="position:absolute">
+        <defs>
+          <filter id="xqy-exposure-lut" color-interpolation-filters="sRGB">
+            <feComponentTransfer>
+              <feFuncR ref="lutR" type="table"></feFuncR>
+              <feFuncG ref="lutG" type="table"></feFuncG>
+              <feFuncB ref="lutB" type="table"></feFuncB>
+            </feComponentTransfer>
+          </filter>
+        </defs>
+      </svg>
       <div class="page-head">
         <h2>衣物拍照</h2>
         <p>扫码后自动进入拍摄状态，可连续拍多张、全部保存后自动编号；快捷键：<b>空格 = 拍照</b>，<b>回车 = 保存</b></p>

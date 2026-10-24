@@ -675,6 +675,12 @@
     // （暗部按比例一起降、相对关系不变），幂次曲线恰恰是把暗部压死的那个。
     // 注：expTargetMean 已于 2026-10-23 现场标定为 105（原值 58，见 DEFAULTS 处注释），
     // 本段中的「目标 58」「ev=-3 真实取值」均为当时实测，作为勘误史实保留原样。
+  // tier0 软件兜底 LUT：保高光色调曲线（2026-10-24 修复「白板被压成灰」）
+  // 中间调/暗部按 k = 2^(ev/gamma) 均匀压暗，与 §7.5 判定同源（主体曝光校正不变）；
+  // 顶部已削顶的高光（码值 ≥ whiteStart）走肩线压缩到 whiteOut，避免白垫板被压成
+  // 均匀灰平台——对洗衣店而言白板变灰 = 看着像脏了，比过曝更糟。
+  // 约束：whiteStart ≤ whiteOut 保证整条曲线对任意 ev∈[expEvMin,0] 单调不减。
+  var EXP_LUT = { whiteStart: 200, whiteOut: 238 };
   function buildExposureLut(ev) {
     var lut = new Uint8ClampedArray(256);
     var v = Number(ev);
@@ -684,7 +690,18 @@
       return lut;
     }
     var k = Math.pow(2, v / SRGB_GAMMA);
-    for (var i = 0; i < 256; i++) lut[i] = Math.round(i * k);
+    var ws = EXP_LUT.whiteStart, wo = EXP_LUT.whiteOut;
+    var loYs = ws * k;                 // 肩部下端点，与线性区在 ws 处连续
+    var span = 255 - ws;
+    for (var i = 0; i < 256; i++) {
+      if (i <= ws) {
+        lut[i] = Math.round(i * k);
+      } else {
+        // 肩部：从 loYs 线性过渡到 whiteOut，保住高光白度（白板仍是白）
+        var t = (i - ws) / span;
+        lut[i] = Math.round(loYs + t * (wo - loYs));
+      }
+    }
     return lut;
   }
 
@@ -2959,6 +2976,7 @@
     buildExposureConstraints: buildExposureConstraints,
     buildExposureRestoreConstraints: buildExposureRestoreConstraints,
     buildExposureLut: buildExposureLut,
+    EXP_LUT: EXP_LUT,
     // 幽灵能力检测（§7.5）：判定参数表 + 三个纯函数
     EXP_EFFECT: EXP_EFFECT,
     // 幽灵记忆的记账门槛（§7.5 DEF-5 方案①）：同一设备同一档位累计判无效这么多次才记账

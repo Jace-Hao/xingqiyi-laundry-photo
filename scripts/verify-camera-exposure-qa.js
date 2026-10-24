@@ -1117,6 +1117,14 @@ async function sectLutOrder() {
   assert(/expInfo\.ev < 0/.test(body), 'Q110 LUT 只在 EV 为负时生效（ev=0 恒等，不做无意义遍历）');
   assert(/typeof window\.CameraController\.buildExposureLut === 'function'/.test(body),
     'Q111 LUT 取用前做能力检查（UMD 未加载时不炸拍照主链）');
+
+  // 预览与存档同一条 LUT：预览改走 SVG feComponentTransfer（不再用 CSS brightness 均匀乘法）
+  assert(/id="xqy-exposure-lut"/.test(rSrc) && /feComponentTransfer/.test(rSrc),
+    'Q150 预览用 SVG feComponentTransfer 套 LUT（不再 brightness() 均匀压暗白板）');
+  assert(/color-interpolation-filters="sRGB"/.test(rSrc),
+    'Q151 预览滤镜锁定 sRGB 色彩空间（与存档 sRGB 码值 LUT 逐点一致，所见即所得）');
+  assert(/url\(#xqy-exposure-lut\)/.test(rSrc) && /exposureLutTable/.test(rSrc),
+    'Q152 tier0 ACTIVE 时预览套用 url(#xqy-exposure-lut)，且曲线由 exposureLutTable 同源生成');
 }
 
 /* ========================================================================== *

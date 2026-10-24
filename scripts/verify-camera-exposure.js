@@ -657,9 +657,11 @@ async function suite() {
     // LUT：与 §7.5 判定同源的 sRGB 模型压暗（out = in × 2^(ev/gamma)）
     const lut = C.buildExposureLut(-1);
     assert(lut.length === 256, 'E24 LUT 长度 256');
-    assert(lut[0] === 0 && lut[255] < 255 && lut[255] === Math.round(255 * Math.pow(2, -1 / C.SRGB_GAMMA)),
-      'E25 LUT 黑点保持 0→0，且白点一起压暗（ev=-1：255 → ' + lut[255] +
-      '，不再锁 255 —— 锁 255 就是「白色鞋底一点没救」）');
+    assert(lut[0] === 0 && lut[255] >= C.EXP_LUT.whiteOut - 1 && lut[255] < 255,
+      'E25 LUT 黑点保持 0→0；白点保高光（ev=-1：255 → ' + lut[255] +
+      '，接近 whiteOut=' + C.EXP_LUT.whiteOut + '，不再被压成灰平台 ' + Math.round(255 * Math.pow(2, -1 / C.SRGB_GAMMA)) + '）');
+    assert(lut[255] > lut[128],
+      'E25b 白点仍比中间调亮（' + lut[255] + ' > ' + lut[128] + '，保住「白板是白」的观感，避免蒙灰）');
     near(lut[128], Math.round(128 * Math.pow(2, -1 / C.SRGB_GAMMA)), 0,
       'E26 ev=-1 → 中间调 128 × 2^(-1/2.2) = ' + lut[128] + '（与 §7.5 判定同源）');
     assert(lut[64] === Math.round(64 * Math.pow(2, -1 / C.SRGB_GAMMA)) && lut[64] > 0,
@@ -687,12 +689,24 @@ async function suite() {
     [-0.5, -1, -2, -3].forEach(function (ev) {
       const L = lutSem(ev);
       const expDrop = C.expectedDropRatio(ev, G);
-      [40, 80, 128, 180, 220].forEach(function (v) {
+      // 只验非高光区：高光走保高光肩线，降幅本就小于均匀降幅（这是预期行为）
+      [40, 80, 128, 180].forEach(function (v) {
         const drop = (v - L[v]) / v;
         if (Math.abs(drop - expDrop) * v > 1.0) semBad++;
       });
     });
-    eq(semBad, 0, 'E46 LUT 降幅与 §7.5 预期降幅逐点一致（差异仅来自取整，越界 ' + semBad + ' 处）');
+    eq(semBad, 0, 'E46 非高光区 LUT 降幅与 §7.5 预期降幅逐点一致（差异仅来自取整，越界 ' + semBad + ' 处）');
+    // 高光保活：顶部已削顶区域降幅必须严格小于均匀降幅（否则白板被压成灰平台）
+    let hlBad = 0;
+    [-0.5, -1, -2, -3].forEach(function (ev) {
+      const L = lutSem(ev);
+      const expDrop = C.expectedDropRatio(ev, G);
+      [220, 240, 255].forEach(function (v) {
+        const drop = (v - L[v]) / v;
+        if (drop >= expDrop) hlBad++;
+      });
+    });
+    eq(hlBad, 0, 'E46b 高光保活：白点降幅严格小于均匀降幅（越界 ' + hlBad + ' 处，白板不被压成灰）');
 
     // ② 现场取值：tier0 解析解（ev=solve(150)）必须把主体压到目标附近。
     //    2026-10-23 标定 expTargetMean=105 后，150 只需 -1.13EV（旧目标 58 下是
@@ -706,7 +720,7 @@ async function suite() {
     //    但 LUT 在护栏深度上的行为仍须逐点验证
     const lut3 = lutSem(-3);
     assert(lut3[255] < 255 && lut3[255] > 30,
-      'E48 被裁剪的白色 255 → ' + lut3[255] + '（拉回可辨范围，旧实现是 255 = 一点没压）');
+      'E48 被裁剪的白色 255 → ' + lut3[255] + '（保高光白度，不再压成灰平台；旧实现是 255 = 一点没压）');
     // ④ 暗部层次：等比压暗，褶皱不被抹成 0
     const shadows = [20, 30, 45, 60].map(function (v) { return lut3[v]; });
     assert(shadows.every(function (x) { return x > 0; }),

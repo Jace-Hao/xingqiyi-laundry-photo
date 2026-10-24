@@ -484,8 +484,12 @@ ev   = clamp(ev - step, expEvMin, 0)          （下限保护 + 只往防过曝�
 
 ```
 out = in × 2^(ev / gamma)           gamma = 2.2（sRGB 编码指数，与 §7.5 判定同源）
-                                    ev 为负 → 系数 <1 → 压暗
+                                    ev 为负 → 系数 <1 → 压暗（仅中间调/暗部；已削顶高光走保高光肩线）
 ```
+保高光色调曲线（2026-10-24 修复「白板被压成灰」）：中间调/暗部按上式均匀压暗（主体曝光校正不变）；
+码值 ≥ `whiteStart`（默认 200）的已削顶高光改为线性肩线压到 `whiteOut`（默认 238），避免白垫板被压成
+均匀灰平台（洗衣店白板变灰 = 看着像脏了）。约束 `whiteStart ≤ whiteOut` 保证整条曲线对任意
+ev∈[expEvMin,0] 单调不减。预览经 SVG `feComponentTransfer`（sRGB 空间）套同一条曲线，与存档逐点一致。
 
 > **勘误 2026-10（QA DEF-1，严重）**：本节原为 `out = 255 × (in/255)^(2^-ev)`。那是在**码值域做幂
 > 运算**：设码值 V ∝ L^(1/2.2)，则 V^(2^-ev) ∝ L^(2^-ev)，等价于把线性光**取幂** L → L^(2^-ev)，
@@ -953,17 +957,32 @@ rawSceneMean < collapseFloor  →  立刻 restore + 降 tier0（会话保持 ACT
     return { advanced: [adv] };
   }
 
-  // 软件兜底查找表：out = 255×(in/255)^(2^-ev)
-  // 为什么用 gamma 而不是线性乘：线性乘把中间调成比例压暗，黑衣物的褶皱
-  // 纹理全挤在 0 附近直接死黑；gamma 曲线压暗的同时保住暗部层次
+  // tier0 软件兜底 LUT：保高光色调曲线（2026-10-24 修复「白板被压成灰」）
+  // 中间调/暗部按 k = 2^(ev/gamma) 均匀压暗，与 §7.5 判定同源（主体曝光校正不变）；
+  // 顶部已削顶的高光（码值 ≥ whiteStart）走肩线压缩到 whiteOut，避免白垫板被压成
+  // 均匀灰平台——对洗衣店而言白板变灰 = 看着像脏了，比过曝更糟。
+  // 约束：whiteStart ≤ whiteOut 保证整条曲线对任意 ev∈[expEvMin,0] 单调不减。
+  var EXP_LUT = { whiteStart: 200, whiteOut: 238 };
   function buildExposureLut(ev) {
     var lut = new Uint8ClampedArray(256);
-    if (!ev || ev >= 0) {
+    var v = Number(ev);
+    if (!isFinite(v) || v >= 0) {
       for (var i0 = 0; i0 < 256; i0++) lut[i0] = i0;
       return lut;
     }
-    var g = Math.pow(2, -ev);
-    for (var i = 0; i < 256; i++) lut[i] = Math.round(255 * Math.pow(i / 255, g));
+    var k = Math.pow(2, v / SRGB_GAMMA);
+    var ws = EXP_LUT.whiteStart, wo = EXP_LUT.whiteOut;
+    var loYs = ws * k;                 // 肩部下端点，与线性区在 ws 处连续
+    var span = 255 - ws;
+    for (var i = 0; i < 256; i++) {
+      if (i <= ws) {
+        lut[i] = Math.round(i * k);
+      } else {
+        // 肩部：从 loYs 线性过渡到 whiteOut，保住高光白度（白板仍是白）
+        var t = (i - ws) / span;
+        lut[i] = Math.round(loYs + t * (wo - loYs));
+      }
+    }
     return lut;
   }
 ```
