@@ -546,6 +546,22 @@
     return '';
   }
 
+  // 崩塌守卫的「适用档位」判定（纯函数，模块级唯一来源）。
+  // 崩塌判据是 EV 模型（floor = 参照 × 2^(-深度/γ)），这套模型只在「压暗量能用 EV
+  // 线性外推」的档位成立：tier1 曝光补偿、tier2 手动曝光。所以准入 = 数字硬件档 1 与 2。
+  //
+  // 明确排除字符串档 'brightness'，且**不能**用 tierRank 来判：tierRank('brightness')===1
+  // 与 tier1 同秩，分不开。它是 ISP 黑电平偏移，不切曝光模式、不存在「请求的时间没被执行」
+  // 这条失效路径；且实际压暗深度与 EV 非线性，用 EV 模型算它的崩塌下限会得出错误的 floor
+  // → 正常帧被误判成崩塌 → 白白降级到 tier0，亮度档一点没用上。
+  //
+  // 也不能只写 `tier > 0`：那是靠 'brightness' > 0 === false 的隐式类型转换侥幸为 false，
+  // 一旦有人「顺手统一成 tierRank(...) > 0」就翻车（亮度档被 EV 模型接管）。
+  // 与 tierRank/expGhostKey 并列放在模块级：档位语义只在这里定义一次，外部可独立断言。
+  function collapseGuardApplies(tier) {
+    return tier === 1 || tier === 2;
+  }
+
   // 能力探测 → 三档降级路径（设计文档 §7.1）。摄像头能力差异极大，
   // 且部分 UVC 的 getCapabilities() 直接抛异常，调用方必须包 try
   function pickExposurePlan(cap, settings) {
@@ -1792,7 +1808,15 @@
       // 下发的 EV + tol。为什么按次取照而不是按档位取一次：过压设备实际压暗是请求的 3 倍
       // （QA X 组 overDepth=2.0），按档位累计深度算会把过压误判成崩塌；按次算时每步只容许
       // 「本步请求 + 2EV」，过压（每步 ≤1.02EV）天然在容差内，而崩塌（一步 -7.5EV）必然越界
-      if (expAssist.tier > 0 && expAssist.preApplyMean > 0 &&
+      //
+      // 准入判定见模块级 collapseGuardApplies：**字符串档（'brightness'）天然跳过本守卫**，
+      // 这是有意设计而非疏漏。崩塌的成因是「切手动曝光模式后设备不按上报的 exposureTime
+      // 执行」，只发生在 tier2；亮度参数档是 ISP 黑电平偏移，不切曝光模式、不存在「请求的
+      // 时间没被执行」这条失效路径，因此不需要（也不应该）被崩塌守卫接管。另：brightness
+      // 的实际压暗深度与 EV 不是线性关系，用 EV 模型算它的崩塌下限会得出错误的 floor，
+      // 容易误判。若将来要给 brightness 加崩塌检测，必须先换一套基于码值的判据，
+      // 不能把准入条件改成 tierRank(...) > 0。
+      if (collapseGuardApplies(expAssist.tier) && expAssist.preApplyMean > 0 &&
           cl.rawSceneMean != null && isFinite(cl.rawSceneMean) && cl.rawSceneMean > 0) {
         var collapseDepth = Math.max(0, -(expAssist.lastAppliedEv || 0)) + EXP_COLLAPSE.tol;
         var collapseFloor = expAssist.preApplyMean *
@@ -3116,6 +3140,10 @@
     // `tier > 0` 之类数值比较会把字符串档误判成 tier0）。导出供独立断言。
     tierRank: tierRank,
     expGhostKey: expGhostKey,
+    // 崩塌守卫的适用档位判定（与 tierRank 同为档位语义的唯一来源）。
+    // 字符串档 'brightness' 必须为 false —— 它是 ISP 黑电平偏移、压暗深度与 EV 非线性，
+    // 用 EV 模型算崩塌下限会把它误判成崩塌。导出供独立断言。
+    collapseGuardApplies: collapseGuardApplies,
     // sRGB 编码指数（§7.3 LUT 与 §7.5 判定共用同一个常量）
     SRGB_GAMMA: SRGB_GAMMA,
     solveTier0Ev: solveTier0Ev

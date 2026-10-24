@@ -567,6 +567,30 @@ const MUTATIONS = [
     from: "if (tier === 'brightness') return 's:brightness';",
     to: "/* MUTANT: 字符串档没有独立键 */",
     expect: ['P20']
+  },
+  {
+    id: 'M58',
+    // 崩塌守卫的准入判定若改用 tierRank(tier) > 0，brightness 档会被接管：
+    // 崩塌下限是 EV 模型算的，而 brightness 是 ISP 黑电平偏移、实际深度与 EV 非线性
+    // → 误判成「画面崩塌」→ 立刻降 tier0，亮度档白做。
+    // 这条变异模拟「后人顺手把准入判定统一成 tierRank(...) > 0」的回归。
+    // 锚点打在纯函数体上（控制器里准入判定的唯一来源），而不是调用点 ——
+    // 打在调用点会被「调用点改成别的写法」这类等价变异绕过。
+    name: '★brightness★ 崩塌守卫准入判定退回 tierRank（brightness 被 EV 模型误判成崩塌）',
+    from: 'return tier === 1 || tier === 2;',
+    to: 'return tierRank(tier) > 0; /* MUTANT: 崩塌守卫接管字符串档 */',
+    expect: ['P34']
+  },
+  {
+    id: 'M59',
+    // 准入判定被绕开：守卫调用点直接用 tierRank(expAssist.tier) > 0，
+    // 纯函数 collapseGuardApplies 还在但没人调它 —— 这是比 M58 更隐蔽的回归
+    // （后人图省事直接改调用点）。只断言纯函数行为抓不到它，必须另有
+    // 「守卫调用点必须走准入纯函数」的契约。
+    name: '★brightness★ 崩塌守卫调用点绕过准入纯函数（直接用 tierRank 判档位）',
+    from: 'if (collapseGuardApplies(expAssist.tier) && expAssist.preApplyMean > 0 &&',
+    to: 'if (tierRank(expAssist.tier) > 0 && expAssist.preApplyMean > 0 && /* MUTANT: 绕过准入纯函数 */',
+    expect: ['P38']
   }
 ];
 
@@ -619,7 +643,12 @@ async function main() {
       mFail++;
       continue;
     }
+    // 让套件的静态源码扫描读**被测副本**而不是仓库真实源码。
+    // 不设的话静态契约在变异框架下永远看到未变异的代码 → 结构上不可能变红
+    // （M58 就是这样漏网的：静态 grep 断言 + expect 指向另一个套件）。
+    process.env.CAM_CTRL_PATH = MUT;
     const r = await run(mutant);
+    delete process.env.CAM_CTRL_PATH;
     const isNew = function (f) { return base.failures.indexOf(f) < 0; };
     const newFails = r.failures.filter(isNew);
 

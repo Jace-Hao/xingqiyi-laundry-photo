@@ -1258,6 +1258,31 @@ async function sectBrightnessTier() {
   assert(d3.banned && d3.banned.brightness && d3.banned.exposureCompensation,
     'Q181 从 brightness 降级时 banned 累积了 brightness 与已摘掉的 exposureCompensation');
 
+  /* --- ⑦ 崩塌守卫不得接管 brightness 档（行为级契约）---
+   * 崩塌守卫的判据是 EV 模型（floor = 参照 × 2^(-深度/γ)），而 brightness 是
+   * ISP 黑电平偏移、实际压暗深度与 EV 非线性 → 用 EV 模型算它的崩塌下限会得出
+   * 错误的 floor，把 brightness 档误判成「画面崩塌」→ 立刻降 tier0，亮度档白做。
+   * 准入判定已提为模块级纯函数 collapseGuardApplies（控制器里唯一来源），
+   * 这里直接断言它的行为。
+   * ⚠️ 之前这里是**静态 grep 源码**（找 'expAssist.tier > 0' 字面量），
+   * 而变异测试注入的是副本模块、静态扫描读的却是真实源码文件 → 静态断言
+   * 在变异框架下**结构上不可能变红**（M58 就这样漏网）。行为级断言直接调
+   * 被测模块的导出函数，变异体改了实现就会变红。
+   */
+  eq(C.collapseGuardApplies(1), true, 'Q192 崩塌守卫适用 tier1（曝光补偿，EV 模型成立）');
+  eq(C.collapseGuardApplies(2), true, 'Q193 崩塌守卫适用 tier2（手动曝光，崩塌成因所在）');
+  eq(C.collapseGuardApplies('brightness'), false,
+    'Q194 崩塌守卫不适用 brightness 档（ISP 黑电平偏移、深度与 EV 非线性，'
+    + '用 EV 模型算崩塌下限会把它误判成崩塌 → 白白降级到 tier0）');
+  eq(C.collapseGuardApplies(0), false, 'Q195 崩塌守卫不适用 tier0（软件兜底没下发硬件约束）');
+  // 反向对照：准入判定必须**排除**字符串档，而不是靠 'brightness' > 0 === false
+  // 的隐式类型转换侥幸为 false —— 后者是巧合不是契约，后人「顺手统一成
+  // tierRank(...) > 0」就会翻车（tierRank('brightness')===1，与 tier1 同秩）。
+  eq(C.collapseGuardApplies('1'), false,
+    'Q196 崩塌守卫不适用字符串 \'1\'（档位身份只认数字字面量 1/2，不靠类型转换）');
+  eq(C.collapseGuardApplies(undefined), false,
+    'Q197 崩塌守卫不适用 undefined（档位缺失时不得误判为适用）');
+
   // 手动档是硬件链最后一环 → 只能落 tier0
   const d4 = C.demoteExposurePlan({ tier: 2, reason: 'x', baseTime: 500, baseIso: null, timeMin: 10, timeMax: 10000, isoMin: null, isoMax: null, restoreMode: 'continuous' }, capAll, settingsAll, {});
   eq(d4.tier, 0, 'Q183 手动档（tier2）判无效后只能落 tier0（硬件链终点）');

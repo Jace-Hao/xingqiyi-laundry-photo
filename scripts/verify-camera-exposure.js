@@ -41,6 +41,17 @@ function near(a, b, tol, m) {
 
 const ROOT = path.resolve(__dirname, '..');
 
+// 被测控制器的**源码文本**（供静态契约扫描用）。
+// 必须与被测模块同一个文件：变异测试把改坏的副本注入为模块（runAll(mutant)），
+// 若静态扫描仍读仓库里的真实源码，静态断言在变异框架下就**结构上不可能变红**
+// —— 它们永远看到未变异的代码，等于没有断言（M58 就这样漏网过）。
+// CAM_CTRL_PATH 由变异框架在注入副本前设置；正常运行时不设 → 读真实源码。
+function ctrlSourceText() {
+  const p = process.env.CAM_CTRL_PATH;
+  const abs = p ? (path.isAbsolute(p) ? p : path.resolve(ROOT, p)) : path.join(ROOT, 'renderer', 'camera-controller.js');
+  return fs.readFileSync(abs, 'utf8');
+}
+
 /* ========================================================================== *
  * 一、虚拟时钟 + 假对象（确定性，无真实 sleep）
  * ======================================================================== */
@@ -1298,6 +1309,42 @@ async function suite() {
       'P30 累积 banned 后降级不回 tier1（原地打转已消除），实际 tier=' + d2b.tier);
     assert(d2b.banned && d2b.banned.exposureCompensation && d2b.banned.brightness,
       'P31 banned 累积了两个已失效能力键（探测空间单调收缩）');
+
+    // ⑤ 崩塌守卫的适用档位（行为级断言，不是静态 grep）。
+    // 崩塌判据是 EV 模型（floor = 参照 × 2^(-深度/γ)），而 brightness 是 ISP 黑电平
+    // 偏移、实际压暗深度与 EV 非线性 → 用 EV 模型算它的崩塌下限会得出错误的 floor，
+    // 把 brightness 档误判成「画面崩塌」→ 立刻降 tier0，亮度档白做。
+    // 准入判定已提为模块级纯函数 collapseGuardApplies（控制器里唯一来源），
+    // 这里直接断言它的行为：
+    //   ⚠️ 之前这里是**静态 grep 源码**（找 'expAssist.tier > 0' 字面量），
+    //   而变异测试注入的是副本模块、静态扫描读的却是真实源码文件 → 静态断言
+    //   在变异框架下**结构上不可能变红**（M58 就这样漏网）。行为级断言直接调
+    //   被测模块的导出函数，变异体改了实现就会变红。
+    eq(C.collapseGuardApplies(1), true,
+      'P32 崩塌守卫适用 tier1（曝光补偿，压暗量可用 EV 线性外推）');
+    eq(C.collapseGuardApplies(2), true,
+      'P33 崩塌守卫适用 tier2（手动曝光，崩塌的真实成因所在）');
+    eq(C.collapseGuardApplies('brightness'), false,
+      'P34 崩塌守卫不适用 brightness 档（ISP 黑电平偏移、深度与 EV 非线性，'
+      + '用 EV 模型算崩塌下限会把它误判成崩塌 → 白白降级到 tier0）');
+    eq(C.collapseGuardApplies(0), false,
+      'P35 崩塌守卫不适用 tier0（软件兜底，压根没下发硬件约束）');
+    // 反向对照：准入判定必须**排除**字符串档，而不是靠 'brightness' > 0 === false
+    // 的隐式类型转换侥幸为 false —— 后者是巧合不是契约，后人「顺手统一成
+    // tierRank(...) > 0」就会翻车（tierRank('brightness')===1，与 tier1 同秩）。
+    eq(C.collapseGuardApplies('1'), false,
+      'P36 崩塌守卫不适用字符串 \'1\'（档位身份只认数字字面量 1/2，不靠类型转换）');
+    eq(C.collapseGuardApplies(null), false,
+      'P37 崩塌守卫不适用 null/undefined（档位缺失时不得误判为适用）');
+    // 调用点必须走准入纯函数：纯函数对了但调用点绕过它（直接 tierRank(...) > 0）
+    // 一样会让 brightness 被接管 —— 纯函数行为断言抓不到这种绕过，必须静态钉住调用点。
+    // 静态扫描读**被测副本**（ctrlSourceText），否则变异框架下这条恒真。
+    const guardSrc = ctrlSourceText();
+    assert(/collapseGuardApplies\(\s*expAssist\.tier\s*\)/.test(guardSrc),
+      'P38 崩塌守卫的调用点走准入纯函数 collapseGuardApplies（不得绕过直接判档位）');
+    assert(!/tierRank\(\s*expAssist\.tier\s*\)\s*>\s*0/.test(guardSrc),
+      'P39 崩塌守卫不得用 tierRank(expAssist.tier) > 0 判准入'
+      + '（tierRank(\'brightness\')===1，与 tier1 同秩 → 亮度档被 EV 模型接管）');
   }
 
   /* ---------------------------------------------------------------- *
@@ -1784,7 +1831,7 @@ async function suite() {
     assert(hLbl.clock.count() === 0, 'T18 兜底身份路径无悬挂定时器');
 
     // 连 label 都拿不到时按 track 实例发号兜底（真实换设备必然换 track 对象）
-    const ctrlSrc = fs.readFileSync(path.join(ROOT, 'renderer', 'camera-controller.js'), 'utf8');
+    const ctrlSrc = ctrlSourceText();
     assert(/__expUid\s*==\s*null/.test(ctrlSrc) && /ghostUidSeq/.test(ctrlSrc),
       'T19 连 label 也拿不到时按 track 实例发号兜底（不落共享空串槽）');
 
@@ -1864,7 +1911,7 @@ async function suite() {
     assert(/--success-soft/.test(cssSrc) && /--warning-soft/.test(cssSrc), 'M17 徽标复用既有语义色变量');
 
     // 控制器边界：不碰 DOM / localStorage
-    const cSrc = fs.readFileSync(path.join(ROOT, 'renderer', 'camera-controller.js'), 'utf8');
+    const cSrc = ctrlSourceText();
     // 先剥掉注释再扫：注释里为了说明「禁止碰 localStorage」会提到它，那不是代码
     const cCode = cSrc.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
     assert(!/\bdocument\./.test(cCode), 'M18 控制器不读 document（页面可见性走注入）');
@@ -1888,8 +1935,12 @@ async function suite() {
 
     // 源码里用到的事件必须都在白名单内（静态扫描，与 verify-camera.js 第 23 组同源）
     const used = new Set();
-    ['renderer/renderer.js', 'renderer/camera-controller.js'].forEach(function (f) {
-      const src = fs.readFileSync(path.join(ROOT, f), 'utf8');
+    // 控制器源码读被测副本（与 ctrlSourceText 同源），renderer.js 是另一个文件、始终读真实源码
+    [
+      { text: fs.readFileSync(path.join(ROOT, 'renderer', 'renderer.js'), 'utf8') },
+      { text: ctrlSourceText() }
+    ].forEach(function (f) {
+      const src = f.text;
       let mm;
       const re = /'CAM_[A-Z_]+'/g;
       while ((mm = re.exec(src)) !== null) used.add(mm[0].replace(/'/g, ''));
