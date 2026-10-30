@@ -3525,3 +3525,65 @@ textarea:focus-visible,
 .camera-overlay .btn {
   pointer-events: auto;
 }
+
+
+/* ---------- 摄像头亮度调节（v1.2.19 新增，取代自动曝光辅助） ---------- */
+.camera-bright {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.camera-bright .cam-bright-label {
+  margin: 0;
+  flex-shrink: 0;
+  color: var(--text-sub);
+}
+
+.camera-bright .brightness-slider {
+  flex: 1 1 220px;
+  min-width: 160px;
+  width: auto;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  accent-color: var(--primary);
+}
+
+.camera-bright .brightness-slider:focus {
+  box-shadow: none;
+}
+
+.camera-bright .brightness-slider:focus-visible {
+  outline: 2px solid var(--primary-ring);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.camera-bright .brightness-val {
+  flex-shrink: 0;
+  min-width: 44px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.camera-bright .brightness-scope {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 132px;
+  height: 30px;
+  padding: 0 8px;
+}
+
+.camera-bright.cam-bright-unsupported {
+  margin-top: 12px;
+  font-size: 13px;
+  color: var(--text-faint);
+  display: flex;
+}
+

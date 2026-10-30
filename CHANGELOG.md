@@ -1,4 +1,25 @@
 # 更新日志
+## v1.2.19（2026-10-30）
+
+### 功能变更（回滚 + 重做亮度调节）
+- **移除自动曝光辅助引擎（整套）**：v1.2.18 的亮度仅作为自动曝光辅助的内部兜底档，由辅助引擎自动选用压暗。本版按产品决策**彻底移除整套自动曝光辅助子系统**（网格统计、滞回决策、闭环步进、幽灵能力检测、档位降级、软件兜底 LUT），改用用户**手动控制**的摄像头亮度滑块替代。
+- **确认移除软件屏幕亮度调节（无残留）**：v1.2.17 曾给预览 `<video>` 套 SVG `feComponentTransfer` 滤镜做后期压暗，在 Electron 下会导致整片白屏，该滤镜已于 v1.2.18 移除；本版复核确认预览链路无任何后期滤镜 / `filter: brightness` 残留，压暗一律走相机原生 `brightness`（ISP 层，预览与成片同源）。
+- **新增「摄像头亮度」手动滑块**（取代自动曝光辅助）：
+  - 通过 `track.applyConstraints({advanced:[{brightness}]})` 下发相机原生亮度参数，在 ISP 层压暗 / 提亮；
+  - **范围 / 默认 / 步进**取自 `getCapabilities().brightness.{min,max,step}`，默认取设备自身默认档位（`getSettings().brightness`）回退量程中点；
+  - **实时预览**：拖动即下发、所见即所得；`step>0` 时对齐步进网格，`step=0` 仅做量程钳位（连续亮度）；
+  - **持久化**：按「全局默认 + 单设备覆盖」保存（localStorage 注入回调，兼容旧数据：无键时回落默认），重启 / 换设备后自动恢复并下发；
+  - **降级**：设备不支持 `brightness` 能力时滑块自动禁用并提示，整条亮度逻辑 no-op，不影响正常拍摄。
+
+### 测试（重写为亮度滑块回归）
+- 删除 `verify-camera-exposure*.js` 四套（针对已移除的自动曝光辅助）与 `docs/exposure-assist-design.md`，新增 `verify-camera-brightness.js`：纯函数层（能力探测 / 量程钳位 / 默认推导）+ 控制器编排（恢复下发、实时预览不存档、提交存档两种槽位、重置、降级、悬挂超时竞速）+ 变异测试负向对照。
+- `verify-camera.js` 的 `CAM_*` 事件白名单同步：`CAM_EXP_*` 全部移出，新增 `CAM_BRIGHT_FAIL`（设备不支持时悬挂下发超时）。
+- 把 `tryApplyRung` 与亮度下发共用的 `applyConstraints` 超时竞速抽成单一 `raceApplyConstraints` 辅助函数，消除重复的 `acw.cancel()`（恢复变异测试 M4 的唯一锚点）。
+
+### 校验
+- `verify-camera-brightness` 50/0；`verify-camera-res-mutation` 12 条变异全部被抓住 0 条漏网；相机相关 9 套 node 验证全绿。
+
+
 
 ## v1.2.18（2026-10-24）
 

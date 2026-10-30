@@ -63,53 +63,6 @@
     resMaxRungs: 16,
     resMaxFps: 3,
 
-    // ===== 曝光辅助：黑色衣物过曝防护（设计文档 docs/exposure-assist-design.md）=====
-    // 所有曝光 applyConstraints 只带 advanced 曝光键，绝不夹带 width/height/frameRate
-    // （夹带一次就可能破坏分辨率锁定，项目纪律红线）
-    expGridSize: 64,             // 整帧降采样边长（64×64 像素统计，开销可忽略）
-    expGridCells: 8,             // 网格划分数：8×8=64 格
-    expSubjectMeanMax: 185,      // 主体格亮度上限：比垫板暗即候选
-    expSubjectSatMax: 0.28,      // 主体格饱和度上限：低饱和=灰黑系；
-    //   深蓝/深棕/深绿衣物饱和度高，不触发（它们不过曝成灰白）
-    expHiMeanMin: 185,           // 高亮格亮度下限：亮垫板/亮背景参照
-    expSubjectAreaMin: 0.08,     // 主体面积下限：零星暗物（电线/阴影）不触发
-    expSubjectAreaMax: 0.75,     // 主体面积上限：超过视为整体昏暗场景，不触发
-    expHiAreaMin: 0.06,          // 高亮面积下限：没有亮参照就无法区分
-    //   「AE 提亮黑衣物」与「场景本来就暗」
-    expCenterSubjectMin: 0.15,   // 中心区域主体下限：衣物在台垫中央，
-    //   顺带排除画面边缘暗物（电线/桌沿阴影）
-    expSceneMeanMin: 45,         // 场景均值下限：低于此=昏暗/遮挡/黑信号，
-    //   那是黑帧检测的职责，不触发
-    expEngageHits: 3,            // 滞回 engage：连续 3 帧命中（≈750ms）
-    expReleaseMisses: 10,        // 滞回 release：连续 10 帧未命中（≈2.5s）
-    expMinHoldMs: 1500,          // engage 后最短保持：衣物半出画不急着恢复
-    expReEngageCooldownMs: 3000, // release 后冷却：防反复横跳
-    expCycleMs: 250,             // 检测周期
-    expEngageDelayMs: 800,       // LIVE 后启动延迟：避开分辨率探测/首帧 AE 窗口
-    // 闭环目标：主体平均亮度。现场标定 2026-10-23（黑色皮衣，设备 346ecdd1，
-    // 调查报告 docs/field-2026-10-23-tier0-darkening.md）：
-    //   ① 原值 58 下 ISP 提亮帧（主体 ~148）被压到 ev≈-2.97，存档照整帧落 35~100
-    //      暗带、皮衣读成一团黑——用户投诉「照片被调暗了，但实际细节依旧显示不出来」；
-    //   ② 同设备 LUT 对照模拟：ev=-1.5（主体 98）时褶皱/高光/口袋清晰可读，仍是黑色衣物。
-    // 58→105 后 148 的主体只压约 -1.1EV，落在验证过的可读区（约 95~120）；对更亮的
-    // 提亮主体（如 185）仍压约 -1.65EV，「过曝防护」的方向不变、力度收回。
-    // 这是设计文档 §10.1 预留的标定旋钮：后续门店若嫌亮/暗，只调这一处常量。
-    expTargetMean: 105,
-    expDeadzone: 8,              // 死区：AE 自身波动 ±几格很正常，不动
-    expEvGain: 0.025,            // 步长增益：误差×0.025=步长(EV)
-    expMaxStepEv: 0.34,          // 单步上限 1/3 档：小步逼近防画面跳变
-    // 累计下限。历史：原为 -2.0 → 2026-10 现场（黑白相间鞋、白色鞋底过曝裁剪）加深到
-    // -3.0，依据是「150 → 58 需要 -3EV」。2026-10-23 标定 expTargetMean=105 后重新
-    // 核算：gamut 内最深需求 = 2.2×log2(105/255) ≈ -2.82EV（主体 255 的极端提亮帧），
-    // -3.0 作为护栏在物理输入下不再触达——这正是护栏应有的形态（真被钳住说明目标/采样
-    // 出了问题，而不是正常路径）。保留 -3.0 与 tier1/tier2 共用同一个常量，避免三档三个下限。
-    // 注意：实际下发仍被设备 cap.exposureCompensation.min 二次钳位
-    expEvMin: -3.0,
-    expStepGapMs: 500,           // 两次曝光 applyConstraints 最小间隔
-    expSettleMs: 400,            // 单次调整后稳定等待：拿过渡值算步长会过冲
-    expApplyTimeoutMs: 1000,     // 曝光 applyConstraints 超时竞速（UVC 悬挂兜底）
-    expApplyFailLimit: 2,        // 连续失败这么多次：停硬件路径、降级软件兜底
-    expBlackFloor: 4             // 黑帧门控兜底：ACTIVE 时场景均值 <4 仍拒拍
   };
 
   /* ---------- 纯计算辅助（可被单测直接调用） ---------- */
@@ -161,690 +114,54 @@
     return out;
   }
 
-  /* ---------- 曝光辅助：纯计算（可单测，不碰 DOM / MediaStreamTrack） ----------
-   * 黑色衣物过曝防护的「判定与数学」全部落在这里：渲染层只负责把整帧降采样成
-   * ImageData，编排层只负责拿结果去发约束。这样 CI 无摄像头环境也能覆盖绝大部分逻辑。
-   * 设计文档：docs/exposure-assist-design.md §6 / §7
-   */
+  /* ---------- 摄像头原生亮度（brightness）调节：纯计算（可单测，不碰 DOM / MediaStreamTrack） ----------
+   * v1.2.19 起，用相机自身的 ISP 亮度参数（MediaTrackCapabilities.brightness）做「压暗/提亮」，
+   * 取代原先的自动曝光辅助引擎。预览与成片天然同源（都在 ISP 层），不套任何后期滤镜
+   *（v1.2.17 曾给 <video> 套 SVG 滤镜导致 Electron 白屏，已废弃）。
+   * 能力探测 / 量程钳位 / 步进对齐 全部落在这里，渲染层只负责把滑块值喂进来、拿结果去发约束，
+   * 这样无摄像头环境也能在 Node 下单测绝大部分逻辑。 */
+
+  // 能力探测：设备不暴露 brightness 能力（或量程非法）时返回 { supported:false }。
+  // 返回结构与 MediaTrackCapabilities.brightness 对齐（min/max/step）。
+  function capabilityProbeBrightness(cap) {
+    var b = cap && cap.brightness;
+    if (!b || typeof b.min !== 'number' || typeof b.max !== 'number' || b.max <= b.min) {
+      return { supported: false, min: 0, max: 0, step: 1 };
+    }
+    var step = typeof b.step === 'number' && b.step > 0 ? b.step : 0;
+    return { supported: true, min: b.min, max: b.max, step: step };
+  }
+
+  // 把滑块值钳进设备量程，并在 step>0 时对齐到「以量程下界为锚」的步进网格。
+  // step<=0 表示设备不提供离散步进，仅做量程钳位（连续亮度）。
+  function clampBrightnessValue(value, cap) {
+    var lo = cap.min, hi = cap.max;
+    var v = Number(value);
+    if (!isFinite(v)) v = lo;
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    if (cap.step > 0) {
+      var steps = Math.round((v - lo) / cap.step);
+      v = lo + steps * cap.step;
+      // 浮点误差兜底：钳回量程
+      if (v < lo) v = lo;
+      if (v > hi) v = hi;
+    }
+    return v;
+  }
+
+  // 设备「自身默认」亮度：优先取当前 settings.brightness（设备开机档位），
+  // 缺失时回退量程中点（绝大多数设备默认 128/255 之类，落在中点附近是常态）。
+  function defaultBrightnessValue(cap, settings) {
+    if (settings && typeof settings.brightness === 'number' && isFinite(settings.brightness)) {
+      return clampBrightnessValue(settings.brightness, cap);
+    }
+    return clampBrightnessValue(cap.min + (cap.max - cap.min) / 2, cap);
+  }
 
   // 网格降采样统计：整帧按 grid×grid 切格，每格算 { mean, sat, clip }
   // 为什么整帧统计而不是继续用中心 64×64：黑色衣物检测要回答的是
   // 「画面里暗主体占多大、有没有亮背景参照」，这是全局问题，中心采样回答不了
-  function computeGridStats(image, grid) {
-    var g = Math.max(1, grid || DEFAULTS.expGridCells);
-    var w = image && image.width ? image.width : 0;
-    var h = image && image.height ? image.height : 0;
-    var data = image && image.data;
-    if (!w || !h || !data) return null;
-    var cw = Math.max(1, Math.floor(w / g));
-    var ch = Math.max(1, Math.floor(h / g));
-    var cells = new Array(g * g);
-    for (var cy = 0; cy < g; cy++) {
-      for (var cx = 0; cx < g; cx++) {
-        var sum = 0;
-        var satSum = 0;
-        var clip = 0;
-        var n = 0;
-        var y1 = cy * ch;
-        var x1 = cx * cw;
-        for (var y = 0; y < ch; y++) {
-          var row = (y1 + y) * w;
-          for (var x = 0; x < cw; x++) {
-            var i = (row + x1 + x) * 4;
-            var r = data[i];
-            var gg = data[i + 1];
-            var b = data[i + 2];
-            var mx = Math.max(r, gg, b);
-            var mn = Math.min(r, gg, b);
-            var luma = (r * 299 + gg * 587 + b * 114) / 1000;
-            sum += luma;
-            // 饱和度 (max-min)/max；纯黑像素（max=0）定义为 0，避免除零
-            satSum += mx > 0 ? (mx - mn) / mx : 0;
-            if (luma > 250) clip++;
-            n++;
-          }
-        }
-        cells[cy * g + cx] = n
-          ? { mean: sum / n, sat: satSum / n, clip: clip / n }
-          : { mean: 0, sat: 0, clip: 0 };
-      }
-    }
-    return cells;
-  }
-
-  // 场景判定：是否命中「黑色衣物过曝」场景。四类相邻暗场景的区分见设计文档 §6.1
-  function classifyExposureGrid(cells, th, opts) {
-    // 缺省阈值取 DEFAULTS：单测可以直接传 { expXxx: ... } 只覆盖关心的几项
-    var t = Object.assign({}, DEFAULTS, th || {});
-    var grid = t.expGridCells;
-    // 曝光还原（缺陷 1）：ACTIVE 且「实测实际生效 EV」(actualEv) < 0 时，参与「判定闸门」
-    // 的亮度要按曝光偏移还原回中性刻度，否则压暗整帧会把亮垫板压到 expHiMeanMin 以下、
-    // 甚至跌到 expSubjectMeanMax 以下混入主体计数 → 闸门自杀 → 闭环反复 RESTORE/ENGAGE
-    // 振荡（用户看到的循环跳亮）。
-    // 物理：设备压暗整帧，实测 c.mean = 中性亮度 × 2^(actualEv/gamma)。还原即乘 2^(-actualEv/gamma)。
-    // 还原口径必须覆盖全部四道闸（亮参照格 / 场景均值 / 主体格 / 中心主体），理由：
-    //   · 亮参照格（垫板）中性≈185，压暗后极易跌破 → 不还原则 hiRatio 塌陷、no-bright-reference。
-    //   · 主体格：黑衣物中性=150 本就 ≤185，但整帧压暗后亮垫板会跌到 ≤185 而被误判成主体 →
-    //     subjectRatio 飙到 1.0、subject-too-large 自杀。用还原亮度判主体可让垫板还原回 210
-    //     （>185，不算主体）、黑衣物还原回 150（≤185，仍算主体）。
-    //   · 还原系数取「实测实际生效 EV」而非「请求 EV」：帧不随补偿变暗的静态/幽灵设备
-    //     actualEv≈0 → 系数≈1 → 主体按原始亮度判，与旧实现完全一致、不漂移、不误判失格。
-    //   · ev=0（未介入 / actualEv=0）时系数为 1，所有量与原实现完全一致。
-    var ev = opts && typeof opts.ev === 'number' ? opts.ev : 0;
-    var gamma = (opts && opts.gamma) ? opts.gamma : SRGB_GAMMA;
-    if (!(gamma > 0)) gamma = SRGB_GAMMA;
-    // 曝光还原（缺陷 1）：设备压暗的是「整帧」，实测 c.mean = 中性亮度 × 2^(actualEv/gamma)。
-    // 闸门的还原不是按某个 EV 值乘系数，而是按「当前整帧相对 engage 时中性帧的实测压暗系数 f」
-    // 还原回中性刻度（f = 当前场景均值 / 中性场景均值，整帧均匀缩放 → 该比值恰为 f）。
-    // 还原口径覆盖全部四道闸（亮参照格 / 场景均值 / 主体格 / 中心主体）：
-    //   · 亮参照格（垫板）中性≈185，压暗后极易跌破 → 不还原则 hiRatio 塌陷、no-bright-reference。
-    //   · 主体格：黑衣物中性=150 本就 ≤185，但整帧压暗后亮垫板会跌到 ≤185 而被误判成主体 →
-    //     subjectRatio 飙到 1.0、subject-too-large 自杀。用还原亮度判主体可让垫板还原回 210
-    //     （>185，不算主体）、黑衣物还原回 150（≤185，仍算主体）。
-    // 用「场景均值之比」而非「请求 EV / 实测 EV」的好处：
-    //   · 无帧滞后——比值来自当前这一帧；过压设备若把帧压得更狠，比值天然含这份额外压暗，
-    //     还原仍精确（用请求 EV 还原会欠还原，垫板仍跌破 185 → subject-too-large）。
-    //   · 对帧不随补偿变暗的静态 / 幽灵设备，f≈1 → 还原系数≈1 → 主体按原始亮度判，与旧实现
-    //     完全一致、不漂移到 185 以上误判失格。
-    //   · ev=0（未介入 / 无中性参照）→ 还原系数=1，所有量与原实现完全一致。
-    var refMean = (opts && typeof opts.refMean === 'number' && opts.refMean > 0) ? opts.refMean : 0;
-    var n = cells && cells.length ? cells.length : 0;
-    if (!n) {
-      return {
-        hit: false, reason: 'no-cells', subjectRatio: 0, hiRatio: 0,
-        centerSubjectRatio: 0, sceneMean: null, subjectMean: null, clipRatio: 0, cells: 0,
-        rawSceneMean: null, restoreFactor: 1
-      };
-    }
-    // 先算「原始（未还原）场景均值」：整帧均匀缩放 → 当前场景均值 / 中性场景均值 = f。
-    var rawSceneSum = 0;
-    for (var k0 = 0; k0 < n; k0++) rawSceneSum += cells[k0].mean;
-    var rawSceneMean = rawSceneSum / n;
-    var restoreFactor = (refMean > 0 && rawSceneMean > 0) ? refMean / rawSceneMean : 1;
-    var subject = 0;
-    var hi = 0;
-    var centerSubject = 0;
-    var centerTotal = 0;
-    var sum = 0;        // 还原后的场景均值（用于闸门判定，≈ 中性场景均值）
-    var subjSum = 0;    // 原始主体均值（闭环反馈，不参与还原）
-    var clipSum = 0;
-    // 中心区域 = 网格中央一半（g/4 ~ 3g/4）
-    var lo = Math.floor(grid / 4);
-    var hiEdge = Math.ceil((grid * 3) / 4);
-    for (var i = 0; i < n; i++) {
-      var c = cells[i];
-      var cx = i % grid;
-      var cy = Math.floor(i / grid);
-      var adjMean = c.mean * restoreFactor;   // 四道闸共用同一还原亮度（亮参照格/场景均值/主体格/中心主体）
-      // 主体格判据用「还原后亮度」(adjMean)，与亮参照格 / 场景均值同一口径：
-      // 整帧压暗时亮垫板被还原回 210（>185，不算主体 → 否则 subject-too-large 自杀），
-      // 黑衣物被还原回 150（≤185，仍算主体）。饱和判据仍用原始 c.sat（亮度缩放不改色相）。
-      var isSubject = adjMean <= t.expSubjectMeanMax && c.sat < t.expSubjectSatMax;
-      if (isSubject) { subject++; subjSum += c.mean; }   // subjSum 仍用原始亮度，供闭环反馈
-      if (adjMean > t.expHiMeanMin) hi++;
-      sum += adjMean;
-      clipSum += c.clip;
-      if (cx >= lo && cx < hiEdge && cy >= lo && cy < hiEdge) {
-        centerTotal++;
-        if (isSubject) centerSubject++;
-      }
-    }
-    var out = {
-      hit: false,
-      reason: 'normal',
-      subjectRatio: subject / n,
-      hiRatio: hi / n,
-      centerSubjectRatio: centerTotal ? centerSubject / centerTotal : 0,
-      sceneMean: sum / n,
-      subjectMean: subject ? subjSum / subject : null,
-      clipRatio: clipSum / n,
-      cells: n,
-      // 诊断口径：还原前的原始场景均值与还原系数。闸门判定用的是还原值（sceneMean），
-      // 现场排查「ACTIVE 后闸门为什么反转让闭环既不下发补偿也不被判无效」时，
-      // 必须同时看到这两个数才能分清「画面真的变了」与「还原系数失真」
-      rawSceneMean: rawSceneMean,
-      restoreFactor: restoreFactor
-    };
-    // 按序短路：每一道都对应一类必须排除的场景（设计文档 §6.1 场景表）
-    if (out.sceneMean < t.expSceneMeanMin) { out.reason = 'overall-dark-or-blocked'; return out; }
-    if (out.hiRatio < t.expHiAreaMin) { out.reason = 'no-bright-reference'; return out; }
-    if (out.subjectRatio < t.expSubjectAreaMin) { out.reason = 'subject-too-small'; return out; }
-    if (out.subjectRatio > t.expSubjectAreaMax) { out.reason = 'subject-too-large'; return out; }
-    if (out.centerSubjectRatio < t.expCenterSubjectMin) { out.reason = 'subject-off-center'; return out; }
-    out.hit = true;
-    out.reason = 'black-garment';
-    return out;
-  }
-
-  // 滞回状态机：engage 要连续 expEngageHits 帧命中，release 要连续
-  // expReleaseMisses 帧未命中且满足最短保持/冷却。单帧抖动不改状态，
-  // 否则补偿会跟着画面闪烁反复横跳（那比过曝本身更扰人）
-  function stepAssistHysteresis(st, hit, nowMs, cfg) {
-    var c = Object.assign({}, DEFAULTS, cfg || {});
-    // engagedAt / releasedAt 必须原样带下去：只在「不改状态」的分支里复制
-    // state/hit/miss 会把这两个时间戳丢掉，最短保持与冷却闸门就永久失效
-    // （engagedAt 变 undefined → nowMs - 0 恒大于阈值）
-    var s = {
-      state: st.state,
-      hit: st.hit,
-      miss: st.miss,
-      engagedAt: st.engagedAt || 0,
-      releasedAt: st.releasedAt || 0
-    };
-    if (hit) { s.hit += 1; s.miss = 0; } else { s.miss += 1; s.hit = 0; }
-    if (s.state === 'IDLE' && s.hit >= c.expEngageHits &&
-      nowMs - (st.releasedAt || 0) >= c.expReEngageCooldownMs) {
-      return { st: { state: 'ACTIVE', hit: 0, miss: 0, engagedAt: nowMs, releasedAt: 0 }, action: 'engage' };
-    }
-    if (s.state === 'ACTIVE' && s.miss >= c.expReleaseMisses &&
-      nowMs - (st.engagedAt || 0) >= c.expMinHoldMs) {
-      return { st: { state: 'IDLE', hit: 0, miss: 0, engagedAt: 0, releasedAt: nowMs }, action: 'release' };
-    }
-    return { st: s, action: null };
-  }
-
-  // EV 闭环步长：按实测主体亮度与目标的误差算下一步补偿（比例控制）
-  //   err  = subjectMean - expTargetMean   （正=还太亮）
-  //   step = clamp(err × expEvGain, ±expMaxStepEv)   （正=要压暗，EV 往下走）
-  //   ev   = clamp(ev - step, expEvMin, 0)
-  // 死区内不动：AE 自身波动 ±几格就微调会让日志爆炸、画面有呼吸感
-  function nextEvStep(curEv, subjectMean, cfg) {
-    var c = Object.assign({}, DEFAULTS, cfg || {});
-    if (subjectMean == null || !isFinite(subjectMean)) return { ev: curEv, step: 0, err: 0 };
-    var err = subjectMean - c.expTargetMean;
-    if (Math.abs(err) < c.expDeadzone) return { ev: curEv, step: 0, err: err };
-    var step = err * c.expEvGain;
-    if (step > c.expMaxStepEv) step = c.expMaxStepEv;
-    if (step < -c.expMaxStepEv) step = -c.expMaxStepEv;
-    var next = curEv - step;
-    if (next < c.expEvMin) next = c.expEvMin; // 下限保护：再暗就逼近黑帧闸门
-    if (next > 0) next = 0;                   // 上限锁 0：本方案只解决过曝，不做正补偿
-    return { ev: next, step: next - curEv, err: err };
-  }
-
-  // sRGB 编码指数（IEC 61966-2-1 的 2.2 幂次近似）：线性光 ×2^ev ↔ 8bit 码值 ×2^(ev/gamma)。
-  // 全模块只有这一处定义，§7.5 的预期降幅与 §7.3 的软件兜底 LUT 必须同源 —— 两套
-  // 「EV 的定义」曾经同时存在（判定照 sRGB 模型、兜底照幂次曲线），后果是
-  // 「判定说该降 27%」与「兜底实际压掉 96%」同时成立（QA DEF-1）
-  var SRGB_GAMMA = 2.2;
-
-  /* ---------- 曝光有效性判定（设计文档 §7.5）：幽灵能力检测 ----------
-   * 现场 2026-10-22：某设备 getCapabilities() 报告 exposureCompensation 有 min/max、
-   * applyConstraints() 也不报错，但 ev 从 0 压到 -2.0 期间主体亮度只在 155~182 噪声
-   * 波动——约束「发出去了」，画面却一点没变。闭环因此永远不达标，只能贴着 expEvMin 空转。
-   * 这类「幽灵能力」没有任何 API 能提前识别，唯一的判据是**实测**：发了补偿，亮度有没有
-   * 按预期方向降。tier2 的 exposureTime 同样可能是幽灵能力（UVC 什么都敢报），所以这套
-   * 判定对 tier1/tier2 通用；tier0 不发约束、只改存档图，不适用。
-   */
-
-  // 判定参数。**刻意不进 DEFAULTS**：DEFAULTS 的 exp* 项与设计文档 §6.2 阈值表一一对应
-  // （QA 按 26 项对拍），新增判定参数另立一表，由 effectCfgOf() 从控制器 cfg 里
-  // 按 expEffect* 名覆盖（单测可注入，现场默认取这里的值）
-  var EXP_EFFECT = {
-    windowMs: 2000,  // 收敛窗口：engage / 换档后先等这么久再判。刚下发模式切换时
-    //   AE 与驱动都在重收敛，此时的亮度变化不能用来判设备能力（防误伤）
-    minSteps: 3,     // 至少下发过这么多次补偿步才判（前两步还混着 AE 收敛）
-    minEv: 1.0,      // 累计补偿至少这么深才判：比这更浅的补偿在 8bit 上只对应几个
-    //   百分点的亮度变化，会被 AE 抖动和衣物微动淹没
-    gamma: SRGB_GAMMA, // 8bit 灰度是 sRGB 编码：线性光 ×2^ev → 码值 ×2^(ev/gamma)
-    ratio: 0.5,      // 实测降幅 ≥ 预期降幅 × 该系数才算有效。留一倍余量吸收 AE 回弹
-    hits: 2          // 连续这么多次「无响应」才判无效。单帧不判：AE 收敛、衣物微动
-    //   都会让单帧亮度偏高，一次误判就会把好设备降成软件兜底
-  };
-
-  // 幽灵记忆的**记账门槛**（QA DEF-5，方案①）：同一设备、同一档位被实测判无效累计到
-  // 这个次数，才把「本设备这条路径无效」记进会话记忆。
-  // 为什么不是 1 次：环境光漂移（QA U4b 实测边界：持续变亮 ≥6 码值/秒）会让好设备被
-  // 误判；单次记账就把「一件衣物的误伤」放大成「整会话不可恢复地失去硬件补偿」，
-  // 而本模块全部设计原则就是「自动恢复」。付一件衣物约 4.3s 的探测窗口是**有界、自愈、
-  // 用户几乎无感**的代价 —— 风险不对称，所以选 2 而不是 1。
-  // 注意：调回 1 会让变异体 M42（记账门槛被放宽）失去判别力。
-  var EXP_GHOST = { minStrikes: 2 };
-
-  // 过压设备（缺陷 2）：tier2 手动曝光路径，设备实际执行时间比请求的更短（时间下限 /
-  // 量化 / 单位解释都可能），导致实际压暗深度超过请求。闭环假设「请求 ev = 实际 ev」线性
-  // 1:1，看到过暗就往回加 ev → bang-bang 振荡，用户看到过暗且循环跳变。每步用实测主体
-  // 亮度反推实际生效 EV，与请求比对，超过容差即记过压设备，并把闭环 ev 下限收紧到
-  // 「实测可达深度」，不再往更深处请求（更深只会被设备再压更深）。
-  var EXP_OVERPRESS = {
-    tol: 0.5,   // 实际比请求深超过 0.5EV 才判（吸收 AE 抖动 / 衣物微动）
-    hits: 2     // 连续 2 次确认，避免单次噪声误判
-  };
-
-  // 画面崩塌守卫（缺陷 3，现场 2026-10-23 复现）：tier2 切 exposureMode:'manual' 时，
-  // 部分设备并不按 getSettings() 上报的 exposureTime 执行。现场实测（HB-HD Camera
-  // eba4:dc26）：continuous 下画面均值 203、上报 exposureTime=39.06，切 manual 后
-  // 同一时间值下画面均值崩到 19（≈-7.5EV），而闭环请求的 ev=0 —— 也就是说崩塌与请求无关。
-  // （同机探针：manual 下 mean≈0.45×exposureTime，625 以上饱和在 151.5；
-  //  即 continuous 的 AE 实际用的时间约 424，上报值 39.06 根本不是它在用的数。）
-  // 崩塌帧的后果是一条死循环：还原系数 = refMean/rawSceneMean 炸到 10 倍以上，
-  // 四道闸整体反转成 subject-too-small → 闭环既不下发补偿（subjectMean 为 null），
-  // 也永远采集不到有效性样本（recordEffectSample 要求 cl.hit）→ 档位永远不被判无效、
-  // 幽灵记忆永远不形成 → 每 3s 反复 engage/release，用户看到的就是「循环跳亮度」。
-  // 判据：帧比「请求补偿深度 + tol」所能解释的更暗，就说明这条路径正在毁画面，
-  // 立刻还原并降 tier0（软件兜底只改存档图，不碰预览）。
-  var EXP_COLLAPSE = {
-    tol: 2.0    // 容许比请求深这么多 EV（吸收过压设备：实测过压约 1.6EV）
-  };
-
-  function numOr(v, dflt) {
-    var n = Number(v);
-    return isFinite(n) ? n : dflt;
-  }
-
-  // 把控制器 cfg 里的 expEffect* 覆盖项并进判定参数表（未覆盖的取 EXP_EFFECT 默认）
-  function effectCfgOf(cfg) {
-    var c = cfg || {};
-    return {
-      windowMs: Math.max(0, numOr(c.expEffectWindowMs, EXP_EFFECT.windowMs)),
-      minSteps: Math.max(1, Math.round(numOr(c.expEffectMinSteps, EXP_EFFECT.minSteps))),
-      minEv: Math.max(0, numOr(c.expEffectMinEv, EXP_EFFECT.minEv)),
-      gamma: numOr(c.expEffectGamma, EXP_EFFECT.gamma) || EXP_EFFECT.gamma,
-      ratio: numOr(c.expEffectRatio, EXP_EFFECT.ratio),
-      hits: Math.max(1, Math.round(numOr(c.expEffectHits, EXP_EFFECT.hits)))
-    };
-  }
-
-  // 预期亮度降幅：线性光 ×2^ev → 8bit 码值 ×2^(ev/gamma)。ev=-1 → 码值 ×0.73（降 27%）
-  function expectedDropRatio(ev, gamma) {
-    var g = numOr(gamma, EXP_EFFECT.gamma);
-    if (!(g > 0)) g = EXP_EFFECT.gamma;
-    var v = ev < 0 ? ev : 0; // 本方案不做正补偿，正 EV 不产生降幅预期
-    return 1 - Math.pow(2, v / g);
-  }
-
-  /**
-   * 曝光有效性判定（纯函数，Node 可单测）：这台设备的曝光能力是不是幽灵能力。
-   *
-   * @param {object} obs { baseline:number, samples:Array<{ev:number,mean:number,t:number,pinned?:boolean}>,
-   *                        startedAt:number }
-   *   baseline  本档位开始时的主体亮度（判定的参照点）
-   *   samples   每次下发补偿后测到的稳态主体亮度（ev 为**实际下发**的值）
-   *   startedAt 本档位开始时刻（收敛窗口闸门的起点）
-   * @param {object} [cfg] 可含 expEffect* 覆盖项
-   * @returns {{verdict:string, reason:string, dropRatio:?number, needDrop:?number,
-   *            expectedDrop:?number, streak:number, candidates:number}}
-   *   verdict: 'effective'（确实在压暗） / 'ineffective'（幽灵能力） / 'pending'（证据不足）
-   */
-  function judgeExposureEffect(obs, cfg) {
-    var e = effectCfgOf(cfg);
-    var o = obs || {};
-    var out = {
-      verdict: 'pending', reason: 'no-baseline', dropRatio: null, needDrop: null,
-      expectedDrop: null, streak: 0, candidates: 0
-    };
-    var baseline = Number(o.baseline);
-    if (!isFinite(baseline) || baseline <= 0) return out;
-    var samples = o.samples || [];
-    var startedAt = Number(o.startedAt);
-    if (!isFinite(startedAt)) startedAt = null;
-    var streak = 0;
-    var considered = 0;
-    var last = null;
-    for (var i = 0; i < samples.length; i++) {
-      var s = samples[i];
-      if (!s) continue;
-      var mean = Number(s.mean);
-      var ev = Number(s.ev);
-      if (!isFinite(mean) || !isFinite(ev)) continue;
-      // ① 步数门槛：前两步测的还混着 AE 收敛，没有判别力
-      if (i < e.minSteps - 1) continue;
-      // ② 深度门槛：补偿太浅时预期降幅落在噪声里。例外是「已经压不动了」
-      //    （pinned：贴住 EV 下限或设备把值钳死），那正是现场空转的形态，必须判
-      if (Math.abs(ev) < e.minEv && !s.pinned) continue;
-      // ③ 收敛窗口：刚 engage / 刚换档时 AE 与驱动都在重收敛，此时判会误伤好设备
-      if (startedAt != null && isFinite(Number(s.t)) && Number(s.t) - startedAt < e.windowMs) continue;
-      considered++;
-      var expected = expectedDropRatio(ev, e.gamma);
-      var need = expected * e.ratio;
-      var drop = (baseline - mean) / baseline;
-      last = { dropRatio: drop, needDrop: need, expectedDrop: expected };
-      // 滞回：连续 e.hits 次不达标才算无效，任何一次达标即清零（防单帧噪声误伤）
-      if (drop < need) streak++; else streak = 0;
-    }
-    out.candidates = considered;
-    out.streak = streak;
-    if (last) {
-      out.dropRatio = last.dropRatio;
-      out.needDrop = last.needDrop;
-      out.expectedDrop = last.expectedDrop;
-    }
-    if (considered === 0) { out.reason = 'need-steps'; return out; }
-    if (streak >= e.hits) { out.verdict = 'ineffective'; out.reason = 'no-response'; return out; }
-    if (streak === 0) { out.verdict = 'effective'; out.reason = 'responded'; return out; }
-    out.reason = 'hysteresis';
-    return out;
-  }
-
-  // 档位身份判定（纯函数，全模块唯一来源）。
-  // tier 可能是数字（0=软件兜底 / 1=曝光补偿 / 2=手动曝光）或字符串（'brightness'=原生亮度）。
-  // 为什么需要它：`tier > 0` 这类数值比较对字符串档恒为 false（'brightness' > 0 === false），
-  // 凡是用它判断「是不是硬件档 / 是不是数字档」的地方，字符串档都会被静默误判成 tier0 ——
-  // 后果是幽灵打击记不进记忆、降级链断裂、零调整安全网失效。
-  // 排名语义：0 = 软件兜底（底），1 = 硬件档（可压暗），2 = 手动档（最重）。
-  // brightness 排在 1 与 2 之间：它比手动曝光轻、不切曝光模式、不会触发帧崩塌。
-  function tierRank(tier) {
-    if (tier === 1) return 1;
-    if (tier === 'brightness') return 1;
-    if (tier === 2) return 2;
-    return 0;
-  }
-
-  // 幽灵记忆的档位键归一化（纯函数，全模块唯一来源）：把 tier 值映射成记忆表里
-  // 唯一且稳定的键。tier 可能是数字（0/1/2）或字符串（'brightness'），直接当
-  // 对象键用会出两类问题：
-  //   ① 数字 1 与字符串 '1' 撞车；
-  //   ② `tier > 0` 这类数值比较对字符串恒为 false（'brightness' > 0 === false），
-  //      凡是用它当「是否为硬件档」的判据，字符串档都会被误判成 tier0。
-  // 统一走这里之后，档位语义（是否为硬件档）与键的取法彻底分离。
-  // 与 tierRank 并列放在模块级：两者都是「档位身份」的唯一判定源，
-  // 放闭包里就只能被内部调用，外部无法独立验证。
-  function expGhostKey(tier) {
-    if (tier === 1) return 't1';
-    if (tier === 2) return 't2';
-    if (tier === 'brightness') return 's:brightness';
-    return '';
-  }
-
-  // 崩塌守卫的「适用档位」判定（纯函数，模块级唯一来源）。
-  // 崩塌判据是 EV 模型（floor = 参照 × 2^(-深度/γ)），这套模型只在「压暗量能用 EV
-  // 线性外推」的档位成立：tier1 曝光补偿、tier2 手动曝光。所以准入 = 数字硬件档 1 与 2。
-  //
-  // 明确排除字符串档 'brightness'，且**不能**用 tierRank 来判：tierRank('brightness')===1
-  // 与 tier1 同秩，分不开。它是 ISP 黑电平偏移，不切曝光模式、不存在「请求的时间没被执行」
-  // 这条失效路径；且实际压暗深度与 EV 非线性，用 EV 模型算它的崩塌下限会得出错误的 floor
-  // → 正常帧被误判成崩塌 → 白白降级到 tier0，亮度档一点没用上。
-  //
-  // 也不能只写 `tier > 0`：那是靠 'brightness' > 0 === false 的隐式类型转换侥幸为 false，
-  // 一旦有人「顺手统一成 tierRank(...) > 0」就翻车（亮度档被 EV 模型接管）。
-  // 与 tierRank/expGhostKey 并列放在模块级：档位语义只在这里定义一次，外部可独立断言。
-  function collapseGuardApplies(tier) {
-    return tier === 1 || tier === 2;
-  }
-
-  // 能力探测 → 三档降级路径（设计文档 §7.1）。摄像头能力差异极大，
-  // 且部分 UVC 的 getCapabilities() 直接抛异常，调用方必须包 try
-  function pickExposurePlan(cap, settings) {
-    if (!cap || typeof cap !== 'object') return { tier: 0, reason: 'no-capabilities' };
-    // min < 0 才可能压暗：UVC 设备报 exposureCompensation:{min:0,max:15} 表示「只能提亮」。
-    // 这类设备上 buildExposureConstraints 会把任何负 ev 钳回 0 —— 约束发出去、画面一点不变，
-    // 正是幽灵能力的形态（现场 HB-HD Camera eba4:dc26 实测：闭环把 ev 推到 -3，
-    // subjectMean 全程在 116~175 噪声带内不动）。min>=0 时直接不走这条路径，
-    // 不让每一件衣物都白付 4.3s 探测窗口；功能上与旧的「钳到 0」完全一致，只是不装看不出来。
-    if (cap.exposureCompensation && typeof cap.exposureCompensation.min === 'number' &&
-        cap.exposureCompensation.min < 0) {
-      return {
-        tier: 1,
-        reason: 'exposure-compensation',
-        min: cap.exposureCompensation.min,
-        max: typeof cap.exposureCompensation.max === 'number' ? cap.exposureCompensation.max : 0,
-        step: cap.exposureCompensation.step || 0
-      };
-    }
-    // 亮度参数档（用户 2026-10-24 现场要求「软件应该调整的是亮度而不是压暗」）：
-    // 相机原生 brightness 是 ISP 黑电平/亮度偏移控制，下压即整体变暗，且预览与成片同源
-    // （无需任何后期 LUT，也没有 SVG 滤镜套 <video> 的白屏风险）。比 tier2(manual) 轻、
-    // 不会触发帧崩塌，故排在 manual 之前。
-    if (cap.brightness && typeof cap.brightness.min === 'number' &&
-        typeof cap.brightness.max === 'number' && cap.brightness.max > cap.brightness.min) {
-      var bBase = (settings && typeof settings.brightness === 'number')
-        ? settings.brightness
-        : (cap.brightness.min + cap.brightness.max) / 2;
-      return {
-        tier: 'brightness',
-        reason: 'brightness',
-        min: cap.brightness.min,
-        max: cap.brightness.max,
-        step: cap.brightness.step || 0,
-        base: bBase
-      };
-    }
-    var modes = cap.exposureMode || [];
-    if (modes.indexOf('manual') >= 0 && (cap.exposureTime || cap.iso)) {
-      // 只有 min 才能定下「压到哪」。设备只报 exposureTime.max（无 min）又无 iso 能力时，
-      // buildExposureConstraints 会退化成「切了 manual 却不发任何曝光值」——画面根本
-      // 不会被压暗，但渲染层徽标仍显示「曝光补偿 xEV」，用户看到的反馈与事实不符。
-      // 这类能力残缺的设备一律降级 tier0（软件兜底，徽标如实显示「软件压暗」）。
-      // 注意别误伤「有 min 无 max」的正常设备：那种由下面的 1e9 兜底覆盖，仍算 tier2
-      var timeMin = cap.exposureTime && typeof cap.exposureTime.min === 'number' ? cap.exposureTime.min : null;
-      var isoMin = cap.iso && typeof cap.iso.min === 'number' ? cap.iso.min : null;
-      if (timeMin == null && isoMin == null) return { tier: 0, reason: 'manual-without-min' };
-      return {
-        tier: 2,
-        reason: 'manual-exposure',
-        baseTime: settings && settings.exposureTime ? settings.exposureTime : null,
-        baseIso: settings && settings.iso ? settings.iso : null,
-        timeMin: timeMin,
-        timeMax: cap.exposureTime && typeof cap.exposureTime.max === 'number' ? cap.exposureTime.max : 1e9,
-        isoMin: isoMin,
-        isoMax: cap.iso && typeof cap.iso.max === 'number' ? cap.iso.max : 1e9,
-        restoreMode: modes.indexOf('continuous') >= 0 ? 'continuous' : 'manual-baseline'
-      };
-    }
-    return { tier: 0, reason: 'unsupported' };
-  }
-
-  // 按档位构造曝光约束。红线：绝不夹带 width/height/frameRate ——
-  // 曝光调整碰分辨率键会破坏 applyMaxResolution 的锁定（项目纪律）
-  //
-  // cfg：可选。brightness 档要把 EV 深度换算成 brightness 码值，需要「EV 下限」
-  // 作为满量程参照（与闭环用同一个常量，否则映射与实际下发深度对不上）。
-  // 本函数是模块级纯函数、拿不到控制器闭包里的 cfg，故由调用方显式传入；
-  // 不传时退回 DEFAULTS.expEvMin（与 nextEvStep/solveTier0Ev 的取值约定一致）。
-  function buildExposureConstraints(plan, ev, cfg) {
-    if (!plan || plan.tier === 0) return null;
-    if (plan.tier === 1) {
-      var v = ev;
-      // 按设备步长取整：部分 UVC 对非步长整数倍的补偿直接拒绝。
-      // isFinite 守卫不可省：有设备把 step 报成 Infinity，而
-      // Math.round(ev / Infinity) * Infinity === NaN —— NaN 会一路送进
-      // applyConstraints（被静默忽略或直接 reject），那样负补偿等于没发。
-      // 步长不可用时原样透传 ev（绝大多数设备本身就接受任意小数）
-      if (plan.step > 0 && isFinite(plan.step)) v = Math.round(ev / plan.step) * plan.step;
-      if (v < plan.min) v = plan.min;
-      if (v > plan.max) v = plan.max;
-      return { advanced: [{ exposureMode: 'continuous', exposureCompensation: v }] };
-    }
-    // 亮度参数档：ISP 黑电平偏移，下压即变暗（与 EV 非严格幂关系，线性近似）。
-    // BRIGHT_DROP_K 留 ISP 余量，满压暗也只吃「可用下行空间」的 70%，避免压到极值
-    // 出现色偏/噪声。
-    if (plan.tier === 'brightness') {
-      var bCfg = Object.assign({}, DEFAULTS, cfg || {});
-      var bSpan = plan.max - plan.min;
-      if (!(bSpan > 0)) return null;
-      var bBase = (typeof plan.base === 'number') ? plan.base : plan.max;
-      // 压暗只能往下走：可用下行空间 = base − min，**不是** span = max − min。
-      // 用 span 算会在基线位于量程中点时算出一个超过实际可用空间的 drop，
-      // 结果码值直接撞 min 钳位 —— 于是「吃 70% 量程」实际变成「吃满到底」，
-      // ISP 余量被吃掉，压到极值出现色偏/噪声。真实设备基线多在中点附近（默认 128/255），
-      // 这条路径是常态而非边缘情况。
-      var bRoom = bBase - plan.min;
-      if (!(bRoom > 0)) return null;      // 基线已在量程底部，无处可压
-      // 满量程参照用「EV 下限」：闭环最深只会请求到 expEvMin，用它做分母才能保证
-      // 「请求到最深 EV」恰好对应「吃满 70% 可用空间」，两者不会脱节。
-      var evFloor = Math.abs(numOr(bCfg.expEvMin, DEFAULTS.expEvMin));
-      if (!(evFloor > 0)) evFloor = 1;
-      var bFrac = (ev < 0) ? Math.min(1, -ev / evFloor) : 0;
-      var bDrop = bFrac * bRoom * BRIGHT_DROP_K;
-      var bVal = bBase - bDrop;
-      if (plan.step > 0 && isFinite(plan.step)) bVal = Math.round(bVal / plan.step) * plan.step;
-      if (bVal < plan.min) bVal = plan.min;
-      if (bVal > plan.max) bVal = plan.max;
-      return { advanced: [{ brightness: bVal }] };
-    }
-    // tier2 手动档：EV 负补偿 = 曝光时间 ×2^ev；优先压时间不升 iso
-    // （升 iso 只加噪点不救过曝，时间才是曝光量的主轴）
-    var adv2 = { exposureMode: 'manual' };
-    if (plan.baseTime && plan.timeMin != null) {
-      var t = plan.baseTime * Math.pow(2, ev);
-      if (t < plan.timeMin) t = plan.timeMin;
-      if (t > plan.timeMax) t = plan.timeMax;
-      adv2.exposureTime = t;
-    } else if (plan.baseIso && plan.isoMin != null) {
-      var iso = plan.baseIso * Math.pow(2, ev);
-      if (iso < plan.isoMin) iso = plan.isoMin;
-      if (iso > plan.isoMax) iso = plan.isoMax;
-      adv2.iso = iso;
-    }
-    // 不变式：产不出具体曝光值就绝不发 manual 约束。
-    // 上游 pickExposurePlan 只守住了「能力里没有 min」，守不住「能力有 min 但
-    // getSettings() 不给基线」这种组合（baseTime / baseIso 为 null）——那类设备
-    // 会被切进手动模式却拿不到曝光量，画面根本不会变暗，而渲染层徽标仍显示
-    // 「曝光补偿 xEV」，属于用户可见的撒谎。把守点下沉到构造函数末尾，任何
-    // 上游判定遗漏的组合在这里都会被封死。
-    if (adv2.exposureTime === undefined && adv2.iso === undefined) return null;
-    return { advanced: [adv2] };
-  }
-
-  // 恢复约束：最小约束原则（只发必须发的键）—— 多发一个键就多一次
-  // Overconstrained / 悬挂风险。tier1 只把补偿归零；tier2 切回 continuous
-  // 把曝光交还 AE（切回连续后 time/iso 约束自动失效，无需逐个还原）
-  function buildExposureRestoreConstraints(plan) {
-    if (!plan || plan.tier === 0) return null;
-    if (plan.tier === 1) return { advanced: [{ exposureCompensation: 0 }] };
-    if (plan.tier === 'brightness') return { advanced: [{ brightness: (typeof plan.base === 'number' ? plan.base : plan.max) }] };
-    if (plan.restoreMode === 'continuous') return { advanced: [{ exposureMode: 'continuous' }] };
-    var adv = { exposureMode: 'manual' };
-    if (plan.baseTime) adv.exposureTime = plan.baseTime;
-    if (plan.baseIso) adv.iso = plan.baseIso;
-    return { advanced: [adv] };
-  }
-
-  // 实际下发到设备的补偿量（EV）。闭环算出的 ev 会被设备步长取整、min/max 钳位，
-  // 真正下发的值可能更浅（例如设备 min=-0.5，闭环要 -2.0 也只能发 -0.5）。
-  // 有效性判定必须拿「真的发下去的值」算预期降幅，否则会高估预期、误判好设备
-  function appliedEvOf(plan, ev, cst) {
-    if (!cst || !cst.advanced || !cst.advanced[0]) return ev;
-    var a = cst.advanced[0];
-    if (!plan || plan.tier === 'brightness') return ev;
-    if (!plan || plan.tier === 1) {
-      return typeof a.exposureCompensation === 'number' ? a.exposureCompensation : ev;
-    }
-    if (plan.tier === 2 && typeof a.exposureTime === 'number' && plan.baseTime > 0) {
-      return Math.log(a.exposureTime / plan.baseTime) / Math.LN2;
-    }
-    if (plan.tier === 2 && typeof a.iso === 'number' && plan.baseIso > 0) {
-      return Math.log(a.iso / plan.baseIso) / Math.LN2;
-    }
-    return ev;
-  }
-
-  /**
-   * 有效性判定失败后的档位降级（纯函数）：tier1 → brightness → tier2 → tier0，一路只往下走。
-   * tier1 的 exposureCompensation 是幽灵能力时，把该能力从 cap 里摘掉再探测，
-   * 让 pickExposurePlan 有机会落到 brightness / manual 路径；manual 同样无效就只剩软件兜底。
-   *
-   * 档位比较不能用 `tier > 0`：字符串档（'brightness'）与 0 比较恒为 false，
-   * 会被误判成 tier0 而直接掉到软件兜底，降级链就断了。统一用 tierRank 判档位身份。
-   *
-   * banned：可选，累积「已判无效的能力键」集合。必须**跨调用累积**而不是每次只摘当前档：
-   * 只摘当前档的话，tier1 被判无效 → 探测到 brightness → brightness 也被判无效 →
-   * 摘掉 brightness 后重新探测，exposureCompensation 又回来了 → 选回刚被判无效的 tier1，
-   * 降级链原地打转（每次都重新走一遍已知无效的档）。累积 banned 后探测空间单调收缩，
-   * 链必然收敛到 tier2 或 tier0。
-   *
-   * @param {object} plan 当前档位（pickExposurePlan 的产物）
-   * @param {object} cap track.getCapabilities()
-   * @param {object} settings track.getSettings()
-   * @param {object} [banned] 已失效能力键的累积集合（形如 {exposureCompensation:true}）
-   * @returns {{tier:number|string, reason:string, plan:(object|null)}}
-   */
-  function demoteExposurePlan(plan, cap, settings, banned) {
-    var tier = plan ? plan.tier : 0;
-    var rank = tierRank(tier);
-    // 手动档（tier2）是硬件链的最后一环，再降只能落软件兜底
-    if (rank === 2) return { tier: 0, reason: 'manual-ineffective', plan: null, banned: banned || {} };
-    if (rank !== 1) return { tier: 0, reason: 'unsupported', plan: null, banned: banned || {} };
-    // 把「刚被判无效」的那个能力从 cap 里摘掉再探测：它可能只是「报告有、实际无效」。
-    // 不摘的话重新探测会选回同一个刚被判无效的档位，降级原地打转。
-    var ban = {};
-    var bk;
-    if (banned && typeof banned === 'object') {
-      for (bk in banned) {
-        if (Object.prototype.hasOwnProperty.call(banned, bk)) ban[bk] = true;
-      }
-    }
-    ban[(tier === 'brightness') ? 'brightness' : 'exposureCompensation'] = true;
-    var cap2 = {};
-    var k;
-    if (cap && typeof cap === 'object') {
-      for (k in cap) {
-        if (Object.prototype.hasOwnProperty.call(cap, k) && !ban[k]) cap2[k] = cap[k];
-      }
-    }
-    var next = pickExposurePlan(cap2, settings);
-    // 只有真能产出曝光值的下一档才值得切：构造不出曝光值等于「切了却不压暗」，
-    // 与幽灵能力是同一个用户可见后果（徽标说在压暗、画面其实没压）
-    if (tierRank(next.tier) === 0) return { tier: 0, reason: 'comp-ineffective', plan: null, banned: ban };
-    if (!buildExposureConstraints(next, -EXP_EFFECT.minEv)) {
-      return { tier: 0, reason: 'comp-ineffective', plan: null, banned: ban };
-    }
-    return { tier: next.tier, reason: 'comp-ineffective', plan: next, banned: ban };
-  }
-
-  // 软件兜底查找表：out = in × 2^(ev/gamma)（与 §7.5 判定同源的 sRGB 模型）
-  //
-  // 勘误 2026-10（QA DEF-1）：原实现 out = 255×(in/255)^(2^-ev) 是在**码值域做幂运算**，
-  // 等价于把线性光取幂 L → L^(2^-ev)，而不是曝光补偿应有的 L → L×2^ev。实测 ev=-3
-  // （tier0 闭环顶到 expEvMin 后的真实取值）：黑衣物主体 150 → 4（近全黑，而非目标 58）、
-  // 被裁剪的白色鞋底 255 → 255（永远救不回来，正是现场投诉的那一项）、褶皱暗部
-  // 20~60 全部抹成 0。越深的补偿偏差越大（-1EV→等效 -2.19EV、-3EV→等效 -12EV）。
-  // 正确做法与硬件补偿同源：线性光 ×2^ev → 码值 ×2^(ev/gamma)，码值域就是一次乘法。
-    // 「gamma 曲线保住暗部层次」的原始理由也随之更正 —— 真正在保层次的是等比例压暗
-    // （暗部按比例一起降、相对关系不变），幂次曲线恰恰是把暗部压死的那个。
-    // 注：expTargetMean 已于 2026-10-23 现场标定为 105（原值 58，见 DEFAULTS 处注释），
-    // 本段中的「目标 58」「ev=-3 真实取值」均为当时实测，作为勘误史实保留原样。
-  // tier0 软件兜底 LUT：保高光色调曲线（2026-10-24 修复「白板被压成灰」）
-  // 中间调/暗部按 k = 2^(ev/gamma) 均匀压暗，与 §7.5 判定同源（主体曝光校正不变）；
-  // 顶部已削顶的高光（码值 ≥ whiteStart）走肩线压缩到 whiteOut，避免白垫板被压成
-  // 均匀灰平台——对洗衣店而言白板变灰 = 看着像脏了，比过曝更糟。
-  // 约束：whiteStart ≤ whiteOut 保证整条曲线对任意 ev∈[expEvMin,0] 单调不减。
-  var EXP_LUT = { whiteStart: 200, whiteOut: 238 };
-  // 亮度参数档 EV→brightness 映射系数（2026-10-24）：满压暗只吃量程的 70%，给 ISP 留余量。
-  // 真机校准：下压后实测主体均值仍过亮则调大，压到色偏/噪声则调小。
-  var BRIGHT_DROP_K = 0.7;
-  function buildExposureLut(ev) {
-    var lut = new Uint8ClampedArray(256);
-    var v = Number(ev);
-    // ev ≥ 0 / 非数 → 恒等（本方案不做提亮）；Uint8ClampedArray 自身会夹 [0,255]
-    if (!isFinite(v) || v >= 0) {
-      for (var i0 = 0; i0 < 256; i0++) lut[i0] = i0;
-      return lut;
-    }
-    var k = Math.pow(2, v / SRGB_GAMMA);
-    var ws = EXP_LUT.whiteStart, wo = EXP_LUT.whiteOut;
-    var loYs = ws * k;                 // 肩部下端点，与线性区在 ws 处连续
-    var span = 255 - ws;
-    for (var i = 0; i < 256; i++) {
-      if (i <= ws) {
-        lut[i] = Math.round(i * k);
-      } else {
-        // 肩部：从 loYs 线性过渡到 whiteOut，保住高光白度（白板仍是白）
-        var t = (i - ws) / span;
-        lut[i] = Math.round(loYs + t * (wo - loYs));
-      }
-    }
-    return lut;
-  }
-
-  // tier0（软件兜底）的 EV 解析解：code × 2^(ev/gamma) = expTargetMean
-  //   →  ev = clamp(gamma × log2(expTargetMean / subjectMean), expEvMin, 0)
-  // 为什么 tier0 不能继续用 nextEvStep 的闭环：tier0 只改存档图、不改预览，闭环读到的
-  // subjectMean 永远是「没被压暗的原图」，误差恒为正 → EV 一路撞到 expEvMin。实测
-  // 主体 100 只需 -1.73EV 却取了 -3.00EV（存档被过压 1.27 档），主体 130 只需 -2.56EV。
-  // 解析解一步到位，且不会把存档压到目标以下。
-  function solveTier0Ev(subjectMean, cfg) {
-    var c = Object.assign({}, DEFAULTS, cfg || {});
-    var mean = Number(subjectMean);
-    var target = Number(c.expTargetMean);
-    if (!isFinite(mean) || mean <= 0 || !isFinite(target) || target <= 0) return null;
-    var ev = SRGB_GAMMA * (Math.log(target / mean) / Math.LN2);
-    if (ev > 0) ev = 0;                 // 比目标更暗：不提亮（欠曝交给现场补光）
-    if (ev < c.expEvMin) ev = c.expEvMin;
-    return ev;
-  }
-
-  // 错误分类：fatal=true 表示不可重试（权限/无设备/安全上下文）
   function classifyError(e) {
     var name = (e && e.name) || 'Error';
     var message = (e && e.message) || '';
@@ -1112,13 +429,11 @@
     // 未注入时（Node 单测 / 无痕模式）一律 no-op，退化为「每次全量枚举」
     var loadPref = typeof opt.loadResolutionPref === 'function' ? opt.loadResolutionPref : null;
     var savePref = typeof opt.saveResolutionPref === 'function' ? opt.saveResolutionPref : null;
-    // 曝光辅助的 4 个注入（黑色衣物过曝防护）。与 blackFrameEnabled 同一模式：
-    // 控制器是纯逻辑模块，不碰 DOM、不读 document、不读 localStorage。
-    // 未注入时一律按「不拦 / 不启用」处理，既有调用方不受任何影响
-    var gridSampler = typeof opt.gridSampler === 'function' ? opt.gridSampler : null;
-    var pageVisible = typeof opt.pageVisible === 'function' ? opt.pageVisible : null;
-    var focusBusy = typeof opt.focusBusy === 'function' ? opt.focusBusy : null;
-    var exposureAssistEnabled = typeof opt.exposureAssistEnabled === 'function' ? opt.exposureAssistEnabled : null;
+    // 摄像头原生亮度（brightness）记忆的注入点：与分辨率记忆同一模式，
+    // 控制器是纯逻辑模块，不碰 DOM、不读 localStorage。未注入时（Node 单测 / 无痕模式）
+    // 一律 no-op，退化为「每次开流都用设备自身默认亮度」
+    var loadBrightnessPref = typeof opt.loadBrightnessPref === 'function' ? opt.loadBrightnessPref : null;
+    var saveBrightnessPref = typeof opt.saveBrightnessPref === 'function' ? opt.saveBrightnessPref : null;
 
     var alive = false;
     var state = STATES.UNINIT;
@@ -1143,8 +458,12 @@
     var waiters = [];
     var trackBinds = [];
     var deviceBound = false;
+    // 摄像头原生亮度（brightness）状态：能力 / 当前生效值 / 来源（设备覆盖 | 全局默认 | 设备自身默认）
+    var brightnessCap = { supported: false, min: 0, max: 0, step: 1 };
+    var brightnessEffective = 0;
+    var brightnessSource = 'native';
 
-    var listeners = { state: [], error: [], devices: [], exposure: [] };
+    var listeners = { state: [], error: [], devices: [] };
 
     function on(name, cb) {
       if (typeof cb !== 'function') return function () {};
@@ -1249,7 +568,6 @@
         try { ct(ts[j]); } catch (e2) {}
       }
       clearDegradedWatch();
-      clearExposureWatch();
     }
 
     function clearDegradedWatch() {
@@ -1310,10 +628,6 @@
 
     // I1：唯一的「停止当前活跃流」入口
     function releaseActive(reason) {
-      // 曝光恢复必须赶在 stream=null（activeTrack 会失效）与 track.stop() 之前点火：
-      // 流一停，设备上的负补偿就再也还回不去了。best-effort、不 await、失败只留痕
-      if (expAssist.state === 'ACTIVE' && expAssist.dirty) restoreExposure('release');
-      stopExposureAssist('release', false);
       var s = stream;
       stream = null;
       openPromise = null;
@@ -1419,9 +733,6 @@
         clearDegradedWatch();
         setState(STATES.LIVE, 'unmuted');
         log('info', 'CAM_LIVE', { seq: seq, device: shortDeviceId(preferredId), res: resField(), reason: 'unmuted', flap: flapCount });
-        // 同一 track 复活：曝光辅助重启（内部先尽力恢复上一会话的补偿
-        // 再归零，否则设备停在降曝态而内部状态已重置，两边会对不上）
-        startExposureAssist(mySeq);
       } else {
         startDegradedWatch(mySeq);
       }
@@ -1445,791 +756,6 @@
         reconnect('muted');
       }, cfg.degradedWatchMs);
       timers.push(degradedTimer);
-    }
-
-    /* ---------- 曝光辅助：黑色衣物过曝防护（设计文档 docs/exposure-assist-design.md）----------
-     * 自包含闭环：检测（纯函数）→ 滞回决策 → 执行（applyConstraints 竞速）→ 恢复。
-     * 不碰 DOM、不碰 localStorage；帧数据经注入的 gridSampler 取得。
-     * 三态：OFF（禁用/无采样器）/ IDLE（在测未命中）/ ACTIVE（已介入）。
-     * 所有对外副作用（日志、约束下发）都被包在里面，任何异常都不得影响预览与拍照主链。
-     */
-    var expAssist = {
-      state: 'OFF',      // OFF（禁用/无采样器）/ IDLE / ACTIVE
-      st: { state: 'IDLE', hit: 0, miss: 0, engagedAt: 0, releasedAt: 0 },
-      ev: 0,
-      tier: 0,
-      plan: null,
-      dirty: false,      // 本会话是否真的改过设备曝光（决定要不要恢复）
-      lastSceneMean: null,
-      lastSubjectMean: null,
-      lastSubjectRatio: null,
-      // 缺陷 1：engage 时（ev=0、整帧中性）捕获的「中性场景均值」，作为判定闸门的还原参照。
-      // ACTIVE 后每帧按「当前场景均值 / 中性场景均值」这一由整帧实测得出的压暗系数 f 还原回
-      // 中性刻度（亮垫板→210、黑衣物→150）。用场景均值之比而非请求/实测 EV：该比值恰为 1/f、
-      // 天然含过压带来的额外压暗、且无帧滞后；对帧不随补偿变暗的静态/幽灵设备 f≈1 → 不还原
-      // → 与旧实现完全一致，不会漂移到 185 以上误判失格。
-      expRefMean: 0,
-      // 缺陷 3：画面崩塌守卫的中性参照 —— 当前档位**接手前**那一帧的原始场景均值。
-      // 与 expRefMean 分开存：expRefMean 服务闸门还原（跨档位不更新，保持中性刻度），
-      // 而这个参照每次换档都要更新（tier1 压暗过的画面才是 tier2 的「中性」），
-      // 否则会把上一档合法压暗的帧误判成崩塌
-      preApplyMean: 0,
-      adjusts: 0,
-      fails: 0,
-      lastApplyAt: 0,
-      // 有效性判定（幽灵能力检测，§7.5）：本档位开始时的主体亮度 + 每次下发后的
-      // 实测响应序列。effBaseline 为 null 时由第一个样本补上（换档后画面基准变了）
-      effBaseline: null,
-      effSamples: [],
-      effAt: 0,
-      demotions: 0,
-      lastAppliedEv: 0,   // 上一次**请求**下发到设备的补偿量（EV，幽灵能力判定用）
-      prevAppliedEv: 0,   // 上上一次，用于识别「已经压不动了（pinned）」
-      // 缺陷 2：过压设备。overPress = 请求 EV − 实际 EV（>0 表示过压）；
-      // evFloor 把闭环 ev 下限收紧到实测可达深度，避免往「只会被设备再压更深」处请求。
-      // actualEv 是实测反推的实际生效 EV（徽标与过压判定用，比请求值诚实）
-      overPress: 0,
-      overPressStreak: 0,
-      evFloor: -3.0,
-      actualEv: 0
-    };
-    var expWatch = null;
-
-    // 会话级「幽灵能力」记忆（QA 观察项 U19）：本设备哪个档位已被实测判过无效。
-    // 为什么需要：降级结论原先只在单次 engage 内有效，release 后重新 engage 会重新探测
-    // tier1 —— 幽灵设备每放一件衣物都要重走一次约 4s 的「徽标显示 -xEV、画面其实没压暗」
-    // 窗口，那正是现场投诉的形态。能力是**设备**的属性而不是流的属性，所以按 deviceId
-    // 记在会话里；换设备即失效（engageAssist 每次比对 deviceId）。
-    // 注意：只有「实测无效」才记账，apply 失败/超时不记 —— 那可能是设备忙，不是能力无效
-    var expGhost = { dev: '', tiers: {} };
-    // 拿不到任何设备标识时的兜底发号器：见 devIdOf() 注释（QA DEF-4）
-    var ghostUidSeq = 0;
-
-    // 幽灵记忆的档位键归一化：见模块级 expGhostKey（与 tierRank 同为档位身份的唯一来源）
-
-    function expGhostBlocked(tier) {
-      var key = expGhostKey(tier);
-      if (!key) return false;
-      return (expGhost.tiers[key] || 0) >= EXP_GHOST.minStrikes;
-    }
-
-    // 当前 track 的设备标识：幽灵记忆按设备记，不能串档（QA DEF-4）。
-    // 为什么不能「拿不到就返回空串」：两台都不上报 deviceId 的设备会落进同一个空串槽，
-    // `devId !== expGhost.dev` 恒为假 → 记忆永不清空 → 好设备被上一台幽灵设备的记录
-    // 挡在硬件补偿之外（实测：B 机全程 0 条补偿约束、直接 tier0）。兜底链按
-    // deviceId → track.id（浏览器给每条 track 的唯一串）→ track.label（设备名）→
-    // track 实例号；换设备必然换 track 对象，实例号因此能把两台设备分开。
-    function devIdOf() {
-      var t = activeTrack();
-      if (!t) return '';
-      var id = '';
-      try {
-        var s = typeof t.getSettings === 'function' ? t.getSettings() : null;
-        if (s && s.deviceId) id = String(s.deviceId);
-      } catch (e) { id = ''; }
-      if (!id) { try { if (t.id) id = String(t.id); } catch (e1) { id = ''; } }
-      if (!id) { try { if (t.label) id = String(t.label); } catch (e2) { id = ''; } }
-      if (!id) {
-        try {
-          if (t.__expUid == null) t.__expUid = 'track#' + (++ghostUidSeq);
-          id = String(t.__expUid);
-        } catch (e3) { id = ''; }
-      }
-      return id;
-    }
-
-    // 记一次「实测无效」，返回该档位在本设备上累计被判无效的次数（供日志回看第几次）。
-    // 计数跟着 devId 走：换设备时连计数一起清空 —— 换了一台机器，上一台还差一次才达
-    // 门槛的证据不该被继承（否则 A 机 1 次 + B 机 1 次就凑成 2 次，误伤新设备）
-    //
-    // 档位键：数字档用 '1'/'2'，字符串档（'brightness'）用 's:brightness'。
-    // 为什么不能直接用 tier 值当键：数字 1 与字符串 '1' 在对象键上会撞车，
-    // 而 tier>0 这类数值比较对字符串档恒为 false（'brightness' > 0 === false），
-    // 用它做判断会让字符串档既记不进记忆也读不出记忆。
-    function expGhostRemember(tier, devId) {
-      var key = expGhostKey(tier);
-      if (!key) return 0;
-      var d = typeof devId === 'string' ? devId : '';
-      if (d !== expGhost.dev) { expGhost.dev = d; expGhost.tiers = {}; }
-      var n = (expGhost.tiers[key] || 0) + 1;
-      expGhost.tiers[key] = n;
-      return n;
-    }
-
-    function expEnabled() {
-      if (!gridSampler) return false;
-      try { return exposureAssistEnabled() !== false; } catch (e) { return false; }
-    }
-
-    // LIVE 后启动。内部先 stopExposureAssist('restart', true)：DEGRADED→LIVE
-    // 复活时同一 track 上可能还挂着上一会话的负补偿，必须先尽力恢复再归零，
-    // 否则设备停在降曝态而内部状态已重置，两边会对不上
-    function startExposureAssist(mySeq) {
-      stopExposureAssist('restart', true);
-      if (!expEnabled()) return;
-      expAssist.state = 'IDLE';
-      expAssist.st = { state: 'IDLE', hit: 0, miss: 0, engagedAt: 0, releasedAt: 0 };
-      expAssist.ev = 0;
-      expAssist.tier = 0;
-      expAssist.plan = null;
-      expAssist.dirty = false;
-      expAssist.actualEv = 0;   // 缺陷 2：实测 EV 一并清零，避免下次 engage 徽标读到残留
-      expAssist.lastSceneMean = null;
-      expAssist.lastSubjectMean = null;
-      expAssist.lastSubjectRatio = null;
-      expAssist.adjusts = 0;
-      expAssist.fails = 0;
-      expAssist.lastApplyAt = 0;
-      expAssist.demotions = 0;
-      expAssist.overPress = 0;
-      expAssist.overPressStreak = 0;
-      expAssist.evFloor = cfg.expEvMin;
-      expAssist.actualEv = 0;
-      expAssist.expRefMean = 0;
-      expAssist.preApplyMean = 0;
-      resetEffectWatch(null);
-      scheduleExposureCycle(mySeq, cfg.expEngageDelayMs);
-    }
-
-    // 有效性判定的观测序列归零（engage / 换档时调用）。换档后画面基准与量纲都变了，
-    // 旧基线与旧样本不能沿用：曝光补偿与曝光时间不是同一个量纲，继承旧 ev 没有意义。
-    // 注意 demotions 不在这里清零：换档本身是一次降级，计数要跨档位累加
-    function resetEffectWatch(baseline) {
-      expAssist.effBaseline = baseline == null ? null : baseline;
-      expAssist.effSamples = [];
-      expAssist.effAt = now();
-      expAssist.lastAppliedEv = 0;
-      expAssist.prevAppliedEv = 0;
-    }
-
-    function scheduleExposureCycle(mySeq, delay) {
-      clearExposureWatch();
-      expWatch = st(function () {
-        var firedId = expWatch;
-        expWatch = null;
-        // 回调触发时把自身 id 从 timers 摘掉，避免数组随周期单调增长
-        if (firedId != null) {
-          var ti = timers.indexOf(firedId);
-          if (ti >= 0) timers.splice(ti, 1);
-        }
-        if (mySeq !== seq || !alive) return;
-        exposureCycle(mySeq);
-      }, delay);
-      timers.push(expWatch);
-    }
-
-    function clearExposureWatch() {
-      if (expWatch == null) return;
-      try { ct(expWatch); } catch (e) {}
-      var i = timers.indexOf(expWatch);
-      if (i >= 0) timers.splice(i, 1);
-      expWatch = null;
-    }
-
-    // 停止辅助；restore=true 且 dirty 时把设备曝光还回去。
-    // 新流（attemptOnce 路径）本来就是默认曝光，此时 dirty=false，
-    // 不会白发一次 applyConstraints —— 那也是给爱悬挂的 UVC 添堵
-    function stopExposureAssist(reason, restore) {
-      clearExposureWatch();
-      if (restore && expAssist.dirty) restoreExposure(reason);
-      expAssist.state = expEnabled() ? 'IDLE' : 'OFF';
-      expAssist.st = { state: 'IDLE', hit: 0, miss: 0, engagedAt: 0, releasedAt: 0 };
-      expAssist.ev = 0;
-      expAssist.tier = 0;
-      expAssist.plan = null;
-      expAssist.dirty = false;
-      expAssist.actualEv = 0;   // 缺陷 2：实测 EV 一并清零，避免下次 engage 徽标读到残留
-      expAssist.demotions = 0;
-      expAssist.overPress = 0;
-      expAssist.overPressStreak = 0;
-      expAssist.evFloor = cfg.expEvMin;
-      expAssist.actualEv = 0;
-      expAssist.expRefMean = 0;
-      expAssist.preApplyMean = 0;
-      resetEffectWatch(null);
-      emitExposure();
-    }
-
-    async function exposureCycle(mySeq) {
-      try {
-        // 闸门组：仅 LIVE + 页面可见 + 采样器可用。对焦脉冲期间整个周期跳过 ——
-        // single-shot 期间部分 UVC 停输出，此时的帧统计全是噪声，且曝光
-        // applyConstraints 与对焦 applyConstraints 交叠有回弹风险
-        if (mySeq !== seq || !alive || state !== STATES.LIVE) return;
-        if (!expEnabled()) { stopExposureAssist('disabled', false); return; }
-        if (pageVisible && !pageVisible()) {
-          log('info', 'CAM_EXP_SKIP', { seq: seq, reason: 'page-hidden' });
-          scheduleExposureCycle(mySeq, cfg.expCycleMs);
-          return;
-        }
-        if (focusBusy && focusBusy()) {
-          log('info', 'CAM_EXP_SKIP', { seq: seq, reason: 'focus-pulse' });
-          scheduleExposureCycle(mySeq, cfg.expCycleMs);
-          return;
-        }
-        var el = safeVideo();
-        if (!frameReady(el)) { scheduleExposureCycle(mySeq, cfg.expCycleMs); return; }
-        var image = null;
-        try { image = gridSampler(el, cfg.expGridSize); } catch (e) { image = null; }
-        var cells = computeGridStats(image, cfg.expGridCells);
-        if (!cells) { scheduleExposureCycle(mySeq, cfg.expCycleMs); return; }
-        // 缺陷 1 修复：把当前整帧按「engage 时中性场景均值 / 当前场景均值」这一实测压暗系数
-        // 还原回中性刻度（亮垫板→210、黑衣物→150），四道闸同一口径，闸门稳定不再自杀。
-        // 用场景均值之比（而非请求 EV / 实测 EV）的原因：整帧均匀压暗下该比值恰为 1/f、天然
-        // 含过压带来的额外压暗、且无帧滞后；对帧不随补偿变暗的静态/幽灵设备 f≈1 → 不还原 →
-        // 与旧实现完全一致。ev=0（无中性参照）→ 还原系数=1。
-        var clOpts = (expAssist.state === 'ACTIVE' && expAssist.expRefMean > 0)
-          ? { refMean: expAssist.expRefMean, gamma: SRGB_GAMMA } : { refMean: 0, gamma: SRGB_GAMMA };
-        var cl = classifyExposureGrid(cells, cfg, clOpts);
-        expAssist.lastSceneMean = cl.sceneMean;
-        expAssist.lastSubjectMean = cl.subjectMean;
-        expAssist.lastSubjectRatio = cl.subjectRatio;
-    var h = stepAssistHysteresis(expAssist.st, cl.hit, now(), cfg);
-    expAssist.st = h.st;
-    if (h.action === 'engage') await engageAssist(mySeq, cl);
-    else if (h.action === 'release') releaseAssist('no-hit', cl);
-        else if (expAssist.state === 'ACTIVE') await tickClosedLoop(mySeq, cl);
-        if (mySeq !== seq || !alive) return;
-        scheduleExposureCycle(mySeq, cfg.expCycleMs);
-      } catch (e) {
-        // 曝光辅助任何意外都不得影响预览/拍照主链：记一条日志，下个周期再来
-        log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'cycle-error', err: { name: (e && e.name) || 'Error', message: (e && e.message) || String(e) } });
-        if (mySeq === seq && alive) scheduleExposureCycle(mySeq, cfg.expCycleMs);
-      }
-    }
-
-    async function engageAssist(mySeq, cl) {
-      var track = activeTrack();
-      expAssist.state = 'ACTIVE';
-      expAssist.ev = 0;
-      // 缺陷 2：实测实际生效 EV 一并清零。不清零的后果见 tier0 分支：从硬件档降级下来时
-      // 徽标会把上一个硬件档的实测值当成「软件压暗」的档位显示（QA F1）
-      expAssist.actualEv = 0;
-      expAssist.adjusts = 0;
-      expAssist.fails = 0;
-      if (!track || typeof track.getCapabilities !== 'function') {
-        expAssist.tier = 0;
-        expAssist.plan = null;
-        log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'no-track-capability', tier: 0 });
-        emitExposure();
-        return;
-      }
-      var cap = null;
-      var settings = null;
-      try { cap = track.getCapabilities(); } catch (e) { cap = null; }
-      try { settings = track.getSettings(); } catch (e2) { settings = null; }
-      // 换设备即清空幽灵记忆：能力是设备的属性，另一台机器可能这条路径是好使的
-      // 必须与 expGhostRemember 用**同一个** devIdOf() 兜底链，否则 engage 侧拿到空串、
-      // 记忆侧拿到 track#N，两边永远不相等 → 上一次刚记下的结论在下次 engage 被误判成
-      // 「换设备」清空（QA DEF-4 的直接后果：记忆形同不存在）
-      var devId = devIdOf();
-      if (devId !== expGhost.dev) { expGhost.dev = devId; expGhost.tiers = {}; }
-      var plan = pickExposurePlan(cap, settings);
-      // 已知无效的档位直接跳过：不让现场每一件衣物都重看一次「徽标说在压暗、画面没变」
-      var skippedTier = 0;
-      // 必须**循环**复查，不能只查一次入口档：双档幽灵设备（tier1 与 tier2 都被实测判过
-      // 无效）若只跳过 tier1，落到 tier2 后 tier2 仍会被完整重走一遍（QA DEF-3 实测：
-      // 第二件衣物仍下发 6 次 manual 约束，无效窗口只从 4.3s 降到 3.5s 而不是 0）。
-      // 降级链尾是 tier0（tier0 不在记忆里），循环必然终止；guard 只是防御性上限。
-      // banned 累积已失效的能力键：否则 tier1 → brightness → tier1 原地打转
-      // （每次都重走一遍已知无效的档位，等于没降级）
-      var guard = 0;
-      var banned = {};
-      while (plan.tier !== 0 && expGhostBlocked(plan.tier) && guard++ < 4) {
-        var alt = demoteExposurePlan(plan, cap, settings, banned);
-        banned = alt.banned || banned;
-        if (!skippedTier) skippedTier = plan.tier;
-        plan = alt.plan || { tier: 0, reason: alt.reason };
-      }
-      expAssist.plan = plan;
-      expAssist.tier = plan.tier;
-      expAssist.demotions = skippedTier ? 1 : 0;
-      if (skippedTier) {
-        log('warn', 'CAM_EXP_FALLBACK', {
-          seq: seq, reason: 'ghost-remembered', tier: plan.tier, from: skippedTier, ev: 0, drop: null
-        });
-      }
-      log('info', 'CAM_EXP_ENUM', { seq: seq, tier: plan.tier, reason: plan.reason });
-      if (plan.tier === 0) {
-        // 硬件不支持：不发任何约束，改由拍照时软件压暗（徽标提示「软件压暗」）
-        log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'software-fallback', tier: 0 });
-        emitExposure();
-        return;
-      }
-      // 有效性判定的起点：本档位下的第一条基线 + 空观测序列
-      resetEffectWatch(cl.subjectMean);
-      // 缺陷 1：捕获 engage 时的中性场景均值作为判定闸门还原参照（此时 ev=0、整帧中性，
-      // clOpts.refMean=0 → cl.sceneMean 即原始中性场景均值）。ACTIVE 后每帧按实测压暗系数还原，
-      // 亮垫板被还原回 210、黑衣物还原回 150，闸门不再自杀。
-      expAssist.expRefMean = (cl && isFinite(cl.sceneMean) && cl.sceneMean > 0) ? cl.sceneMean : 0;
-      // 缺陷 3：崩塌守卫的参照取「本档 apply 之前的原始帧」。engage 时 cl 还没被任何
-      // 曝光约束碰过（clOpts.refMean=0），rawSceneMean 就是接手前的亮度。
-      // 与 tickClosedLoop 的步进同语义：只在 apply 真的成功时更新（设备没动就不能换参照）
-      var preApplyMean = (cl && isFinite(cl.rawSceneMean) && cl.rawSceneMean > 0) ? cl.rawSceneMean : 0;
-      // 先把模式切过去（补偿从 0 起，具体压多少交给闭环），失败即降级 tier0
-      // cfg 必须传：brightness 档要拿 expEvMin 当满量程参照，不传会退回 DEFAULTS，
-      // 与控制器实际配置不同源（用户改过 expEvMin 时映射与闭环深度脱节）
-      var cst = buildExposureConstraints(plan, 0, cfg);
-      var ok = await applyExposure(track, cst, mySeq);
-      if (!ok) {
-        expAssist.tier = 0;
-        expAssist.plan = null;
-        log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'engage-apply-failed', tier: plan.tier });
-      } else {
-        expAssist.dirty = true;
-        expAssist.preApplyMean = preApplyMean;
-        expAssist.lastAppliedEv = appliedEvOf(plan, 0, cst);
-        expAssist.prevAppliedEv = 0;
-        // 与 demoteExposureTier 对齐：记下这次 apply 的时刻。不记的后果是 engage 后第一个
-        // 周期就通过频率闸门，拿到的是模式切换后还没稳定的过渡帧 —— 崩塌守卫会把它当成崩塌
-        expAssist.lastApplyAt = now();
-      }
-      log('info', 'CAM_EXP_ENGAGE', {
-        seq: seq,
-        tier: expAssist.tier,
-        ev: expAssist.ev,
-        subjectRatio: Math.round(cl.subjectRatio * 100) / 100,
-        sceneMean: cl.sceneMean == null ? null : Math.round(cl.sceneMean)
-      });
-      emitExposure();
-    }
-
-    async function tickClosedLoop(mySeq, cl) {
-      var nowMs = now();
-      // 频率限制：距上次 apply 不足 max(stepGap, settle) 不动。不足 settle
-      // 说明 AE 还在收敛，此刻测的亮度是过渡值，拿它算步长会过冲
-      if (nowMs - expAssist.lastApplyAt < Math.max(cfg.expStepGapMs, cfg.expSettleMs)) return;
-
-      // 缺陷 3：画面崩塌守卫。tier2 切 manual 时设备不按上报的 exposureTime 执行，
-      // 帧会崩到远低于任何请求所能解释的亮度（现场 -7.5EV）。崩塌帧上四道闸整体反转、
-      // 闭环既不动也不被判无效，形成每 3s 一次的无限振荡 —— 这是用户说的「循环跳亮度」。
-      // 判据用原始场景均值（还原后的 sceneMean 被钳在 refMean 上，永远发现不了崩塌）。
-      // 参照取「上一次 applyConstraints 之前那一帧」的原始均值，容许深度 = 那次 apply 实际
-      // 下发的 EV + tol。为什么按次取照而不是按档位取一次：过压设备实际压暗是请求的 3 倍
-      // （QA X 组 overDepth=2.0），按档位累计深度算会把过压误判成崩塌；按次算时每步只容许
-      // 「本步请求 + 2EV」，过压（每步 ≤1.02EV）天然在容差内，而崩塌（一步 -7.5EV）必然越界
-      //
-      // 准入判定见模块级 collapseGuardApplies：**字符串档（'brightness'）天然跳过本守卫**，
-      // 这是有意设计而非疏漏。崩塌的成因是「切手动曝光模式后设备不按上报的 exposureTime
-      // 执行」，只发生在 tier2；亮度参数档是 ISP 黑电平偏移，不切曝光模式、不存在「请求的
-      // 时间没被执行」这条失效路径，因此不需要（也不应该）被崩塌守卫接管。另：brightness
-      // 的实际压暗深度与 EV 不是线性关系，用 EV 模型算它的崩塌下限会得出错误的 floor，
-      // 容易误判。若将来要给 brightness 加崩塌检测，必须先换一套基于码值的判据，
-      // 不能把准入条件改成 tierRank(...) > 0。
-      if (collapseGuardApplies(expAssist.tier) && expAssist.preApplyMean > 0 &&
-          cl.rawSceneMean != null && isFinite(cl.rawSceneMean) && cl.rawSceneMean > 0) {
-        var collapseDepth = Math.max(0, -(expAssist.lastAppliedEv || 0)) + EXP_COLLAPSE.tol;
-        var collapseFloor = expAssist.preApplyMean *
-          Math.pow(2, -collapseDepth / SRGB_GAMMA);
-        if (cl.rawSceneMean < collapseFloor) {
-          var collapseStrikes = expGhostRemember(expAssist.tier, devIdOf());
-          log('warn', 'CAM_EXP_FALLBACK', {
-            seq: seq, reason: 'frame-collapse', tier: expAssist.tier,
-            ev: Math.round(expAssist.ev * 100) / 100,
-            refMean: Math.round(expAssist.preApplyMean),
-            rawMean: Math.round(cl.rawSceneMean),
-            floorMean: Math.round(collapseFloor),
-            ghostStrike: collapseStrikes
-          });
-          demoteForCollapse(mySeq);
-          return;
-        }
-      }
-
-      // 缺陷 2：用实测主体亮度反推「实际生效 EV」。闭环假设「请求 ev = 实际 ev」线性 1:1，
-      // 设备若把请求时间再乘 1/k 执行（时间下限 / 量化 / 单位解释都可能），实际压暗会更深，
-      // 闭环看到过暗就往回加 ev → bang-bang 振荡。先量出 actual，供过压判定与徽标使用。
-      var measuredEv = null;
-      if (cl.subjectMean != null && isFinite(cl.subjectMean) && cl.subjectMean > 0 &&
-          expAssist.effBaseline != null && isFinite(expAssist.effBaseline) && expAssist.effBaseline > 0 &&
-          expAssist.lastApplyAt > 0) {
-        measuredEv = SRGB_GAMMA * (Math.log(cl.subjectMean / expAssist.effBaseline) / Math.LN2);
-        if (!isFinite(measuredEv) || measuredEv > 0) measuredEv = null;  // 物理上不会变亮
-      }
-      // 过压判定（连续命中才记，吸收 AE 抖动 / 衣物微动）：实际比请求深超过容差即记过压设备，
-      // 并把闭环 ev 下限收紧到「实测可达深度」，不再往更深（只会被设备再压更深）处请求。
-      if (measuredEv != null && expAssist.ev < 0) {
-        var op = expAssist.ev - measuredEv;   // >0 表示实际更深
-        var prevOverPress = expAssist.overPress;
-        if (measuredEv < expAssist.ev - EXP_OVERPRESS.tol && op > 0) {
-          expAssist.overPressStreak += 1;
-        } else {
-          expAssist.overPressStreak = 0;
-        }
-        if (expAssist.overPressStreak >= EXP_OVERPRESS.hits && op > expAssist.overPress) {
-          expAssist.overPress = op;
-          expAssist.evFloor = Math.min(0, cfg.expEvMin + op);
-          // 缺陷 2 徽标诚实性（2026-10-23 标定 expTargetMean=105 后暴露）：过压确认时
-          // 必须把实测 EV 写进 actualEv。请求一步就收敛进死区时不会再有 apply，
-          // 而 apply 路径是 actualEv 唯一的更新点——不在这里补，徽标就停在 engage 时的
-          // 0.0EV，而设备实际被压在实测深度（X 组实测：请求 -0.34、实际 -1.02）。
-          // 只写在「过压确认且比已记账更深」时：徽标稳定，不随逐帧噪声跳数字
-          expAssist.actualEv = measuredEv;
-          // 只在「过压更深了」时记一条；稳态后 op 不再增长就不再刷日志
-          // （真实设备每周期都过压，不拦会秒级刷屏）
-          if (op > (prevOverPress + 1e-9)) {
-            log('warn', 'CAM_EXP_OVERPRESS', {
-              seq: seq, reason: 'over-press', tier: expAssist.tier,
-              requestedEv: Math.round(expAssist.ev * 100) / 100,
-              measuredEv: Math.round(measuredEv * 100) / 100,
-              overPress: Math.round(op * 100) / 100,
-              evFloor: Math.round(expAssist.evFloor * 100) / 100
-            });
-          }
-        }
-      }
-      // 闭环步长：把 ev 下限收紧到过压后可达深度，不再请求更深
-      var r = nextEvStep(expAssist.ev, cl.subjectMean, cfg);
-      if (r.ev < expAssist.evFloor) {
-        r = { ev: expAssist.evFloor, step: expAssist.evFloor - expAssist.ev, err: r.err };
-      }
-      // 幽灵能力只能靠这一步测出来：约束发出去 ≠ 画面真的变暗（lastAppliedEv 仍为请求值）
-      if (expAssist.tier !== 0 && cl.hit && expAssist.lastApplyAt > 0) {
-        recordEffectSample(cl, nowMs, r.err > 0 &&
-          Math.abs(expAssist.lastAppliedEv - expAssist.prevAppliedEv) < 1e-6);
-      }
-      // 有效性判定：只判硬件档（tier0 根本没发过约束，也不影响预览采样）。
-      // 判定放这里而不是「apply 成功之后」：贴住下限时不会再有 apply，
-      // 而那正是现场「一直空转」的形态，必须照样判得到
-      if (expAssist.tier !== 0 && expAssist.demotions < 2) {
-        var v = judgeExposureEffect({
-          baseline: expAssist.effBaseline,
-          samples: expAssist.effSamples,
-          startedAt: expAssist.effAt
-        }, cfg);
-        if (v.verdict === 'ineffective') {
-          await demoteExposureTier(mySeq, v, cl);
-          return;
-        }
-      }
-      if (r.step === 0) return;
-      if (expAssist.tier === 0) {
-        // 软件兜底档：没有约束可发，EV 走**解析解**（solveTier0Ev）——闭环在这里是开环的，
-        // 见该函数注释。lastApplyAt 也要记账：否则每周期都来一次，日志会爆炸
-        var solved = solveTier0Ev(cl.subjectMean, cfg);
-        if (solved == null) return;
-        var jump = solved - expAssist.ev;
-        // 已在位（含抖动 <0.01EV ≈ 0.4% 亮度）就不重复记账
-        if (Math.abs(jump) < 0.01) return;
-        expAssist.ev = solved;
-        // 缺陷 2 / QA F1：tier0 的「实际生效 EV」就是拍照时下发的软件解析解（没有硬件约束可发）。
-        // 不清零的后果：从硬件档降级到 tier0 时，actualEv 残留上一个硬件档的实测值，
-        // 徽标会把「软件压暗」显示成那个残留值（如 -2.4EV），与实际下发的解析解不符
-        expAssist.actualEv = solved;
-        expAssist.lastApplyAt = nowMs;
-        expAssist.adjusts += 1;
-        log('info', 'CAM_EXP_STEP', {
-          seq: seq, tier: 0,
-          ev: Math.round(solved * 100) / 100,
-          step: Math.round(jump * 100) / 100,
-          subjectMean: cl.subjectMean == null ? null : Math.round(cl.subjectMean),
-          clipRatio: clipFieldOf(cl)
-        });
-        emitExposure();
-        return;
-      }
-      var track = activeTrack();
-      if (!track) return;
-      var cst = buildExposureConstraints(expAssist.plan, r.ev, cfg);
-      var ok = await applyExposure(track, cst, mySeq);
-      if (!ok) {
-        // 连续失败达到上限：停硬件路径降软件兜底，并把这轮补偿恢复掉
-        if (expAssist.fails >= cfg.expApplyFailLimit) {
-          log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'fail-limit', tier: expAssist.tier });
-          restoreExposure('fail-limit');
-          expAssist.tier = 0;
-          expAssist.plan = null;
-          emitExposure();
-        }
-        return;
-      }
-      // 缺陷 3：记下「这次 apply 之前的帧」。崩塌守卫以此为参照判断下一帧是不是
-      // 无解释地崩了；apply 失败时不该更新参照（设备没动，参照必须留在原地）
-      expAssist.preApplyMean = (cl.rawSceneMean != null && isFinite(cl.rawSceneMean) && cl.rawSceneMean > 0)
-        ? cl.rawSceneMean : expAssist.preApplyMean;
-      expAssist.prevAppliedEv = expAssist.lastAppliedEv;
-      expAssist.lastAppliedEv = appliedEvOf(expAssist.plan, r.ev, cst);
-      // 实测反推的实际生效 EV：幽灵判定的 lastAppliedEv 保持「请求值」不变，这里单独记账，
-      // 供徽标诚实展示（缺陷 2）与「闭环是否已被钳在可达深度」判定
-      expAssist.actualEv = (measuredEv != null) ? measuredEv : expAssist.actualEv;
-      expAssist.ev = r.ev;
-      expAssist.lastApplyAt = nowMs;
-      expAssist.adjusts += 1;
-      log('info', 'CAM_EXP_STEP', {
-        seq: seq, tier: expAssist.tier,
-        ev: Math.round(r.ev * 100) / 100,
-        step: Math.round(r.step * 100) / 100,
-        subjectMean: cl.subjectMean == null ? null : Math.round(cl.subjectMean),
-        clipRatio: clipFieldOf(cl)
-      });
-      emitExposure();
-    }
-
-    // 高光裁剪占比（千分位）：白色鞋底/白垫板「还在被裁剪」是过曝的直接证据。
-    // classifyExposureGrid 早就算出 clip，只是没透出——调参时没有它只能靠猜
-    function clipFieldOf(cl) {
-      var v = cl && cl.clipRatio;
-      return v == null || !isFinite(Number(v)) ? null : Math.round(Number(v) * 1000) / 1000;
-    }
-
-    // 记一次「已下发补偿 → 实测亮度」的配对样本。只在硬件档且场景仍命中时记：
-    // 衣物移出画面后的亮度与补偿无关，记进去会污染判定
-    function recordEffectSample(cl, nowMs, pinned) {
-      var mean = Number(cl && cl.subjectMean);
-      if (!isFinite(mean)) return;
-      // 换档后第一帧的画面基准可能与 engage 时不同（如切 manual 冻结了 AE），
-      // 基线缺失时就用第一个样本补上
-      if (expAssist.effBaseline == null || !isFinite(expAssist.effBaseline)) expAssist.effBaseline = mean;
-      expAssist.effSamples.push({
-        ev: expAssist.lastAppliedEv,
-        mean: mean,
-        t: nowMs,
-        pinned: !!pinned
-      });
-      // 只留最近 12 条：贴住下限时每个周期都会记一条，不设上限数组会一直增长
-      if (expAssist.effSamples.length > 12) expAssist.effSamples.shift();
-    }
-
-    // 档位降级（幽灵能力 → 换一条路）：tier1 → brightness → tier2 → tier0。
-    //   ① 先把当前档位的约束还回去（补偿归零 / 切回 continuous），否则两份曝光
-    //      偏置会叠在同一台设备上，用户看到的是「莫名偏暗」；
-    //   ② 重新探测下一档（把无效的那个能力摘掉再探测）；
-    //   ③ 换量纲 → ev 归零、基线与观测序列重置，对新档位**重新做一次有效性验证**。
-    async function demoteExposureTier(mySeq, verdict, cl) {
-      var track = activeTrack();
-      var from = expAssist.tier;
-      var oldPlan = expAssist.plan;
-      // 降级原因按**来源档位**区分：手动档是 manual-ineffective，其余硬件档都是
-      // comp-ineffective。字符串档也要能被区分开，否则现场日志里看不出是哪条路径失效。
-      var reason = tierRank(from) === 2 ? 'manual-ineffective' : 'comp-ineffective';
-      expAssist.demotions += 1;
-      // 记进会话级幽灵记忆（达到 EXP_GHOST.minStrikes 才真正生效）：下次 engage
-      // （下一件衣物）直接跳过这个档位。返回值是「这台设备这条路径第几次被判无效」，
-      // 未达门槛时现场也能从日志看出「还差一次」，不用猜为什么这次没跳过
-      var ghostStrikes = expGhostRemember(from, devIdOf());
-      // ① 还回去（best-effort：失败只留痕，见 restoreExposure 注释）
-      restoreExposure(reason);
-      var cap = null;
-      var settings = null;
-      try {
-        cap = track && typeof track.getCapabilities === 'function' ? track.getCapabilities() : null;
-      } catch (e) { cap = null; }
-      try {
-        settings = track && typeof track.getSettings === 'function' ? track.getSettings() : null;
-      } catch (e2) { settings = null; }
-      var next = demoteExposurePlan(oldPlan, cap, settings);
-      // 降级后同样要查一次记忆：tier1 判无效会降到 tier2，而 tier2 可能在上一次
-      // engage 里已经单独被判过无效（双档幽灵设备，QA DEF-3）。与 engage 侧同一个循环。
-      // banned 累积已失效能力键，否则 tier1 → brightness → tier1 原地打转。
-      var g2 = 0;
-      var banned2 = next.banned || {};
-      while (next.tier !== 0 && next.plan && expGhostBlocked(next.tier) && g2++ < 4) {
-        next = demoteExposurePlan(next.plan, cap, settings, banned2);
-        banned2 = next.banned || banned2;
-      }
-      log('warn', 'CAM_EXP_FALLBACK', {
-        seq: seq,
-        reason: reason,
-        tier: next.tier,
-        from: from,
-        ev: Math.round(expAssist.ev * 100) / 100,
-        drop: verdict && verdict.dropRatio == null ? null : Math.round(verdict.dropRatio * 1000) / 1000,
-        // 第几次被判无效（含本次）。未达 EXP_GHOST.minStrikes 时不会记账，
-        // 现场凭这个字段就能区分「还没到门槛」和「记忆没生效」
-        ghostStrike: ghostStrikes
-      });
-      // ③ 换量纲：补偿与曝光时间不是同一个量纲，继承旧 ev 没有意义，从 0 重新收敛
-      expAssist.ev = 0;
-      expAssist.adjusts = 0;
-      expAssist.fails = 0;
-      // 缺陷 3：崩塌守卫的参照换成「上一档 apply 之前的当前帧」——新档位接手时看到的就是
-      // 这个亮度，拿它当基准才不会把上一档合法压暗的部分算成崩塌
-      var preApplyMean2 = (cl && isFinite(cl.rawSceneMean) && cl.rawSceneMean > 0) ? cl.rawSceneMean : 0;
-      resetEffectWatch(null);
-      if (next.tier === 0 || !next.plan || !track) {
-        expAssist.plan = null;
-        expAssist.tier = 0;
-        emitExposure();
-        return;
-      }
-      expAssist.plan = next.plan;
-      expAssist.tier = next.plan.tier;
-      log('info', 'CAM_EXP_ENUM', { seq: seq, tier: next.plan.tier, reason: reason });
-      // 新档位同样从 0 起（具体压多少交给闭环），失败就再降一级到软件兜底
-      var cst = buildExposureConstraints(next.plan, 0, cfg);
-      var ok = await applyExposure(track, cst, mySeq);
-      if (!ok) {
-        expAssist.plan = null;
-        expAssist.tier = 0;
-        log('warn', 'CAM_EXP_FALLBACK', { seq: seq, reason: 'demote-apply-failed', tier: next.plan.tier });
-      } else {
-        expAssist.dirty = true;
-        expAssist.lastAppliedEv = appliedEvOf(next.plan, 0, cst);
-        expAssist.prevAppliedEv = 0;
-        expAssist.lastApplyAt = now();
-        // 缺陷 3：降级 apply 成功后才生效参照——上面失败时不能更新（设备没动，参照必须留在原地）
-        expAssist.preApplyMean = preApplyMean2;
-      }
-      emitExposure();
-    }
-
-    // 曝光约束统一竞速：部分 UVC 摄像头 applyConstraints 永不 settle，
-    // 不竞速会把曝光周期（进而拍照前的等待）卡死。与 tryApplyRung 同构
-    async function applyExposure(track, cst, mySeq) {
-      if (!track || !cst || typeof track.applyConstraints !== 'function') return false;
-      // 变量名刻意不用 acw：scripts/verify-camera-res-mutation.js 的 M4 变异体以
-      // 「acw.cancel();」为锚点定位 tryApplyRung 的定时器回收，这里同名会让锚点失配
-      var expW = waitMs(cfg.expApplyTimeoutMs);
-      var err = null;
-      var raced = null;
-      try {
-        raced = await Promise.race([
-          track.applyConstraints(cst).then(function () { return 'ok'; }, function (e) { err = e; return 'err'; }),
-          expW.promise.then(function (v) { return v === false ? 'aborted' : 'timeout'; })
-        ]);
-      } catch (e2) {
-        err = err || e2;
-        raced = 'err';
-      } finally {
-        // 防御性回收，不是正确性支柱：sleep / unmount / 重开流这几条路径上的
-        // clearTimers() 已经兜底清空了 timers[]，删掉这行不会改变 EV、档位或
-        // 下发次数（QA 实测逐项相同），只是运行期间会多残留 1~2 颗已无用的定时器，
-        // 并在超时前继续持有闭包。这里提前释放是为了少一点抖动
-        expW.cancel();
-      }
-      // 'aborted' = 定时器被 clearTimers 打断（卸载/休眠），不算设备故障
-      if (raced === 'aborted') return false;
-      if (raced === 'timeout' || raced === 'err') {
-        expAssist.fails += 1;
-        log('warn', 'CAM_EXP_FALLBACK', {
-          seq: mySeq,
-          reason: raced === 'timeout' ? 'apply-timeout' : 'apply-error',
-          err: err ? { name: (err && err.name) || 'Error', message: (err && err.message) || '' } : null
-        });
-        return false;
-      }
-      expAssist.fails = 0;
-      return true;
-    }
-
-    function releaseAssist(reason, cl) {
-      if (expAssist.state !== 'ACTIVE') return;
-      // 缺陷 3 的安全网：硬件档会话一次补偿都没下发成就被判离场，说明这个档位在当前
-      // 设备上根本使不上力（崩塌守卫漏过的变体、能力残缺等）。记一次幽灵记忆：
-      // 连续两次同样的「零调整离场」后，下次 engage 直接跳过该档位落 tier0 ——
-      // 没有这条，闭环会永远重复「engage→零调整→release」而没有任何机制能挣脱
-      var zeroAdjustStrike = 0;
-      if (expAssist.tier !== 0 && expAssist.adjusts === 0) {
-        zeroAdjustStrike = expGhostRemember(expAssist.tier, devIdOf());
-      }
-      log('info', 'CAM_EXP_RELEASE', {
-        seq: seq, reason: reason,
-        ev: Math.round(expAssist.ev * 100) / 100,
-        // 闸门明细：离场时是哪一道闸没过、还原前的原始亮度、本会话下发过几次。
-        // 没有这些字段，现场只能看到「no-hit」而分不清是场景变了还是还原系数失真
-        // （rf = engage 中性均值 / rawMean，需要时可按 ENGAGE 日志的 sceneMean 现算）
-        gate: cl && cl.reason ? cl.reason : null,
-        rawMean: cl && cl.rawSceneMean != null ? Math.round(cl.rawSceneMean) : null,
-        subjRatio: cl && cl.subjectRatio != null ? Math.round(cl.subjectRatio * 100) / 100 : null,
-        adjusts: expAssist.adjusts,
-        ghostStrike: zeroAdjustStrike || null
-      });
-      // 衣物移出画面时 track 还活着，这里的恢复是用户可感知的，必须真发
-      restoreExposure(reason);
-      expAssist.state = 'IDLE';
-      expAssist.st = { state: 'IDLE', hit: 0, miss: 0, engagedAt: 0, releasedAt: now() };
-      expAssist.ev = 0;
-      expAssist.tier = 0;
-      expAssist.plan = null;
-      expAssist.dirty = false;
-      expAssist.actualEv = 0;   // 缺陷 2：实测 EV 一并清零，避免下次 engage 徽标读到残留
-      expAssist.demotions = 0;
-      expAssist.overPress = 0;
-      expAssist.overPressStreak = 0;
-      expAssist.evFloor = cfg.expEvMin;
-      expAssist.actualEv = 0;
-      expAssist.expRefMean = 0;
-      expAssist.preApplyMean = 0;   // 缺陷 3：崩塌参照随会话一起清零
-      resetEffectWatch(null);
-      emitExposure();
-    }
-
-    // 画面崩塌后的降级（缺陷 3）：这条硬件路径正在毁画面，立刻还原并落 tier0。
-    // 与 demoteExposureTier 的两点区别：① 不重新探测下一档 —— 崩塌是实测结论，
-    // 不是「证据不足」，没有值得再试的硬件路径；② 会话保持 ACTIVE（不 release），
-    // 避免「还原→3s 冷却→再 engage→再崩」的二次闪跳。软件兜底只改存档图，不碰预览。
-    // 幽灵记忆照记：达到 EXP_GHOST.minStrikes 后，下次 engage 直接跳过这个档位
-    function demoteForCollapse(mySeq) {
-      restoreExposure('frame-collapse');
-      expAssist.demotions += 1;
-      expAssist.ev = 0;
-      expAssist.adjusts = 0;
-      expAssist.fails = 0;
-      expAssist.plan = null;
-      expAssist.tier = 0;
-      expAssist.actualEv = 0;
-      expAssist.overPress = 0;
-      expAssist.overPressStreak = 0;
-      expAssist.evFloor = cfg.expEvMin;
-      expAssist.preApplyMean = 0;
-      resetEffectWatch(null);
-      log('info', 'CAM_EXP_ENUM', { seq: seq, tier: 0, reason: 'frame-collapse' });
-      emitExposure();
-    }
-
-    // 刻意不挂 waitMs 竞速定时器：那些路径上 clearTimers() 往往已经跑过，
-    // 再挂一颗定时器就会留下永不回收的悬挂定时 —— 而这里的流马上就停，
-    // 设备重置后设置本来就会丢，失败只需留痕，不需要重排
-    function restoreExposure(reason) {
-      var plan = expAssist.plan;
-      if (!plan || plan.tier === 0 || expAssist.tier === 0) return Promise.resolve(false);
-      var track = activeTrack();
-      var cst = buildExposureRestoreConstraints(plan);
-      if (!track || !cst || typeof track.applyConstraints !== 'function') {
-        log('warn', 'CAM_EXP_RESTORE', { seq: seq, reason: reason, ok: false });
-        return Promise.resolve(false);
-      }
-      var p = null;
-      try {
-        p = Promise.resolve(track.applyConstraints(cst));
-      } catch (e) {
-        p = Promise.reject(e);
-      }
-      p.then(function () {
-        expAssist.dirty = false;
-        log('info', 'CAM_EXP_RESTORE', { seq: seq, reason: reason, ok: true });
-      }, function () {
-        log('warn', 'CAM_EXP_RESTORE', { seq: seq, reason: reason, ok: false });
-      });
-      return Promise.resolve(true);
-    }
-
-    // 黑帧门控放行条件（设计文档 §9.1）。用「刚刚」采的场景均值而不是
-    // 上一个周期的值：挡镜头后 sceneMean 会在一个周期内崩塌，若拿陈旧值
-    // 放行，被遮挡的 release 滞回窗口（≈2.5s）里就可能放进黑照片。
-    // gridSampler 是同步的，重新采一次的代价可接受
-    function expGateSuppress() {
-      if (expAssist.state !== 'ACTIVE' || !gridSampler) return false;
-      var sceneMean = expAssist.lastSceneMean;
-      try {
-        var image = gridSampler(safeVideo(), cfg.expGridSize);
-        var cells = computeGridStats(image, cfg.expGridCells);
-        var cl = cells ? classifyExposureGrid(cells, cfg) : null;
-        if (cl && cl.sceneMean != null) sceneMean = cl.sceneMean;
-      } catch (e) { /* 采样失败时退回上一个周期的值 */ }
-      return sceneMean != null && sceneMean >= cfg.expBlackFloor;
-    }
-
-    function emitExposure() {
-      emit('exposure', {
-        state: expAssist.state,
-        ev: expAssist.ev,
-        appliedEv: expAssist.actualEv,   // 缺陷 2：实际生效 EV（由实测亮度反推，诚实展示）
-        tier: expAssist.tier,
-        sceneMean: expAssist.lastSceneMean,
-        subjectMean: expAssist.lastSubjectMean,
-        adjusts: expAssist.adjusts
-      });
     }
 
     function frameReady(el) {
@@ -2422,11 +948,10 @@
 
     // 单档尝试：exact 锁定 + 超时兜底 + 显式失败原因。
     // 返回 'stale'（会话已作废）/ true（已应用）/ false（被拒或超时）
-    async function tryApplyRung(track, rung, deviceId, mySeq) {
-      if (!track || typeof track.applyConstraints !== 'function') return false;
-      var cst = { width: { exact: rung.width }, height: { exact: rung.height } };
-      // frameRate 只用 ideal：带宽不够时降帧比整档失败更划算
-      if (rung.frameRate) cst.frameRate = { ideal: rung.frameRate };
+    // 把约束下发到 track，并用 cfg.applyConstraintMs 做超时竞速兜底：
+    // 部分 UVC 摄像头 applyConstraints 永不 settle，必须 race 超时否则整条开流链路卡死。
+    // 返回 { result: 'ok' | 'stale' | 'fail', timedOut, err }，调用方各自决定日志与回落。
+    async function raceApplyConstraints(track, cst, mySeq) {
       var acw = waitMs(cfg.applyConstraintMs);
       var timedOut = false;
       var err = null;
@@ -2435,19 +960,28 @@
           track.applyConstraints(cst).then(function () { return 'ok'; }, function (e) { err = e; return 'err'; }),
           acw.promise.then(function (v) { if (v !== false) timedOut = true; return 'timeout'; })
         ]);
-      } catch (e2) {
-        err = err || e2;
-      }
+      } catch (e2) { err = err || e2; }
       // 无论胜负都回收定时器：落败一侧的计时器若留下就是悬挂定时（QA 探测项 A/D1）
       acw.cancel();
-      if (!alive || mySeq !== seq) return 'stale';
-      if (timedOut || err) {
+      if (!alive || mySeq !== seq) return { result: 'stale', timedOut: timedOut, err: err };
+      if (timedOut || err) return { result: 'fail', timedOut: timedOut, err: err };
+      return { result: 'ok', timedOut: timedOut, err: err };
+    }
+
+    async function tryApplyRung(track, rung, deviceId, mySeq) {
+      if (!track || typeof track.applyConstraints !== 'function') return false;
+      var cst = { width: { exact: rung.width }, height: { exact: rung.height } };
+      // frameRate 只用 ideal：带宽不够时降帧比整档失败更划算
+      if (rung.frameRate) cst.frameRate = { ideal: rung.frameRate };
+      var r = await raceApplyConstraints(track, cst, mySeq);
+      if (r.result === 'stale') return 'stale';
+      if (r.result === 'fail') {
         log('warn', 'CAM_RES_FALLBACK', {
           seq: mySeq,
           device: shortDeviceId(deviceId),
           res: resFieldOf(rung),
-          reason: timedOut ? 'apply-timeout' : ((err && err.name) === 'OverconstrainedError' ? 'overconstrained' : 'apply-error'),
-          err: err ? { name: (err && err.name) || 'Error', message: (err && err.message) || '' } : null
+          reason: r.timedOut ? 'apply-timeout' : ((r.err && r.err.name) === 'OverconstrainedError' ? 'overconstrained' : 'apply-error'),
+          err: r.err ? { name: (r.err && r.err.name) || 'Error', message: (r.err && r.err.message) || '' } : null
         });
         return false;
       }
@@ -2678,9 +1212,6 @@
       verifyOutputResolution(el, deviceId, mySeq);
       setState(STATES.LIVE, 'attached');
       log('info', 'CAM_LIVE', { seq: mySeq, device: shortDeviceId(deviceId), res: resField(), attempt: att, flap: flapCount });
-      // 曝光辅助在 LIVE 之后启动，内部再延迟 expEngageDelayMs 避开
-      // 分辨率探测与首帧 AE 收敛窗口
-      startExposureAssist(mySeq);
       return true;
     }
 
@@ -2959,23 +1490,6 @@
       try { samples = frameSampler(target, cfg.sampleSize); } catch (e) { samples = null; }
       if (!samples || !samples.length) return false;
       var r = analyzeGraySamples(samples, { mean: cfg.blackMean, variance: cfg.blackVariance });
-      if (r.black && expGateSuppress()) {
-        // 曝光辅助 ACTIVE 期间的门控放行（设计文档 §9.1）：手动降曝后中心
-        // 区域必然更暗，沿用 blackMean:12 的绝对阈值会把「被正确压暗的
-        // 黑色衣物」误判成「画面全黑」而拒拍。ACTIVE 的成立条件本身已排除
-        // 挡镜头/黑信号（要求高亮参照 ≥ expHiAreaMin、场景均值 ≥ expSceneMeanMin），
-        // 故只保留一条兜底：实时场景均值 ≥ expBlackFloor 才放行。
-        // 为什么这里不守 silent 约定：它不是拒收记录，而是「门控放行了一次
-        // 本会被误拒的拍摄」的证据，且只在黑衣物+辅助激活时出现，量极小
-        log('info', 'CAM_EXP_BLACKGATE', {
-          seq: seq,
-          reason: 'assist-active',
-          sceneMean: expAssist.lastSceneMean == null ? null : Math.round(expAssist.lastSceneMean),
-          mean: Math.round(r.mean * 100) / 100,
-          variance: Math.round(r.variance * 100) / 100
-        });
-        return false;
-      }
       if (r.black && !silent) {
         log('warn', 'CAM_CAPTURE_REJECT', { seq: seq, reason: 'black-frame', mean: Math.round(r.mean * 100) / 100, variance: Math.round(r.variance * 100) / 100 });
       }
@@ -3025,19 +1539,125 @@
         preferredId: preferredId,
         alive: alive,
         trackBinds: trackBinds.length,
-        // 曝光辅助现场复盘：state=ACTIVE & tier=1 & ev=-1.2 = 硬件补偿正常工作；
-        // tier=0 = 设备不支持走软件兜底（照片预览仍过曝是预期）；fails>0 = 约束在失败/超时
-        exposure: {
-          state: expAssist.state,
-          ev: expAssist.ev,
-          tier: expAssist.tier,
-          sceneMean: expAssist.lastSceneMean,
-          subjectMean: expAssist.lastSubjectMean,
-          subjectRatio: expAssist.lastSubjectRatio,
-          adjusts: expAssist.adjusts,
-          fails: expAssist.fails
-        }
       };
+    }
+
+    /* ---------- 摄像头原生亮度（brightness）调节 ----------
+     * 取代自动曝光辅助引擎（v1.2.19）。亮度直接下发到相机 ISP 层（advanced:[{brightness}]），
+     * 预览与成片同源。能力不支持时一切 no-op，由渲染层禁用滑块并提示。
+     * 持久化形状（由注入的 loadBrightnessPref/saveBrightnessPref 读写）：
+     *   { default: number|null, devices: { [deviceId]: number } }
+     * 优先级：设备覆盖 devices[id] > 全局默认 default > 设备自身默认（settings.brightness）。 */
+
+    function persistBrightness(value, scope, deviceId) {
+      if (!saveBrightnessPref) return;
+      var store = loadBrightnessPref() || {};
+      if (typeof store.default !== 'number') store.default = null;
+      if (!store.devices || typeof store.devices !== 'object') store.devices = {};
+      if (scope === 'device') {
+        if (value == null) delete store.devices[deviceId];
+        else store.devices[deviceId] = value;
+      } else {
+        store.default = value == null ? null : value;
+        delete store.devices[deviceId]; // 跟随全局默认
+      }
+      try { saveBrightnessPref(store); } catch (e) { /* 持久化失败不影响本次调节 */ }
+    }
+
+    function resolveBrightnessTarget(cap, settings, deviceId) {
+      var store = loadBrightnessPref() || {};
+      var devices = (store && store.devices && typeof store.devices === 'object') ? store.devices : {};
+      var def = (store && typeof store.default === 'number') ? store.default : null;
+      if (deviceId && Object.prototype.hasOwnProperty.call(devices, deviceId) && typeof devices[deviceId] === 'number') {
+        return { value: clampBrightnessValue(devices[deviceId], cap), source: 'device' };
+      }
+      if (def != null) {
+        return { value: clampBrightnessValue(def, cap), source: 'default' };
+      }
+      return { value: defaultBrightnessValue(cap, settings), source: 'native' };
+    }
+
+    function deviceIdOfTrack(track) {
+      var s = readRawSettings(track);
+      return s && s.deviceId ? s.deviceId : '';
+    }
+
+    // 把亮度下发到当前 track（advanced 约束），沿用 tryApplyRung 的超时竞速兜底：
+    // 部分 UVC 摄像头 applyConstraints 永不 settle，必须 race 超时否则卡死。
+    async function applyBrightnessToTrack(value, mySeq) {
+      var track = activeTrack();
+      if (!track || typeof track.applyConstraints !== 'function') return false;
+      var cst = { advanced: [{ brightness: value }] };
+      var r = await raceApplyConstraints(track, cst, mySeq);
+      if (r.result === 'stale') return 'stale';
+      if (r.result === 'fail') {
+        log('warn', 'CAM_BRIGHT_FAIL', {
+          seq: mySeq, device: shortDeviceId(deviceIdOfTrack(track)),
+          value: value, reason: r.timedOut ? 'apply-timeout' : ((r.err && r.err.name) || 'apply-error')
+        });
+        return false;
+      }
+      return true;
+    }
+
+    // 开流进入 LIVE 时由渲染层调用：探测能力、按记忆恢复亮度、立即下发。
+    // 这样重启 / 换设备后亮度自动回到上次设定（预览即所见）。
+    async function refreshBrightness() {
+      var track = activeTrack();
+      brightnessCap = { supported: false, min: 0, max: 0, step: 1 };
+      brightnessEffective = 0;
+      brightnessSource = 'native';
+      if (!track || typeof track.getCapabilities !== 'function') return getBrightnessState();
+      var cap = capabilityProbeBrightness(track.getCapabilities());
+      brightnessCap = cap;
+      if (!cap.supported) return getBrightnessState();
+      var settings = (typeof track.getSettings === 'function') ? track.getSettings() : null;
+      var deviceId = deviceIdOfTrack(track);
+      var t = resolveBrightnessTarget(cap, settings, deviceId);
+      brightnessEffective = t.value;
+      brightnessSource = t.source;
+      await applyBrightnessToTrack(brightnessEffective, seq);
+      return getBrightnessState();
+    }
+
+    // 滑块实时拖动（persist=false）只下发不存档；松手（persist=true）才写持久化。
+    async function setBrightness(value, opts) {
+      var o = opts || {};
+      if (!brightnessCap.supported) return { applied: false, value: brightnessEffective, source: brightnessSource };
+      var v = clampBrightnessValue(value, brightnessCap);
+      var applied = await applyBrightnessToTrack(v, seq);
+      if (applied === 'stale') return { applied: false, value: brightnessEffective, source: brightnessSource };
+      brightnessEffective = v;
+      if (o.persist) {
+        var track = activeTrack();
+        var deviceId = deviceIdOfTrack(track);
+        persistBrightness(v, o.scope === 'default' ? 'default' : 'device', deviceId);
+        var settings = (track && typeof track.getSettings === 'function') ? track.getSettings() : null;
+        var resolved = o.scope === 'default'
+          ? { value: clampBrightnessValue(v, brightnessCap), source: 'default' }
+          : resolveBrightnessTarget(brightnessCap, settings, deviceId);
+        brightnessSource = resolved.source;
+      }
+      return { applied: applied !== false, value: brightnessEffective, source: brightnessSource };
+    }
+
+    // 清除当前设备的亮度覆盖，回退到全局默认 / 设备自身默认并立即下发。
+    async function resetBrightness() {
+      if (!brightnessCap.supported) return getBrightnessState();
+      var track = activeTrack();
+      var deviceId = deviceIdOfTrack(track);
+      persistBrightness(null, 'device', deviceId); // 清设备覆盖
+      var settings = (track && typeof track.getSettings === 'function') ? track.getSettings() : null;
+      var t = resolveBrightnessTarget(brightnessCap, settings, deviceId);
+      brightnessEffective = t.value;
+      brightnessSource = t.source;
+      await applyBrightnessToTrack(brightnessEffective, seq);
+      return getBrightnessState();
+    }
+
+    function getBrightnessCapability() { return brightnessCap; }
+    function getBrightnessState() {
+      return { capability: brightnessCap, effective: brightnessEffective, source: brightnessSource };
     }
 
     var api = {
@@ -3072,28 +1692,16 @@
       // 单入口（暴露出来便于断言 I1/I6）
       releaseActive: releaseActive,
       attachStream: attachStream,
-      // 曝光辅助（黑色衣物过曝防护）：渲染层据此显示徽标与做软件兜底
-      getExposureInfo: function () {
-        return {
-          state: expAssist.state,
-          ev: expAssist.ev,
-          appliedEv: expAssist.actualEv,   // 缺陷 2：实际生效 EV（徽标据此诚实展示）
-          tier: expAssist.tier,
-          sceneMean: expAssist.lastSceneMean,
-          subjectMean: expAssist.lastSubjectMean,
-          adjusts: expAssist.adjusts,
-          fails: expAssist.fails
-        };
-      },
-      onExposureChange: function (cb) { return on('exposure', cb); },
-      // 生命周期由控制器自管理（attemptOnce / handleTrackUnmuted / releaseActive
-      // 内部调用）；暴露出来仅为单测驱动，渲染层不调用
-      startExposureAssist: startExposureAssist,
-      stopExposureAssist: stopExposureAssist,
       // 事件订阅
       onStateChange: function (cb) { return on('state', cb); },
       onError: function (cb) { return on('error', cb); },
-      onDevicesChange: function (cb) { return on('devices', cb); }
+      onDevicesChange: function (cb) { return on('devices', cb); },
+      // 摄像头原生亮度（brightness）调节（v1.2.19 取代自动曝光辅助）
+      refreshBrightness: refreshBrightness,
+      setBrightness: setBrightness,
+      resetBrightness: resetBrightness,
+      getBrightnessCapability: getBrightnessCapability,
+      getBrightnessState: getBrightnessState
     };
 
     Object.defineProperty(api, 'state', { get: function () { return state; } });
@@ -3110,6 +1718,10 @@
     analyzeGraySamples: analyzeGraySamples,
     sampleCenterGray: sampleCenterGray,
     classifyError: classifyError,
+    // 摄像头原生亮度（纯函数，供单测直接断言）
+    capabilityProbeBrightness: capabilityProbeBrightness,
+    clampBrightnessValue: clampBrightnessValue,
+    defaultBrightnessValue: defaultBrightnessValue,
     // 分辨率锁定（纯函数，供单测直接断言）
     buildResolutionLadder: buildResolutionLadder,
     normalizeResolution: normalizeResolution,
@@ -3118,34 +1730,6 @@
     buildResolutionConstraints: buildResolutionConstraints,
     RES_PREF_VERSION: RES_PREF_VERSION,
     STANDARD_RATINGS: STANDARD_RATINGS,
-    // 曝光辅助（黑色衣物过曝防护）：纯函数供单测直接断言
-    computeGridStats: computeGridStats,
-    classifyExposureGrid: classifyExposureGrid,
-    stepAssistHysteresis: stepAssistHysteresis,
-    nextEvStep: nextEvStep,
-    pickExposurePlan: pickExposurePlan,
-    buildExposureConstraints: buildExposureConstraints,
-    buildExposureRestoreConstraints: buildExposureRestoreConstraints,
-    buildExposureLut: buildExposureLut,
-    EXP_LUT: EXP_LUT,
-    // 幽灵能力检测（§7.5）：判定参数表 + 三个纯函数
-    EXP_EFFECT: EXP_EFFECT,
-    // 幽灵记忆的记账门槛（§7.5 DEF-5 方案①）：同一设备同一档位累计判无效这么多次才记账
-    EXP_GHOST: EXP_GHOST,
-    expectedDropRatio: expectedDropRatio,
-    judgeExposureEffect: judgeExposureEffect,
-    appliedEvOf: appliedEvOf,
-    demoteExposurePlan: demoteExposurePlan,
-    // 档位身份的唯一判定源（数字档 0/1/2 与字符串档 'brightness' 混用时，
-    // `tier > 0` 之类数值比较会把字符串档误判成 tier0）。导出供独立断言。
-    tierRank: tierRank,
-    expGhostKey: expGhostKey,
-    // 崩塌守卫的适用档位判定（与 tierRank 同为档位语义的唯一来源）。
-    // 字符串档 'brightness' 必须为 false —— 它是 ISP 黑电平偏移、压暗深度与 EV 非线性，
-    // 用 EV 模型算崩塌下限会把它误判成崩塌。导出供独立断言。
-    collapseGuardApplies: collapseGuardApplies,
-    // sRGB 编码指数（§7.3 LUT 与 §7.5 判定共用同一个常量）
-    SRGB_GAMMA: SRGB_GAMMA,
-    solveTier0Ev: solveTier0Ev
+    // 摄像头原生亮度（brightness）纯函数：能力探测 / 量程钳位 / 设备默认推导，供单测直接断言。
   };
 });

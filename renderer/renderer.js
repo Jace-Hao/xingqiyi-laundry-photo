@@ -1567,9 +1567,53 @@ const CapturePage = {
     // 取代原来写死的 aspect-ratio:4/3 与 max-height:68vh
     const camAr = Vue.ref(''); // --cam-ar，形如 '1280 / 720'
     const camMaxH = Vue.ref(0); // --cam-max-h，单位 px
-    // 曝光辅助（黑色衣物过曝防护）：controller 推来的辅助状态，供徽标与软件兜底消费。
-    // 仅 ACTIVE 时才有意义；可用 window.__xqyExposureAssist=false 整体退出
-    const exposureInfo = Vue.ref(null);
+    // 摄像头原生亮度（brightness）滑块状态：能力 / 当前值 / 来源 / 提交范围。
+    // 来源：'device' = 设备覆盖；'default' = 全局默认；'native' = 设备自身默认（无记忆时）。
+    const brightnessCap = Vue.ref({ supported: false, min: 0, max: 0, step: 1 });
+    const brightnessValue = Vue.ref(0);
+    const brightnessSource = Vue.ref('native');
+    const brightnessScope = Vue.ref('device'); // 提交时写到哪个槽：本设备 | 全局默认
+
+    // 开流进入 LIVE 时由 controller.refreshBrightness() 探测能力并按记忆恢复亮度（重启自动恢复）。
+    function syncBrightnessOnLive() {
+      if (!controller || typeof controller.refreshBrightness !== 'function') return;
+      controller.refreshBrightness().then((st) => {
+        brightnessCap.value = st.capability;
+        brightnessValue.value = st.effective;
+        brightnessSource.value = st.source;
+        brightnessScope.value = st.source === 'device' ? 'device' : 'default';
+      }).catch(() => {});
+    }
+
+    // 实时拖动：仅下发到相机 ISP 层（不存档），预览即所见。
+    function onBrightnessInput(e) {
+      const v = Number((e && e.target) ? e.target.value : e);
+      if (!isFinite(v)) return;
+      brightnessValue.value = v;
+      if (controller && typeof controller.setBrightness === 'function') {
+        controller.setBrightness(v, { persist: false });
+      }
+    }
+
+    // 松手提交：按当前「保存范围」写入持久化（本设备 / 所有摄像头）。
+    function onBrightnessCommit() {
+      const v = brightnessValue.value;
+      if (!controller || typeof controller.setBrightness !== 'function') return;
+      controller.setBrightness(v, { persist: true, scope: brightnessScope.value }).then((r) => {
+        brightnessSource.value = r.source;
+      }).catch(() => {});
+    }
+
+    // 清除当前设备的亮度覆盖，回退到全局默认 / 设备自身默认。
+    function resetBrightnessToDefault() {
+      if (!controller || typeof controller.resetBrightness !== 'function') return;
+      controller.resetBrightness().then((st) => {
+        brightnessCap.value = st.capability;
+        brightnessValue.value = st.effective;
+        brightnessSource.value = st.source;
+        brightnessScope.value = st.source === 'device' ? 'device' : 'default';
+      }).catch(() => {});
+    }
 
     // 错误态 UI：按错误码取为我们预先定义好的文案与按钮组合，取不到时一律回退 UNKNOWN
     const camErr = Vue.computed(() => {
@@ -1577,27 +1621,8 @@ const CapturePage = {
       return (c && CAM_ERR_UI[c]) || null;
     });
 
-    // 曝光辅助徽标：只在辅助 ACTIVE 时显示，让介入行为对用户可见（不隐性）。
-    // 2026-10-24 改为相机原生亮度参数（brightness 档）：压暗在 ISP 层面发生，
-    // 预览与成片同源，无需任何后期 LUT，也不再给 <video> 套 SVG 滤镜（那会导致白屏）。
-    // tier 'brightness' = 原生亮度参数压暗（硬件能力，ok 色）；tier 0 = 硬件不支持、
-    // 靠拍照时软件压暗存档图（预览为原始 ISP 提亮帧，warn 色说明是显示层补的）。
-    const exposureBadge = Vue.computed(() => {
-      const e = exposureInfo.value;
-      if (!e || e.state !== 'ACTIVE') return null;
-      // 缺陷 2：徽标显示「实际生效」EV（由实测亮度反推，诚实展示）。正常设备实际≈请求，
-      // 过压设备会被闭环钳在可达深度，徽标自然回到合理范围；appliedEv 缺失时回退请求值
-      const evRaw = (e.appliedEv != null && isFinite(e.appliedEv)) ? e.appliedEv : e.ev;
-      const ev = (Math.round(evRaw * 10) / 10).toFixed(1);
-      if (e.tier === 'brightness') return { text: '亮度调节 ' + ev + 'EV', level: 'ok' };
-      if (e.tier === 0) return { text: '软件压暗 ' + ev + 'EV', level: 'warn' };
-      return { text: '曝光补偿 ' + ev + 'EV', level: 'ok' };
-    });
 
-    // 预览不再做任何后期滤镜：亮度参数档（brightness）在 ISP 层面压暗，预览即所见；
-    // 软件兜底档（tier0）只改存档图，预览保持原始 ISP 提亮帧（与 v1.2.16 行为一致）。
-    // 注：曾给 <video> 套 SVG feComponentTransfer 滤镜（v1.2.17），在 Electron/Chromium
-    // 下会把视频渲染挂掉致白屏，已移除。
+    // 预览不套任何后期滤镜：亮度在相机 ISP 层调节，预览与成片同源（v1.2.17 曾因 SVG 滤镜白屏而废弃）。
 
     function camIdleMs() {
       const v = Number(window.__xqyCamIdleMs);
@@ -1641,25 +1666,6 @@ const CapturePage = {
       }
     }
 
-    // 曝光检测采样：整帧缩到 size×size 取 ImageData（不取中心 —— 黑色衣物
-    // 检测要的是全画面的暗/亮分布）。统计与判定在 controller 纯函数里做，
-    // 渲染层只负责把画面变成像素数组（DOM 只出现在这里）
-    function sampleExposureGrid(video, size) {
-      try {
-        const vw = video.videoWidth;
-        const vh = video.videoHeight;
-        if (!vw || !vh) return null;
-        const side = Math.max(1, Math.min(size || 64, vw, vh));
-        const canvas = document.createElement('canvas');
-        canvas.width = side;
-        canvas.height = side;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(video, 0, 0, vw, vh, 0, 0, side, side);
-        return ctx.getImageData(0, 0, side, side);
-      } catch (e) {
-        return null;
-      }
-    }
 
     // ---------- 摄像头生命周期控制器（renderer/camera-controller.js）----------
     // 取流 / 释放 / 重连 / 拍照闸门全部收敛到 controller：
@@ -1685,13 +1691,10 @@ const CapturePage = {
             // 不碰 localStorage，读写由这里注入；存档按 deviceId 分开，切换摄像头不串档
             loadResolutionPref: (id) => readResPref(id),
             saveResolutionPref: (id, val) => writeResPref(id, val),
-            // 曝光辅助（黑色衣物过曝防护）：controller 不碰 DOM，4 项全部注入。
-            // gridSampler 未注入即整体 OFF；focusBusy 让周期避开对焦脉冲
-            // （single-shot 期间部分 UVC 停输出，帧统计是噪声）
-            gridSampler: sampleExposureGrid,
-            pageVisible: () => !document.hidden,
-            focusBusy: () => focusPulseBusy,
-            exposureAssistEnabled: () => window.__xqyExposureAssist !== false,
+            // 摄像头原生亮度（brightness）记忆：controller 不碰 localStorage，
+            // 读写由这里注入；存档为 { default, devices }，全局默认 + 单设备覆盖
+            loadBrightnessPref: () => readBrightnessPref(),
+            saveBrightnessPref: (store) => writeBrightnessPref(store),
             log: camLog
           })
         : null;
@@ -1800,20 +1803,15 @@ const CapturePage = {
           loadDevices(); // 授权后再枚举，deviceId / label 才有值
         }
         scheduleIdleSleep();
+        syncBrightnessOnLive();
       } else {
         stopFocusPulse();
       }
-      // 离开 LIVE 时徽标即消失：辅助只在 LIVE 跑，残留状态会误导现场判断
-      if (s !== 'LIVE') exposureInfo.value = null;
     }
 
     if (controller) {
       controller.onStateChange(syncCameraState);
       controller.onError(syncCameraState);
-      // 曝光辅助状态推送（与 onStateChange 并列）：徽标与软件兜底共用同一份数据
-      if (typeof controller.onExposureChange === 'function') {
-        controller.onExposureChange((e) => { exposureInfo.value = e; });
-      }
       controller.onDevicesChange(() => {
         loadDevices();
       });
@@ -2112,23 +2110,6 @@ const CapturePage = {
         canvas.height = v.videoHeight;
         const ctx = canvas.getContext('2d');
         ctx.drawImage(v, 0, 0);
-        // 曝光辅助软件兜底（仅 tier0：硬件不支持曝光补偿时）：用闭环算出的 EV
-        // 对存档图做 gamma 压暗，保住黑衣物的暗部层次（线性乘会压成死黑）。
-        // 只改存档图、不改预览，所以必须放在 drawImage 之后、水印之前 ——
-        // 水印放在压暗之后，保证时间戳始终是醒目的白色
-        const expInfo = typeof controller.getExposureInfo === 'function' ? controller.getExposureInfo() : null;
-        if (expInfo && expInfo.state === 'ACTIVE' && expInfo.tier === 0 && expInfo.ev < 0 &&
-            window.CameraController && typeof window.CameraController.buildExposureLut === 'function') {
-          const lut = window.CameraController.buildExposureLut(expInfo.ev);
-          const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
-          const px = frame.data;
-          for (let i = 0; i < px.length; i += 4) {
-            px[i] = lut[px[i]];
-            px[i + 1] = lut[px[i + 1]];
-            px[i + 2] = lut[px[i + 2]];
-          }
-          ctx.putImageData(frame, 0, 0);
-        }
         // 右上角烧录拍照时间水印：存进照片本身，导出/打印后依然可见
         drawTimeWatermark(ctx, canvas.width, canvas.height, watermarkTimeText(shotAt));
         shots.value.push(canvas.toDataURL('image/jpeg', 0.92));
@@ -2471,7 +2452,8 @@ const CapturePage = {
       barcode, note, saving, barcodeCount, videoEl, barcodeEl, ready,
       barcodeWarn, applyCleaned, applySimilar, barcodeLocked, unlockBarcode,
       sleeping, camState, camHint, camPrivacy, camErr, camErrCode, camAr, camMaxH,
-      exposureInfo, exposureBadge,
+      brightnessCap, brightnessValue, brightnessSource, brightnessScope,
+      onBrightnessInput, onBrightnessCommit, resetBrightnessToDefault,
       startCamera, retryCamera, switchDevice, wakeCamera, sleepCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone, openPrivacySettings
     };
   },
@@ -2517,13 +2499,25 @@ const CapturePage = {
               </template>
             </div>
           </div>
+            <div class="camera-bright" v-if="brightnessCap.supported">
+              <label class="cam-bright-label">摄像头亮度</label>
+              <input type="range" class="brightness-slider"
+                     :min="brightnessCap.min" :max="brightnessCap.max" :step="brightnessCap.step || 1"
+                     :value="brightnessValue" @input="onBrightnessInput" @change="onBrightnessCommit" />
+              <span class="brightness-val">{{ brightnessValue }}</span>
+              <select class="brightness-scope" v-model="brightnessScope">
+                <option value="device">仅本摄像头</option>
+                <option value="default">所有摄像头</option>
+              </select>
+              <button class="btn btn-ghost btn-sm" v-if="brightnessSource === 'device'" @click="resetBrightnessToDefault">恢复默认</button>
+            </div>
+            <div class="camera-bright cam-bright-unsupported" v-else-if="camState === 'LIVE'">该摄像头不支持亮度调节</div>
           <div class="camera-bar">
             <select v-if="devices.length > 1" v-model="deviceId" @change="switchDevice(deviceId)">
               <option v-for="(d, i) in devices" :key="d.deviceId || i" :value="d.deviceId">
                 {{ d.label || ('摄像头 ' + (i + 1)) }}
               </option>
             </select>
-            <span v-if="exposureBadge" class="exposure-badge" :class="exposureBadge.level">{{ exposureBadge.text }}</span>
             <button class="btn btn-primary btn-shutter" :disabled="camState !== 'LIVE'" @click="capture">📸 拍照（空格）</button>
             <button v-if="camState !== 'SLEEPING' && camState !== 'UNINIT'" class="btn btn-ghost" @click="sleepCamera('manual')">释放摄像头</button>
           </div>
@@ -3645,6 +3639,39 @@ function writeResPref(deviceId, val) {
     /* 无痕模式 / 存储不可用时静默降级为单次生效（本次会话内仍然有效） */
   }
 }
+
+    /* ---------- 摄像头原生亮度记忆（全局默认 + 单设备覆盖）----------
+     * 形状：{ default: number|null, devices: { [deviceId]: number } }
+     * 优先级：设备覆盖 devices[id] > 全局默认 default > 设备自身默认（settings.brightness）。
+     * 旧版本无此键 → readBrightnessPref 返回兜底对象，绝不抛错、绝不锁死。 */
+    const CAM_BRIGHT_PREFIX = 'xqy-cam-bright:';
+    const BRIGHT_DEFAULT_KEY = CAM_BRIGHT_PREFIX + 'store';
+
+    function readBrightnessPref() {
+      const raw = readPref(BRIGHT_DEFAULT_KEY, '');
+      if (!raw) return { default: null, devices: {} };
+      try {
+        const v = JSON.parse(raw);
+        return {
+          default: (v && typeof v.default === 'number') ? v.default : null,
+          devices: (v && v.devices && typeof v.devices === 'object') ? v.devices : {}
+        };
+      } catch (e) {
+        return { default: null, devices: {} }; // 存档损坏：当作没有记忆
+      }
+    }
+
+    function writeBrightnessPref(store) {
+      try {
+        const out = {
+          default: (store && typeof store.default === 'number') ? store.default : null,
+          devices: (store && store.devices && typeof store.devices === 'object') ? store.devices : {}
+        };
+        writePref(BRIGHT_DEFAULT_KEY, JSON.stringify(out));
+      } catch (e) {
+        /* 无痕模式 / 存储不可用时静默降级为单次生效 */
+      }
+    }
 
 let themeStore = null;
 function useTheme() {

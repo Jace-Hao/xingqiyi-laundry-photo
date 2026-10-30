@@ -705,10 +705,8 @@ async function main() {
       'CAM_RES_ENUM', 'CAM_RES_PREF', 'CAM_RES_APPLY', 'CAM_RES_VERIFY', 'CAM_RES_FALLBACK', 'CAM_RES_PERSIST',
       // 黑帧复采：瞬时黑帧复采后恢复（放行），区别于 CAM_CAPTURE_REJECT 的持续黑帧拒收
       'CAM_BLACK_RETRY',
-      // 曝光辅助：黑色衣物过曝防护（docs/exposure-assist-design.md §9.5）
-      'CAM_EXP_ENUM', 'CAM_EXP_ENGAGE', 'CAM_EXP_STEP', 'CAM_EXP_RELEASE',
-      'CAM_EXP_RESTORE', 'CAM_EXP_SKIP', 'CAM_EXP_FALLBACK', 'CAM_EXP_BLACKGATE',
-      'CAM_EXP_OVERPRESS'
+      // 摄像头原生亮度调节（v1.2.19 取代自动曝光辅助）：设备不支持时悬挂下发超时
+      'CAM_BRIGHT_FAIL'
     ];
     const used = new Set();
     for (const f of ['renderer/renderer.js', 'renderer/camera-controller.js']) {
