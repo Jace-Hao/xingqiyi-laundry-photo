@@ -159,6 +159,32 @@
     return clampBrightnessValue(cap.min + (cap.max - cap.min) / 2, cap);
   }
 
+  // 亮度校准（扫码成功钩子用）：根据当前预览帧平均亮度，按比例把相机 brightness 推近目标亮度。
+  // 纯函数、不碰 DOM / track，可在 Node 下单测。设备不暴露 brightness 能力 / 帧均值不可用时 no-op。
+  // meanLuma: 0-255 灰度均值；cap: capabilityProbeBrightness 的结果；currentValue: 当前 brightness 设定值；
+  // opts: { target: 目标亮度占比(0-1，默认 0.5 中灰), gain: 阻尼系数(0-1，默认 0.7 防过冲), deadband: 死区占比(默认 0.06) }。
+  function calibrateBrightness(meanLuma, cap, currentValue, opts) {
+    if (!cap || !cap.supported) return currentValue; // 不支持亮度能力的设备直接 no-op
+    var o = opts || {};
+    var target = typeof o.target === 'number' ? o.target : 0.5;   // 目标：中灰 0.5
+    var gain = typeof o.gain === 'number' ? o.gain : 0.7;          // 阻尼，避免过冲/振荡
+    var deadband = typeof o.deadband === 'number' ? o.deadband : 0.06;
+    var luma = Number(meanLuma);
+    if (!isFinite(luma)) return currentValue;                      // 帧均值不可信 -> 不动
+    var lumaFrac = luma / 255;
+    var err = target - lumaFrac;                                  // 正=偏暗需提亮，负=偏亮需压暗
+    if (Math.abs(err) <= deadband) return currentValue;           // 已在目标附近，不折腾
+    var span = cap.max - cap.min;
+    if (!(span > 0)) return currentValue;
+    var curFrac = (Number(currentValue) - cap.min) / span;
+    if (!isFinite(curFrac)) curFrac = 0.5;
+    curFrac = Math.max(0, Math.min(1, curFrac));
+    var newFrac = curFrac + err * gain;
+    newFrac = Math.max(0, Math.min(1, newFrac));
+    var raw = cap.min + newFrac * span;
+    return clampBrightnessValue(raw, cap);
+  }
+
   // 网格降采样统计：整帧按 grid×grid 切格，每格算 { mean, sat, clip }
   // 为什么整帧统计而不是继续用中心 64×64：黑色衣物检测要回答的是
   // 「画面里暗主体占多大、有没有亮背景参照」，这是全局问题，中心采样回答不了
@@ -1722,6 +1748,7 @@
     capabilityProbeBrightness: capabilityProbeBrightness,
     clampBrightnessValue: clampBrightnessValue,
     defaultBrightnessValue: defaultBrightnessValue,
+    calibrateBrightness: calibrateBrightness,
     // 分辨率锁定（纯函数，供单测直接断言）
     buildResolutionLadder: buildResolutionLadder,
     normalizeResolution: normalizeResolution,

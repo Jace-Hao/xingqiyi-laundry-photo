@@ -1615,6 +1615,41 @@ const CapturePage = {
       }).catch(() => {});
     }
 
+    // 扫码成功自动亮度校准（v1.2.20）：每次成功识别条形码后，采样当前预览帧平均亮度，
+    // 按比例把相机 brightness 推近中灰目标。仅本次会话生效（persist:false），不写持久化，
+    // 因此与手动滑块微调互不覆盖——用户任何时候拖动滑块都能在自动值基础上继续微调。
+    // 瞬态黑帧（对焦脉冲/自动曝光调整期间）均值不可信，跳过本次校准，等下一帧。
+    let calibrating = false;
+    async function autoCalibrateBrightness() {
+      if (calibrating) return;
+      if (!controller || typeof controller.getBrightnessCapability !== 'function') return;
+      const cap = controller.getBrightnessCapability();
+      if (!cap || !cap.supported) return; // 设备不支持亮度能力 -> 直接跳过
+      const v = videoEl.value;
+      if (!v || !v.videoWidth) return;
+      // 复用黑帧检测：瞬态黑帧下均值不可信，跳过本次校准
+      if (controller.isBlackFrame && controller.isBlackFrame(v)) return;
+      const samples = sampleFrame(v, 64);
+      if (!samples || !samples.length) return;
+      let sum = 0;
+      for (let i = 0; i < samples.length; i++) sum += samples[i];
+      const meanLuma = sum / samples.length;
+      const st = controller.getBrightnessState();
+      calibrating = true;
+      try {
+        const target = window.CameraController
+          ? window.CameraController.calibrateBrightness(meanLuma, cap, st.effective)
+          : st.effective;
+        if (target === st.effective) return; // 已在目标附近，无需调整
+        const r = await controller.setBrightness(target, { persist: false });
+        if (r && typeof r.value === 'number') brightnessValue.value = r.value;
+      } catch (e) {
+        /* 校准失败不影响扫码流程 */
+      } finally {
+        calibrating = false;
+      }
+    }
+
     // 错误态 UI：按错误码取为我们预先定义好的文案与按钮组合，取不到时一律回退 UNKNOWN
     const camErr = Vue.computed(() => {
       const c = camErrCode.value;
@@ -1933,6 +1968,66 @@ const CapturePage = {
       }
     }
 
+    // 预览点击重新对焦（v1.2.20）：用户点击预览区域时触发一次单点对焦（点哪对焦哪），
+    // 随后恢复连续对焦。设备支持 pointsOfInterest 时按点击坐标设置对焦点，否则回退中心对焦。
+    // 与周期对焦脉冲共用 focusPulseBusy 标记：对焦期间若恰逢拍照，waitPulseClear 会等其结束，
+    // 避免采到 single-shot 的黑帧。不以任何方式改动扫码输入焦点，扫码流程不受影响。
+    let focusOnceBusy = false;
+    async function focusOnce(fx, fy) {
+      if (focusOnceBusy || focusPulseBusy) return;              // 不与周期脉冲/拍照重叠
+      if (camState.value !== 'LIVE') return;
+      const track = controller && controller.getTrack ? controller.getTrack() : null;
+      if (!track || track.readyState !== 'live' || !track.getCapabilities) return;
+      let cap = {};
+      try { cap = track.getCapabilities(); } catch (e) { return; }
+      if (!cap.focusMode || cap.focusMode.indexOf('single-shot') < 0) return; // 不支持单点对焦则静默忽略
+      // 计算对焦点（设备坐标空间；不支持 pointsOfInterest 时回退中心）
+      let pt = null;
+      if (cap.pointsOfInterest && typeof cap.pointsOfInterest.width === 'number' && typeof cap.pointsOfInterest.height === 'number') {
+        const x = Math.max(0, Math.min(1, fx == null ? 0.5 : fx));
+        const y = Math.max(0, Math.min(1, fy == null ? 0.5 : fy));
+        pt = { x: Math.round(x * cap.pointsOfInterest.width), y: Math.round(y * cap.pointsOfInterest.height) };
+      }
+      focusOnceBusy = true;
+      focusPulseBusy = true; // 让拍照前 waitPulseClear 也等待，避免采到对焦黑帧
+      try {
+        const single = pt ? { focusMode: 'single-shot', pointsOfInterest: [pt] } : { focusMode: 'single-shot' };
+        await Promise.race([
+          track.applyConstraints({ advanced: [single] }),
+          new Promise((r) => setTimeout(r, 1500))
+        ]);
+        await new Promise((r) => setTimeout(r, 350));
+        // 恢复连续对焦；保持与 applyFocus 一致的稳态（中心 pointsOfInterest + continuous）
+        const cx = Math.round((cap.pointsOfInterest ? cap.pointsOfInterest.width : 1000) / 2);
+        const cy = Math.round((cap.pointsOfInterest ? cap.pointsOfInterest.height : 1000) / 2);
+        const restore = cap.pointsOfInterest
+          ? { focusMode: 'continuous', pointsOfInterest: [{ x: cx, y: cy }] }
+          : { focusMode: 'continuous' };
+        await Promise.race([
+          track.applyConstraints({ advanced: [restore] }),
+          new Promise((r) => setTimeout(r, 1500))
+        ]);
+      } catch (e) {
+        /* 不支持的设备静默忽略 */
+      } finally {
+        focusPulseBusy = false;
+        focusOnceBusy = false;
+      }
+    }
+
+    // 预览区点击：计算点击在视频内的归一化坐标，触发一次重新对焦。
+    // @mousedown.prevent 阻止点击把焦点从条码输入框抢走（扫码枪依赖输入框聚焦），扫码流程不受影响。
+    function onPreviewClick(e) {
+      if (camState.value !== 'LIVE') return;
+      const v = videoEl.value;
+      if (!v) { focusOnce(0.5, 0.5); return; }
+      const rect = v.getBoundingClientRect();
+      if (!rect.width || !rect.height) { focusOnce(0.5, 0.5); return; }
+      const fx = (e.clientX - rect.left) / rect.width;
+      const fy = (e.clientY - rect.top) / rect.height;
+      focusOnce(fx, fy);
+    }
+
     function clearIdleTimer() {
       if (idleTimer) {
         clearTimeout(idleTimer);
@@ -2217,6 +2312,8 @@ const CapturePage = {
       if (barcodeEl.value && document.activeElement === barcodeEl.value) barcodeEl.value.blur();
       // 扫码/确认条码说明用户正在操作，重置空闲计时防止键盘路径下误休眠
       bumpActivity();
+      // v1.2.20：每次成功识别条形码后自动执行一次亮度校准（仅本次会话生效）
+      if (barcode.value.trim()) autoCalibrateBrightness();
     }
 
     async function saveAll() {
@@ -2454,7 +2551,7 @@ const CapturePage = {
       sleeping, camState, camHint, camPrivacy, camErr, camErrCode, camAr, camMaxH,
       brightnessCap, brightnessValue, brightnessSource, brightnessScope,
       onBrightnessInput, onBrightnessCommit, resetBrightnessToDefault,
-      startCamera, retryCamera, switchDevice, wakeCamera, sleepCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone, openPrivacySettings
+      startCamera, retryCamera, switchDevice, wakeCamera, sleepCamera, capture, removeShot, clearShots, saveAll, checkBarcodeCount, onBarcodeDone, onPreviewClick, openPrivacySettings
     };
   },
   template: `
@@ -2475,7 +2572,7 @@ const CapturePage = {
                invalid at computed-value time，var() 的 fallback 也救不回来，会退化成 auto。 -->
           <div class="camera-box"
                :style="{ '--cam-ar': camAr || '4 / 3', '--cam-max-h': (camMaxH > 0 ? camMaxH + 'px' : '68vh') }">
-            <video ref="videoEl" autoplay playsinline muted></video>
+            <video ref="videoEl" autoplay playsinline muted @mousedown.prevent @click="onPreviewClick" style="cursor:pointer"></video>
             <div v-if="camState !== 'LIVE'" class="camera-overlay" :class="{ error: !!cameraError }">
               <template v-if="camState === 'SLEEPING'">
                 <div class="camera-sleep-title">摄像头已休眠（已释放占用）</div>

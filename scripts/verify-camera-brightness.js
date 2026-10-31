@@ -198,6 +198,26 @@ function brightnessPureChecks(M) {
   e(M.defaultBrightnessValue(cap2, { brightness: 999 }), 64, 'A3 settings 超限被钳位');
   e(M.defaultBrightnessValue(cap2, {}), 0, 'A3 无 settings→量程中点');
   e(M.defaultBrightnessValue(cap2, null), 0, 'A3 settings 为 null→量程中点');
+  // A4 亮度校准（扫码成功钩子）
+  const cb = { supported: true, min: -64, max: 64, step: 1 };
+  // 偏暗帧（均值 30）-> 亮度应上调；偏亮帧（均值 220）-> 亮度应下调
+  const up = M.calibrateBrightness(30, cb, 0);
+  a(up > 0, 'A4 偏暗帧(30) -> 亮度上调 (>0)');
+  const down = M.calibrateBrightness(220, cb, 0);
+  a(down < 0, 'A4 偏亮帧(220) -> 亮度下调 (<0)');
+  // 中灰附近（均值 140）-> 死区内，保持原值
+  e(M.calibrateBrightness(140, cb, 0), 0, 'A4 中灰(140)在死区内 -> 保持 0');
+  // 不支持能力 -> no-op 返回原值
+  e(M.calibrateBrightness(30, { supported: false, min: 0, max: 0, step: 1 }, 5), 5, 'A4 不支持能力 -> 返回原值');
+  // 帧均值不可信（NaN）-> 不动
+  e(M.calibrateBrightness(NaN, cb, 0), 0, 'A4 帧均值 NaN -> 保持原值');
+  // 已封顶/封底：偏暗但已在 max -> 钳在 max；偏亮但已在 min -> 钳在 min
+  e(M.calibrateBrightness(30, cb, 64), 64, 'A4 已在 max 且偏暗 -> 钳在 64');
+  e(M.calibrateBrightness(220, cb, -64), -64, 'A4 已在 min 且偏亮 -> 钳在 -64');
+  // 步进对齐：step>0 时结果对齐到步进网格
+  const cb2 = { supported: true, min: 0, max: 255, step: 5 };
+  const cval = M.calibrateBrightness(30, cb2, 0);
+  a((cval % 5) === 0, 'A4 步进对齐：结果落在 step 网格上 (' + cval + ')');
   return { p, f, fails };
 }
 
@@ -340,6 +360,8 @@ async function sectionC() {
   mutantRun('capabilityProbe 去掉 min>=max 拒识', (s) => s.replace('|| b.max <= b.min', ''));
   // 去掉 step 对齐 → 步进对齐用例应转红
   mutantRun('clamp 去掉步进对齐', (s) => s.replace('v = lo + steps * cap.step;', 'v = v; /* removed */'));
+  mutantRun('calibrate 翻转误差符号（暗帧应提亮→变压暗）', (s) => s.replace('newFrac = curFrac + err * gain;', 'newFrac = curFrac - err * gain;'));
+  mutantRun('calibrate 去掉死区（中灰应保持→变调整）', (s) => s.replace('if (Math.abs(err) <= deadband) return currentValue;', '/* removed */'));
 }
 
 /* ========================================================================== */
