@@ -2397,22 +2397,27 @@ const CapturePage = {
 
     // 快捷键：空格拍摄、回车保存；条码框内回车 = 确认条码并进入拍摄状态
     function onKeydown(e) {
-      // 输入法组合态（拼音候选确认等）一律放行：拦截 Enter 会强杀组合并失焦，
-      // 之后打字失灵，表现为「删掉内容后再也打不出字」（keyCode 229 为组合态 keydown 兼容标志）。
+      // 输入法组合态（拼音候选确认等）一律放行：拦截会强杀组合并失焦，之后打字失灵
       if (e.isComposing || e.keyCode === 229) return;
       const t = e.target;
-      const inBarcode = t === barcodeEl.value;
-      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) {
-        if (inBarcode && e.key === 'Enter') {
-          e.preventDefault();
-          onBarcodeDone();
-        }
+      // 自由文本字段（备注 textarea、搜索框等文本型输入框）：空格与回车都按原生输入处理，
+      // 不触发拍照或保存，避免破坏打字。其余控件（含条码框）一律走下方全局快捷键逻辑。
+      if (window.ShortcutHelper && !window.ShortcutHelper.isSpaceCaptureTarget(t, barcodeEl.value)) {
         return;
       }
       if (e.code === 'Space') {
+        // 全局空格拍照：亮度滑块 / 下拉 / 按钮 / 条码框等任何控件获焦都拍，
+        // 不再因某个控件获得焦点而失效（修复调完亮度后必须点空白才能拍照的问题）。
         e.preventDefault();
         if (!e.repeat) capture();
-      } else if (e.key === 'Enter') {
+        return;
+      }
+      if (t === barcodeEl.value && e.key === 'Enter') {
+        e.preventDefault();
+        onBarcodeDone();
+        return;
+      }
+      if (e.key === 'Enter') {
         e.preventDefault();
         saveAll();
       }

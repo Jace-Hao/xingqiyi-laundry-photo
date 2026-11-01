@@ -1,4 +1,11 @@
 # 更新日志
+## v1.2.21（2026-11-01）
+
+### 缺陷修复（全局空格拍照）
+- **修复调整后空格无法拍照**：v1.2.20 的 `onKeydown` 对 `INPUT/TEXTAREA/SELECT/contentEditable` 直接 return，导致调完亮度滑块（`<input type="range">`）后滑块仍持焦点，空格被吞、必须点空白处 blur 才能恢复拍照。
+- **改为全局空格拍照**：抽出纯函数 `isSpaceCaptureTarget(t, barcodeEl)`（新增 `renderer/shortcut-helper.js`，UMD 双导出，可在 Node 下单测）。规则——自由文本字段（备注 textarea、搜索框等文本型 INPUT）保留空格输入不拍照；条码框、亮度滑块、下拉、按钮、页面空白等任意控件获焦时空格一律触发 `capture()`，IME 组合态仍全局放行。
+- 新增 `scripts/verify-shortcut.js`：13 项正向断言（P1–P13，覆盖 range/select/button/body/条码框→拍照，textarea/contentEditable/search/text/number→不拍照）+ 2 处变异负向对照（Q1 把 range 错当文本、Q2 所有 INPUT 不拍照，均被主检抓到）。结果 16/0 全绿。
+
 ## v1.2.20（2026-10-30）
 
 ### 功能变更（扫码亮度自动校准 + 预览点击对焦）
