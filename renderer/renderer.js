@@ -5362,6 +5362,398 @@ const AdminSystemPage = {
   `
 };
 
+/* ---------- 会员导出软件订单导入 ----------
+ * 从第三方会员/CRM 导出软件读取订单数据，解析关键字段（订单号、会员、商品、
+ * 金额、时间、状态）并映射到本系统订单模型（订单号即条码）。
+ *
+ * 两步式操作：先「选择文件并预览」，看清字段映射、字段缺失、格式异常与重复订单
+ * 的统计后再确认导入，避免脏数据直接入库。
+ * 解析与去重在主进程完成（main/member-order-parser.js），渲染层只负责展示。
+ */
+const MemberOrdersPage = {
+  props: {
+    token: { type: String, required: true },
+    user: { type: Object, default: null }
+  },
+  setup(props) {
+    // 有「衣物拍照」权限的账号才能导入（与新增存档同口径）；
+    // 门店管理员/查询账号可查看，但不能导入
+    const canImport = Vue.computed(
+      () => !!(props.user && props.user.permissions && props.user.permissions.capture)
+    );
+
+    // ---------- 已导入的会员订单列表 ----------
+    const rows = Vue.ref([]);
+    const total = Vue.ref(0);
+    const page = Vue.ref(1);
+    const pageSize = 12;
+    const loading = Vue.ref(false);
+    const errMsg = Vue.ref('');
+    const keyword = Vue.ref('');
+
+    const totalPages = Vue.computed(() => Math.max(1, Math.ceil(total.value / pageSize)));
+
+    // ---------- 导入流程状态 ----------
+    const file = Vue.ref(null);        // { fileName, content, format }
+    const preview = Vue.ref(null);     // 预览结果（主进程返回）
+    const importing = Vue.ref(false);
+    const picking = Vue.ref(false);
+
+    // 导入后需要清空的预览（避免重复提交同一文件）
+    function resetImport() {
+      file.value = null;
+      preview.value = null;
+    }
+
+    async function load() {
+      loading.value = true;
+      errMsg.value = '';
+      try {
+        const r = await window.api.listMemberOrders(props.token, {
+          keyword: keyword.value.trim(),
+          page: page.value,
+          pageSize
+        });
+        if (!r.ok) {
+          errMsg.value = r.message || '加载失败';
+          return;
+        }
+        rows.value = r.data.items;
+        total.value = r.data.total;
+      } catch (e) {
+        errMsg.value = e.message || String(e);
+      } finally {
+        loading.value = false;
+      }
+    }
+
+    function search() {
+      page.value = 1;
+      load();
+    }
+
+    function goPage(p) {
+      const n = Number(p) || 1;
+      page.value = Math.min(Math.max(1, n), totalPages.value);
+      load();
+    }
+
+    // 选择文件并预览：主进程读文件 → 主进程解析 → 渲染层展示解析结果
+    async function chooseAndPreview() {
+      if (picking.value || importing.value) return;
+      picking.value = true;
+      try {
+        const f = await window.api.chooseMemberOrderFile();
+        if (!f.ok) {
+          if (f.message && f.message !== '已取消') toast(f.message, 'error');
+          return;
+        }
+        file.value = f.data;
+        const r = await window.api.previewMemberOrders(props.token, {
+          content: f.data.content,
+          format: f.data.format,
+          fileName: f.data.fileName
+        });
+        if (!r.ok) {
+          toast(r.message || '解析失败', 'error');
+          file.value = null;
+          return;
+        }
+        preview.value = r.data;
+      } catch (e) {
+        toast('读取文件失败：' + (e.message || e), 'error');
+      } finally {
+        picking.value = false;
+      }
+    }
+
+    // 确认导入：把文件内容交给主进程解析入库
+    async function doImport() {
+      if (!file.value || importing.value) return;
+      const p = preview.value;
+      const willImport = p ? Math.max(0, p.stats.valid - p.dbDuplicate) : 0;
+      const ok = await showConfirm({
+        title: '导入会员订单',
+        message:
+          '将导入「' + (file.value.fileName || '所选文件') + '」中的订单数据。\n' +
+          '预计新增 ' + willImport + ' 条' +
+          (p && p.dbDuplicate ? '，跳过库内已存在 ' + p.dbDuplicate + ' 条' : '') +
+          (p && p.stats.invalid ? '，无效 ' + p.stats.invalid + ' 条' : '') +
+          (p && p.stats.duplicates ? '，文件内重复 ' + p.stats.duplicates + ' 条' : '') + '。\n' +
+          '导入的订单号将作为条形码，可在「衣物拍照」页据此建档。',
+        confirmText: '确认导入'
+      });
+      if (!ok) return;
+      importing.value = true;
+      try {
+        const r = await window.api.importMemberOrders(props.token, {
+          content: file.value.content,
+          format: file.value.format,
+          fileName: file.value.fileName
+        });
+        if (!r.ok) {
+          toast(r.message || '导入失败', 'error');
+          return;
+        }
+        const d = r.data;
+        let msg = '导入完成：新增 ' + d.imported + ' 条';
+        if (d.skipped) msg += '，跳过重复 ' + d.skipped + ' 条';
+        if (d.invalid) msg += '，无效 ' + d.invalid + ' 条';
+        if (d.matchedPhoto) msg += '（其中 ' + d.matchedPhoto + ' 条与照片存档条码同名）';
+        toast(msg, 'success');
+        resetImport();
+        page.value = 1;
+        await load();
+      } catch (e) {
+        toast('导入失败：' + (e.message || e), 'error');
+      } finally {
+        importing.value = false;
+      }
+    }
+
+    // 删除单条会员订单（仅导入者本人或系统管理员可删，服务端已鉴权）
+    async function removeOrder(o) {
+      const ok = await showConfirm({
+        title: '删除会员订单',
+        message: '将删除订单「' + o.orderNo + '」。该操作不可撤销。',
+        confirmText: '删除',
+        danger: true
+      });
+      if (!ok) return;
+      const r = await window.api.deleteMemberOrders(props.token, [o.id]);
+      if (!r.ok) {
+        toast(r.message || '删除失败', 'error');
+        return;
+      }
+      toast('已删除会员订单「' + o.orderNo + '」', 'success');
+      await load();
+    }
+
+    // ---------- 展示辅助 ----------
+    // 金额为空表示源文件里没有/解析不出，不显示 0（避免把缺失当 0 元）
+    function fmtAmount(v) {
+      if (v === null || v === undefined || v === '') return '—';
+      const n = Number(v);
+      return Number.isFinite(n) ? '¥' + n.toFixed(2) : '—';
+    }
+
+    function fmtTime(iso) {
+      if (!iso) return '—';
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return '—';
+      const p = (n) => String(n).padStart(2, '0');
+      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+        p(d.getHours()) + ':' + p(d.getMinutes());
+    }
+
+    function fmtItems(items) {
+      if (!items || !items.length) return '—';
+      return items.join('、');
+    }
+
+    // 预览区的问题清单：最多展示 20 条，其余折叠计数
+    const issueList = Vue.computed(() => {
+      const p = preview.value;
+      if (!p || !p.issues || !p.issues.length) return [];
+      return p.issues.slice(0, 20);
+    });
+    const issueMore = Vue.computed(() => {
+      const p = preview.value;
+      if (!p || !p.issues) return 0;
+      return Math.max(0, p.issues.length - issueList.value.length);
+    });
+
+    Vue.onMounted(load);
+    return {
+      canImport, rows, total, page, totalPages, loading, errMsg, keyword,
+      file, preview, importing, picking,
+      load, search, goPage, chooseAndPreview, doImport, removeOrder, resetImport,
+      fmtAmount, fmtTime, fmtItems, issueList, issueMore
+    };
+  },
+  template: `
+    <div>
+      <div class="page-head">
+        <h2>会员订单</h2>
+        <p>从会员导出软件读取订单数据：订单号映射为本系统条形码，会员、商品、金额、时间、状态一并入库，便于按单建档拍照。</p>
+      </div>
+
+      <!-- 导入入口：仅「衣物拍照」权限账号可见 -->
+      <div v-if="canImport" class="card mo-import">
+        <div class="card-title">导入订单数据</div>
+        <p class="mo-hint">
+          支持会员导出软件导出的 CSV / JSON 文件。导入前会先预览解析结果，确认无误后再入库；
+          订单号重复的记录默认跳过，不会覆盖已有订单。
+        </p>
+        <div class="mo-actions">
+          <button class="btn btn-primary" :disabled="picking || importing" @click="chooseAndPreview">
+            {{ picking ? '读取中…' : (file ? '重新选择文件' : '选择文件并预览') }}
+          </button>
+          <button v-if="file" class="btn btn-ghost" :disabled="importing" @click="resetImport">取消</button>
+          <span v-if="file" class="mo-filename">已选：{{ file.fileName }}</span>
+        </div>
+
+        <!-- 预览结果 -->
+        <div v-if="preview" class="mo-preview">
+          <div class="stat-row mo-stats">
+            <div class="stat-card">
+              <div class="num">{{ preview.stats.valid }}</div>
+              <div class="lbl">可导入订单</div>
+            </div>
+            <div class="stat-card">
+              <div class="num">{{ preview.dbDuplicate }}</div>
+              <div class="lbl">库内已存在（将跳过）</div>
+            </div>
+            <div class="stat-card">
+              <div class="num">{{ preview.stats.invalid + preview.stats.duplicates }}</div>
+              <div class="lbl">无效 / 文件内重复</div>
+            </div>
+          </div>
+
+          <div v-if="preview.stats.invalid || preview.stats.duplicates || preview.dbDuplicate"
+               class="inline-alert warn">
+            <span class="grow">
+              文件共解析 {{ preview.stats.total }} 行：
+              有效 {{ preview.stats.valid }} 条，
+              无效 {{ preview.stats.invalid }} 条，
+              文件内重复 {{ preview.stats.duplicates }} 条；
+              其中 {{ preview.dbDuplicate }} 条在库内已存在，导入时将跳过。
+            </span>
+          </div>
+
+          <!-- 字段映射预览：确认源数据被正确识别 -->
+          <div v-if="preview.orders.length" class="table-wrap mo-preview-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>订单号 → 条形码</th>
+                  <th>会员</th>
+                  <th>手机号</th>
+                  <th>商品</th>
+                  <th>金额</th>
+                  <th>下单时间</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="o in preview.orders" :key="o.rowIndex">
+                  <td><code class="code">{{ o.orderNo }}</code></td>
+                  <td>{{ o.customer || '—' }}</td>
+                  <td>{{ o.phone || '—' }}</td>
+                  <td>{{ fmtItems(o.items) }}</td>
+                  <td>{{ fmtAmount(o.amount) }}</td>
+                  <td>{{ fmtTime(o.createdAt) }}</td>
+                  <td><span class="tag-gray">{{ o.status || '—' }}</span></td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-if="preview.truncated" class="pager-info">仅预览前 100 条，导入时按全部解析结果处理。</div>
+          </div>
+
+          <!-- 字段缺失 / 格式异常明细 -->
+          <div v-if="issueList.length" class="mo-issues">
+            <div class="mo-issues-title">字段缺失与格式异常</div>
+            <ul>
+              <li v-for="(is, i) in issueList" :key="i">
+                <span class="tag-orange">第 {{ is.row }} 行</span>
+                <span class="tag-gray">{{ is.field }}</span>
+                {{ is.message }}
+              </li>
+            </ul>
+            <div v-if="issueMore" class="pager-info">另有 {{ issueMore }} 条同类提示未展示。</div>
+          </div>
+
+          <div class="mo-actions">
+            <button class="btn btn-primary" :disabled="importing" @click="doImport">
+              {{ importing ? '导入中…' : '确认导入' }}
+            </button>
+            <button class="btn btn-ghost" :disabled="importing" @click="resetImport">取消</button>
+          </div>
+        </div>
+      </div>
+
+      <div v-else class="inline-alert">
+        <span class="grow">当前账号没有「衣物拍照」权限，无法导入会员订单；你仍可查看已导入的订单。</span>
+      </div>
+
+      <!-- 已导入订单列表 -->
+      <div v-if="errMsg" class="card">
+        <div class="empty">
+          <div class="empty-title">加载失败</div>
+          <div class="empty-desc">{{ errMsg }}</div>
+          <button class="btn btn-ghost" @click="load">重试</button>
+        </div>
+      </div>
+
+      <div v-else-if="loading && !rows.length" class="card">
+        <div class="empty"><div class="empty-title">正在加载会员订单…</div></div>
+      </div>
+
+      <div v-else-if="!rows.length" class="card">
+        <div class="empty">
+          <div class="empty-icon" aria-hidden="true"></div>
+          <div class="empty-title">暂无会员订单</div>
+          <div class="empty-desc">可从会员导出软件导出订单文件后导入。</div>
+        </div>
+      </div>
+
+      <div v-else class="table-wrap">
+        <div class="filter-bar">
+          <div class="f-item f-keyword">
+            <label>关键词</label>
+            <input v-model="keyword" :disabled="loading" placeholder="订单号 / 会员 / 手机号 / 商品 / 状态"
+                   @keyup.enter="search" />
+          </div>
+          <div class="f-item">
+            <label>&nbsp;</label>
+            <button class="btn btn-primary btn-sm" :disabled="loading" @click="search">查询</button>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>订单号（条形码）</th>
+              <th>会员</th>
+              <th>手机号</th>
+              <th>商品</th>
+              <th>金额</th>
+              <th>下单时间</th>
+              <th>状态</th>
+              <th>导入人</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="o in rows" :key="o.id">
+              <td><code class="code">{{ o.orderNo }}</code></td>
+              <td>{{ o.customer || '—' }}</td>
+              <td>{{ o.phone || '—' }}</td>
+              <td>{{ fmtItems(o.items) }}</td>
+              <td>{{ fmtAmount(o.amount) }}</td>
+              <td>{{ fmtTime(o.createdAt) }}</td>
+              <td><span class="tag-gray">{{ o.status || '—' }}</span></td>
+              <td>{{ o.username }}</td>
+              <td>
+                <button class="btn btn-ghost btn-sm" @click="removeOrder(o)">删除</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="pager">
+          <span class="pager-info">共 {{ total }} 条 · 第 {{ page }}/{{ totalPages }} 页</span>
+          <button class="btn btn-ghost btn-sm" :disabled="page <= 1" @click="goPage(page - 1)">上一页</button>
+          <span class="pager-jump" title="选择页码直达">
+            <select class="pager-select" :value="page" :disabled="totalPages <= 1" @change="goPage($event.target.value)" aria-label="选择页码">
+              <option v-for="p in totalPages" :key="p" :value="p">{{ p }} / {{ totalPages }}</option>
+            </select>
+          </span>
+          <button class="btn btn-ghost btn-sm" :disabled="page >= totalPages" @click="goPage(page + 1)">下一页</button>
+        </div>
+      </div>
+    </div>
+  `
+};
+
 /* ---------- 内置操作手册（所有角色可见，章节按角色裁剪） ---------- */
 const ManualPage = {
   props: {
@@ -5904,7 +6296,8 @@ const Shell = {
       data: QueryPage,
       system: AdminSystemPage,
       manual: ManualPage,
-      weekly: WeeklyOrdersPage
+      weekly: WeeklyOrdersPage,
+      memberOrders: MemberOrdersPage
     };
 
     // 菜单图标为内联 SVG 常量（经 v-html 渲染；均为代码内固定字符串，无注入面）
@@ -5917,6 +6310,7 @@ const Shell = {
           { key: 'logs', icon: '<svg viewBox="0 0 24 24"><path d="M8 6.5h12M8 12h12M8 17.5h12"/><path d="M3.8 6.5h.01M3.8 12h.01M3.8 17.5h.01"/></svg>', label: '操作日志' },
           { key: 'data', icon: '<svg viewBox="0 0 24 24"><path d="M3.8 7a2 2 0 0 1 2-2h3.4l1.9 2.3h7.1a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5.8a2 2 0 0 1-2-2Z"/></svg>', label: '数据查看' },
           { key: 'weekly', icon: '<svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 9h16M8 3v4M16 3v4"/></svg>', label: '本周订单' },
+          { key: 'memberOrders', icon: '<svg viewBox="0 0 24 24"><path d="M12 3.6v9.2"/><path d="m8.4 9.6 3.6 3.6 3.6-3.6"/><path d="M4.6 16.4v2.2a1.6 1.6 0 0 0 1.6 1.6h11.6a1.6 1.6 0 0 0 1.6-1.6v-2.2"/></svg>', label: '会员订单' },
           { key: 'system', icon: '<svg viewBox="0 0 24 24"><path d="M4 7.2h9.2M18.2 7.2H20M4 12h2.2M11 12h9M4 16.8h9.2M18.2 16.8H20"/><circle cx="15.6" cy="7.2" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.6" cy="16.8" r="2"/></svg>', label: '系统设置' }
         ];
       } else if (isStoreAdmin) {
@@ -5925,6 +6319,7 @@ const Shell = {
           { key: 'logs', icon: '<svg viewBox="0 0 24 24"><path d="M8 6.5h12M8 12h12M8 17.5h12"/><path d="M3.8 6.5h.01M3.8 12h.01M3.8 17.5h.01"/></svg>', label: '本店日志' },
           { key: 'query', icon: '<svg viewBox="0 0 24 24"><path d="M3.8 7a2 2 0 0 1 2-2h3.4l1.9 2.3h7.1a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5.8a2 2 0 0 1-2-2Z"/></svg>', label: '本店订单' },
           { key: 'weekly', icon: '<svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 9h16M8 3v4M16 3v4"/></svg>', label: '本周订单' },
+          { key: 'memberOrders', icon: '<svg viewBox="0 0 24 24"><path d="M12 3.6v9.2"/><path d="m8.4 9.6 3.6 3.6 3.6-3.6"/><path d="M4.6 16.4v2.2a1.6 1.6 0 0 0 1.6 1.6h11.6a1.6 1.6 0 0 0 1.6-1.6v-2.2"/></svg>', label: '会员订单' },
           { key: 'settings', icon: '<svg viewBox="0 0 24 24"><path d="M4 7.2h9.2M18.2 7.2H20M4 12h2.2M11 12h9M4 16.8h9.2M18.2 16.8H20"/><circle cx="15.6" cy="7.2" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.6" cy="16.8" r="2"/></svg>', label: '设置' }
         ];
       } else {
@@ -5933,6 +6328,7 @@ const Shell = {
         if (canCapture) list.push({ key: 'capture', icon: '<svg viewBox="0 0 24 24"><path d="M14.5 5h-5L7.8 7.6H4.6A1.6 1.6 0 0 0 3 9.2v8.2a1.6 1.6 0 0 0 1.6 1.6h14.8a1.6 1.6 0 0 0 1.6-1.6V9.2a1.6 1.6 0 0 0-1.6-1.6h-3.2Z"/><circle cx="12" cy="13.2" r="3.1"/></svg>', label: '衣物拍照' });
         list.push({ key: 'query', icon: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.4"/><path d="m19.8 19.8-3.2-3.2"/></svg>', label: '记录查询' });
         list.push({ key: 'weekly', icon: '<svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 9h16M8 3v4M16 3v4"/></svg>', label: '本周订单' });
+        list.push({ key: 'memberOrders', icon: '<svg viewBox="0 0 24 24"><path d="M12 3.6v9.2"/><path d="m8.4 9.6 3.6 3.6 3.6-3.6"/><path d="M4.6 16.4v2.2a1.6 1.6 0 0 0 1.6 1.6h11.6a1.6 1.6 0 0 0 1.6-1.6v-2.2"/></svg>', label: '会员订单' });
         list.push({ key: 'settings', icon: '<svg viewBox="0 0 24 24"><path d="M4 7.2h9.2M18.2 7.2H20M4 12h2.2M11 12h9M4 16.8h9.2M18.2 16.8H20"/><circle cx="15.6" cy="7.2" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.6" cy="16.8" r="2"/></svg>', label: '设置' });
       }
       // 操作手册对所有角色可见，统一在末尾追加：

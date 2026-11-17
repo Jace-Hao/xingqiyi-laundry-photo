@@ -323,6 +323,10 @@ function localCall(route, body, token) {
     'records/downloadPhoto': () => store.downloadPhoto(token, b),
     'records/downloadPhotos': () => store.downloadPhotos(token, b),
     'records/barcodes': () => store.listBarcodes(token),
+    'records/importMemberOrders': () => store.importMemberOrders(token, b),
+    'records/previewMemberOrders': () => store.previewMemberOrders(token, b),
+    'records/memberOrders': () => store.listMemberOrders(token, b),
+    'records/deleteMemberOrders': () => store.deleteMemberOrders(token, b.ids),
     'records/renameBarcode': () => store.renameRecordBarcode(token, b.id, b.barcode),
     'records/renameBarcodeBatch': () => store.renameRecordsBarcode(token, b.ids, b.barcode),
     'users/list': () => store.listUsers(token),
@@ -582,6 +586,78 @@ handle('records:renameBarcode', (p, token) => dispatch('records/renameBarcode', 
 handle('records:renameBarcodeBatch', (p, token) => dispatch('records/renameBarcodeBatch', p, token));
 handle('records:delete', (p, token) => dispatch('records/delete', p, token));
 handle('records:deleteBatch', (p, token) => dispatch('records/deleteBatch', p, token));
+
+// ---------- 会员导出软件订单导入 ----------
+// 文件读取与解析的职责划分：
+// - 服务端模式：文件在服务端电脑，主进程读文件后直接调用数据层；
+// - 客户端模式：文件在客户端电脑，主进程读文件后把内容随请求发给服务端解析入库。
+// 解析与字段映射统一在 main/member-order-parser.js（纯函数），两端行为一致。
+
+// 允许导入的文件类型：CSV / JSON / TXT（部分导出软件导出的其实是纯文本表格）
+const MEMBER_ORDER_FILTERS = [
+  { name: '会员订单导出文件', extensions: ['csv', 'json', 'txt'] },
+  { name: 'CSV 文件', extensions: ['csv'] },
+  { name: 'JSON 文件', extensions: ['json'] },
+  { name: '所有文件', extensions: ['*'] }
+];
+
+// 读取导入文件：读文本 + 推断格式 + 附带文件名。失败返回 {ok:false,message}
+function readMemberOrderFile(filePath) {
+  const fs = require('fs');
+  const p = String(filePath || '').trim();
+  if (!p) return { ok: false, message: '未选择文件' };
+  try {
+    const stat = fs.statSync(p);
+    if (!stat.isFile()) return { ok: false, message: '所选路径不是文件' };
+    // 体积保护：20MB 上限（服务端 HTTP 请求体上限 30MB，留出 JSON 转义余量）。
+    // 客户端模式下文件内容要随请求发到服务端，超限会被服务端拒绝，故两端口径一致。
+    if (stat.size > 20 * 1024 * 1024) return { ok: false, message: '文件过大（超过 20MB），请确认是否为订单导出文件' };
+    // 读取为 utf8；GBK 编码的 CSV 会读出乱码，交给解析器后表现为字段缺失，属可接受的降级
+    const content = fs.readFileSync(p, 'utf8');
+    const ext = path.extname(p).toLowerCase();
+    let format = '';
+    if (ext === '.csv') format = 'csv';
+    else if (ext === '.json') format = 'json';
+    return { ok: true, data: { content, format, fileName: path.basename(p) } };
+  } catch (e) {
+    return { ok: false, message: '读取文件失败：' + (e.message || String(e)) };
+  }
+}
+
+// 选择会员订单导出文件（仅本地读取，不入库）
+handle('system:chooseMemberOrderFile', () => {
+  const { dialog } = require('electron');
+  ensureWindowFocus();
+  return dialog
+    .showOpenDialog(mainWindow, {
+      title: '选择会员导出软件的订单文件',
+      properties: ['openFile'],
+      filters: MEMBER_ORDER_FILTERS
+    })
+    .then((r) => {
+      ensureWindowFocus();
+      if (r.canceled || !r.filePaths.length) return { ok: false, message: '已取消' };
+      const file = readMemberOrderFile(r.filePaths[0]);
+      if (!file.ok) return file;
+      return { ok: true, data: file.data };
+    })
+    .catch((e) => {
+      ensureWindowFocus();
+      return { ok: false, message: e.message || String(e) };
+    });
+});
+
+// 读取已选文件内容（供界面先预览解析结果，再决定是否入库）
+handle('system:readMemberOrderFile', (_p, _token) => {
+  const r = readMemberOrderFile(_p && _p.filePath);
+  return r;
+});
+
+// 导入会员订单：content 已由主进程读出，两种模式都把内容交给数据层解析入库
+handle('records:importMemberOrders', (p, token) => dispatch('records/importMemberOrders', p, token));
+handle('records:previewMemberOrders', (p, token) => dispatch('records/previewMemberOrders', p, token));
+handle('records:memberOrders', (p, token) => dispatch('records/memberOrders', p, token));
+handle('records:deleteMemberOrders', (p, token) => dispatch('records/deleteMemberOrders', p, token));
 
 // 客户端模式：照片在服务端电脑，主进程逐张从服务器拉取后按条码文件夹保存到本机目录
 async function clientExportPhotos(p, sessionToken) {

@@ -3587,3 +3587,83 @@ textarea:focus-visible,
   display: flex;
 }
 
+
+/* ---------- 会员订单（会员导出软件订单导入） ----------
+ * 配色沿用既有语义变量（靛蓝主色 + 金色强调），不引入新的色板，
+ * 以免与设计体系 v2 的 token 分叉；圆角/间距一律走 --r-* / --sp-* 变量。 */
+.mo-import {
+  margin-bottom: 20px;
+}
+
+.mo-hint {
+  margin: 0 0 14px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-sub);
+}
+
+.mo-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.mo-filename {
+  font-size: 13px;
+  color: var(--text-faint);
+  /* 文件名可能很长，截断显示并保留完整值于 title */
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mo-preview {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--divider);
+}
+
+.mo-stats {
+  margin-bottom: 14px;
+  max-width: none;
+}
+
+.mo-preview-table {
+  margin-top: 12px;
+}
+
+.mo-issues {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--warning-line);
+  background: var(--warning-soft);
+  border-radius: var(--r-control);
+}
+
+.mo-issues-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--warning-dark);
+  margin-bottom: 8px;
+}
+
+.mo-issues ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mo-issues li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-sub);
+}

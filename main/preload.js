@@ -76,6 +76,20 @@ contextBridge.exposeInMainWorld('api', {
   downloadPhoto: (token, payload) => call('records:downloadPhoto', payload, token),
   downloadPhotos: (token, payload) => call('records:downloadPhotos', payload, token),
 
+  // 会员导出软件订单
+  /** 选择会员订单导出文件并读出文本内容（只读本地文件，不入库） */
+  chooseMemberOrderFile: () => ipcRenderer.invoke('system:chooseMemberOrderFile'),
+  /** 读取指定路径的会员订单文件（用于界面先预览解析结果） */
+  readMemberOrderFile: (filePath) => ipcRenderer.invoke('system:readMemberOrderFile', { filePath }),
+  /** 导入会员订单（content 由主进程读文件得到，两种模式都在服务端解析入库） */
+  importMemberOrders: (token, payload) => call('records:importMemberOrders', payload, token),
+  /** 预览会员订单文件（只解析不落库，用于导入前确认字段映射与异常） */
+  previewMemberOrders: (token, payload) => call('records:previewMemberOrders', payload, token),
+  /** 查询会员订单列表 */
+  listMemberOrders: (token, payload) => call('records:memberOrders', payload, token),
+  /** 删除会员订单 */
+  deleteMemberOrders: (token, ids) => call('records:deleteMemberOrders', { ids }, token),
+
   // 用户管理（只传原始类型参数，对象在桥接层内组装）
   listUsers: (token) => call('users:list', undefined, token),
   createUser: (token, username, name, role, password, capture, query, store) =>

@@ -107,6 +107,11 @@ function startServer(store, opts = {}) {
       'records/barcodes': () => store.listBarcodes(sessionToken),
       'records/renameBarcode': () => store.renameRecordBarcode(sessionToken, body.id, body.barcode),
       'records/renameBarcodeBatch': () => store.renameRecordsBarcode(sessionToken, body.ids, body.barcode),
+      // 会员导出软件订单（客户端模式经此路由把文件内容送到服务端解析入库）
+      'records/importMemberOrders': () => store.importMemberOrders(sessionToken, body),
+      'records/previewMemberOrders': () => store.previewMemberOrders(sessionToken, body),
+      'records/memberOrders': () => store.listMemberOrders(sessionToken, body),
+      'records/deleteMemberOrders': () => store.deleteMemberOrders(sessionToken, body.ids),
       // 移动端补充接口（配套移动端 App 使用，首见于桌面端 v1.2.3）：
       // addByFile 与 stageUpload 配套，用于弱网下的原始二进制上传；
       // setNote 用于事后订正备注。桌面端不调用，属纯增量。
