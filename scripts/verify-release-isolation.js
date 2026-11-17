@@ -105,11 +105,18 @@ check(
   'docs/manual.md 含当前版本号 v' + version,
   'prebuild 的 sync-manual.js 也会拦这一条，这里提前暴露'
 );
-// 桌面端版本线为 1.2.x：跳到 1.3.x 说明又踩了当年的编号失误
+// 桌面端版本线：1.2.x 已于 v1.2.22 收尾，自 v2.0.0 起进入 2.x 大版本线。
+// 这条断言的原意是「防止误跳版本线」——历史上 v1.3.0 是编号失误（桌面端与移动端
+// 当时共库同号，移动端发 v1.3.1 被桌面端判成新版本，APK 被当安装包推给电脑用户）。
+// 因此这里不禁止大版本，而是要求版本号落在已知的版本线集合内：
+// 未列入的线（如 1.3.x / 3.x）视为误跳，会被拦下。
+const DESKTOP_VERSION_LINES = ['1.2', '2.0'];
+const versionLine = version.split('.').slice(0, 2).join('.');
 check(
-  /^1\.2\.\d+$/.test(version),
-  '桌面端版本号处于 1.2.x 版本线（1.2.3 起递增）',
-  '当前为 ' + version + '。桌面端上一正式版是 v1.2.2，1.3.0 是曾发生的编号失误'
+  DESKTOP_VERSION_LINES.includes(versionLine),
+  '桌面端版本号处于已知版本线（' + DESKTOP_VERSION_LINES.join(' / ') + '.x）',
+  '当前为 ' + version + '。已知版本线：' + DESKTOP_VERSION_LINES.join(' / ') +
+    '；1.3.x 是曾发生的编号失误，不在允许列表内'
 );
 
 // ---------- 5. .gitignore 不再声明 Android 产物 ----------
