@@ -291,40 +291,6 @@ const tinyJpeg =
   const noTokenResp = await call('records/list', { silent: true }, '');
   check('无令牌失败但不带 revoked 标志', noTokenResp.body.ok === false && noTokenResp.body.revoked !== true, JSON.stringify(noTokenResp.body));
 
-  // ---------- 会员导出软件订单（客户端模式经 HTTP 把文件内容送到服务端解析入库） ----------
-  const moCsv = '订单号,会员姓名,会员手机,商品名称,订单金额,下单时间,订单状态\n' +
-    'XY-NET-001,张女士,13800001111,"羽绒服,皮靴",128.50,2026-11-01 14:32,待取\n' +
-    'XY-NET-002,李先生,13900002222,西服,88,2026/11/02 09:00,已取';
-
-  const moPreview = await call('records/previewMemberOrders', { content: moCsv, format: 'csv', fileName: 'net.csv' }, sessionB);
-  check('会员订单预览接口经 HTTP 可用', moPreview.body.ok === true && moPreview.body.data.stats.valid === 2, JSON.stringify(moPreview.body).slice(0, 200));
-  check('预览不落库（会员订单总数仍为 0）', (await call('records/memberOrders', { silent: true }, sessionB)).body.data.total === 0);
-
-  const moImport = await call('records/importMemberOrders', { content: moCsv, format: 'csv', fileName: 'net.csv' }, sessionB);
-  check('会员订单导入接口经 HTTP 可用', moImport.body.ok === true && moImport.body.data.imported === 2, JSON.stringify(moImport.body).slice(0, 200));
-
-  const moList = await call('records/memberOrders', { silent: true }, sessionB);
-  check('导入的会员订单可经 HTTP 查询到', moList.body.ok === true && moList.body.data.total === 2, JSON.stringify(moList.body).slice(0, 200));
-  const moRow = (moList.body.data.items || []).find((r) => r.orderNo === 'XY-NET-001');
-  check('字段映射经 HTTP 往返后仍然正确（订单号→条码/会员/金额/状态）',
-    !!moRow && moRow.barcode === 'XY-NET-001' && moRow.customer === '张女士' && moRow.amount === 128.5 && moRow.status === '待取',
-    JSON.stringify(moRow || null));
-
-  const moReimport = await call('records/importMemberOrders', { content: moCsv, format: 'csv', fileName: 'net.csv' }, sessionB);
-  check('重复订单经 HTTP 导入被跳过（不重复入库）', moReimport.body.ok === true && moReimport.body.data.imported === 0 && moReimport.body.data.skipped === 2,
-    JSON.stringify(moReimport.body.data || moReimport.body).slice(0, 200));
-
-  // 权限隔离：查询账号（无「衣物拍照」权限）导入必须被拒绝。
-  // 单独建账号而不是复用 clerk01——clerk01 是拍照账号（有 capture 权限），且旧会话已被顶下线。
-  await call('users/create', { username: 'moq01', name: '查询员', role: 'query', password: 'moq123' }, session);
-  const moqLogin = await call('auth/login', { username: 'moq01', password: 'moq123' }, '');
-  const moqSession = moqLogin.body.ok ? moqLogin.body.data.sessionToken : '';
-  const moNoPerm = await call('records/importMemberOrders', { content: moCsv }, moqSession);
-  check('无导入权限的账号经 HTTP 导入被拒绝', moNoPerm.body.ok === false && /无权限/.test(String(moNoPerm.body.message || '')),
-    JSON.stringify(moNoPerm.body).slice(0, 200));
-  const moqList = await call('records/memberOrders', { silent: true }, moqSession);
-  check('查询账号经 HTTP 可查询会员订单（只读）', moqList.body.ok === true, JSON.stringify(moqList.body).slice(0, 200));
-
   await server.close();
   console.log('\n结果：' + passed + ' 通过，' + failed + ' 失败');
   fs.rmSync(tmpDir, { recursive: true, force: true });

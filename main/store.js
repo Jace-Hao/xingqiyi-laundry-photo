@@ -16,9 +16,6 @@ const license = require('./license');
 // （removeFor 为纯文件操作，无需注入 nativeImage）。
 // thumb.js 只依赖 fs/path/crypto，不 require store.js，因此无循环引用。
 const { createThumbService, DEFAULT_THUMB_WIDTH } = require('./thumb');
-// 会员导出软件订单解析：纯函数模块（CSV/JSON 解析 + 字段映射 + 去重），
-// 不依赖 Electron，可在 scripts/verify-member-orders.js 中直接单测。
-const memberParser = require('./member-order-parser');
 
 // 请求来源上下文：服务端收到网络请求时把客户端 IP 存入这里，
 // 写日志时自动读取，无需层层修改业务函数签名。
@@ -65,10 +62,6 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
   const LOGS_FILE = path.join(dataDir, 'logs.json');
   const SESSIONS_FILE = path.join(dataDir, 'sessions.json');
   const OFFLINE_QUEUE_FILE = path.join(dataDir, 'offline-queue.json');
-  // 会员导出软件导入的订单单独存一张表：
-  // records 表的每条记录都对应一张照片（photoFile 必填），会员订单没有照片，
-  // 混在一起会污染照片列表与统计口径，故独立存储，查询时按门店/账号裁剪。
-  const MEMBER_ORDERS_FILE = path.join(dataDir, 'member-orders.json');
 
   function readJson(file, fallback) {
     try {
@@ -93,8 +86,6 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
   const saveLogs = (l) => writeJson(LOGS_FILE, l);
   const loadSessions = () => readJson(SESSIONS_FILE, []);
   const saveSessions = (s) => writeJson(SESSIONS_FILE, s);
-  const loadMemberOrders = () => readJson(MEMBER_ORDERS_FILE, []);
-  const saveMemberOrders = (o) => writeJson(MEMBER_ORDERS_FILE, o);
 
   // ---------- 配置 ----------
   const DEFAULT_CONFIG = () => ({
@@ -768,246 +759,6 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     return [...set].sort((a, b) => a.localeCompare(b, 'zh-CN'));
   }
 
-  // ---------- 会员导出软件订单（独立表，与照片存档 records 隔离） ----------
-
-  /**
-   * 会员订单可见范围：与 canViewRecord 同口径（本人 + 同门店非空门店），系统管理员可见全部。
-   * 会员订单虽无照片，但同样按门店隔离，避免跨门店看到别家会员资料。
-   */
-  function canViewMemberOrder(me, o) {
-    if (!me) return false;
-    if (isSysAdmin(me)) return true;
-    if (o.userId === me.id) return true;
-    const myStore = normalizeStore(me.store);
-    return !!myStore && normalizeStore(o.storeName) === myStore;
-  }
-
-  /**
-   * 导入会员导出软件的订单数据。
-   *
-   * 数据流：调用方（主进程）读文件 → 本函数只接收文本内容并落库。
-   * 解析与字段映射在 main/member-order-parser.js（纯函数，可单测）完成。
-   *
-   * 去重口径（两层）：
-   *   1) 文件内重复：解析阶段已按订单号去重，保留首条；
-   *   2) 与库内已有会员订单重复：默认跳过（skipDuplicates !== false 时生效），
-   *      避免重复导入把订单冲掉；订单号大小写不敏感。
-   * 与照片存档的关系：若订单号已存在同名条码的照片存档，只统计并回报数量，不阻断导入
-   * （会员信息与照片存档是两套信息，门店可能需要同时看到两者）。
-   *
-   * @param {string} token 会话令牌
-   * @param {{content?:string, format?:string, fileName?:string, skipDuplicates?:boolean}} p
-   * @returns {{imported:number, skipped:number, duplicated:number, invalid:number,
-   *            issues:Array<object>, orders:Array<object>}}
-   */
-  function importMemberOrders(token, p = {}) {
-    const me = requireSessionPermission(token, 'capture');
-    const content = String(p.content || '');
-    const fileName = String(p.fileName || '').trim();
-    const parsed = memberParser.parseMemberOrders(content, { format: p.format });
-    const issues = Array.isArray(parsed.issues) ? parsed.issues.slice() : [];
-
-    if (!parsed.orders.length) {
-      appendLog({
-        ...logBase(me),
-        module: '会员订单',
-        action: '导入会员订单',
-        detail: `导入会员订单失败：文件「${fileName || '未命名'}」未解析出有效订单`,
-        result: '失败'
-      });
-      return {
-        imported: 0, skipped: 0, duplicated: 0,
-        invalid: parsed.stats.invalid, issues, orders: []
-      };
-    }
-
-    const existing = loadMemberOrders();
-    const existSet = new Set(existing.map((o) => String(o.orderNo || '').trim().toLowerCase()).filter(Boolean));
-    // 照片存档里已存在的条码（用于回报，不阻断导入）
-    const photoBarcodes = new Set(loadRecords().map((r) => String(r.barcode || '').trim()).filter(Boolean));
-
-    const skipDuplicates = p.skipDuplicates !== false;
-    const accepted = [];
-    let duplicated = 0;
-    let skipped = 0;
-    let matchedPhoto = 0;
-
-    for (const o of parsed.orders) {
-      const key = String(o.orderNo || '').trim().toLowerCase();
-      if (existSet.has(key)) {
-        duplicated++;
-        if (skipDuplicates) {
-          skipped++;
-          issues.push({
-            row: o.rowIndex, field: 'orderNo',
-            message: `订单号「${o.orderNo}」已存在，已跳过（未覆盖原有记录）`
-          });
-          continue;
-        }
-      }
-      if (photoBarcodes.has(o.barcode)) matchedPhoto++;
-      existSet.add(key);
-      accepted.push(o);
-    }
-
-    // 落库：字段映射到本系统订单模型（订单号即条码）
-    const importedAt = now();
-    const rows = accepted.map((o) => ({
-      id: uid(),
-      orderNo: o.orderNo,
-      barcode: o.barcode,
-      customer: o.customer || '',
-      phone: o.phone || '',
-      items: o.items || [],
-      amount: o.amount === null || o.amount === undefined ? null : o.amount,
-      // 缺失下单时间时以导入时刻兜底，保证记录在时间维度上可排序、可被保留期策略覆盖
-      createdAt: o.createdAt || importedAt,
-      status: o.status || '',
-      extra: o.extra || {},
-      source: '会员导出软件',
-      sourceFile: fileName,
-      userId: me.id,
-      username: me.username,
-      storeName: normalizeStore(me.store),
-      importedAt
-    }));
-
-    if (rows.length) {
-      existing.push(...rows);
-      saveMemberOrders(existing);
-    }
-
-    appendLog({
-      ...logBase(me),
-      module: '会员订单',
-      action: '导入会员订单',
-      detail: `导入会员订单：文件「${fileName || '未命名'}」，成功 ${rows.length} 条` +
-        (skipped ? `，跳过重复 ${skipped} 条` : '') +
-        (parsed.stats.invalid ? `，无效 ${parsed.stats.invalid} 条` : '') +
-        (matchedPhoto ? `，其中 ${matchedPhoto} 条与照片存档条码同名` : ''),
-      result: rows.length ? '成功' : '失败'
-    });
-
-    return {
-      imported: rows.length,
-      skipped,
-      duplicated,
-      invalid: parsed.stats.invalid,
-      matchedPhoto,
-      issues,
-      orders: rows
-    };
-  }
-
-  /**
-   * 预览会员订单文件（只解析不落库）。
-   *
-   * 供界面在正式导入前展示：解析出多少条有效订单、多少条字段缺失/格式异常、
-   * 有多少条与库内已有订单重复（库内重复在预览阶段就能算出来，
-   * 不必等真正导入时才发现）。因此导入前可清楚看到「会导入什么、跳过什么」。
-   *
-   * 权限：只读操作，按「订单查询」鉴权（门店管理员/查询账号也能预览文件格式，
-   * 但正式导入仍需「衣物拍照」权限，两者分离是刻意的）。
-   *
-   * @param {string} token 会话令牌
-   * @param {{content?:string, format?:string, fileName?:string}} p
-   */
-  function previewMemberOrders(token, p = {}) {
-    requireSessionPermission(token, 'query');
-    const content = String(p.content || '');
-    const fileName = String(p.fileName || '').trim();
-    const parsed = memberParser.parseMemberOrders(content, { format: p.format });
-
-    // 与库内已有会员订单比对，算出「若现在导入会被跳过」的条数
-    const existSet = new Set(
-      loadMemberOrders().map((o) => String(o.orderNo || '').trim().toLowerCase()).filter(Boolean)
-    );
-    let dbDuplicate = 0;
-    for (const o of parsed.orders) {
-      if (existSet.has(String(o.orderNo || '').trim().toLowerCase())) dbDuplicate++;
-    }
-
-    return {
-      format: parsed.format,
-      fileName,
-      stats: parsed.stats,
-      dbDuplicate,
-      issues: parsed.issues,
-      // 预览只回传前 100 条，避免大文件把渲染层撑爆
-      orders: parsed.orders.slice(0, 100),
-      truncated: parsed.orders.length > 100
-    };
-  }
-
-  /**
-   * 查询会员订单列表。权限与裁剪口径与 listRecords 一致（本人 + 同门店 / 管理员全量）。
-   *
-   * @param {string} token 会话令牌
-   * @param {{keyword?:string, storeFilter?:string, userId?:string, page?:number, pageSize?:number, silent?:boolean}} p
-   */
-  function listMemberOrders(token, p = {}) {
-    const me = requireSessionPermission(token, 'query');
-    const isAdmin = isSysAdmin(me);
-    let list = loadMemberOrders();
-
-    if (!isAdmin) list = list.filter((o) => canViewMemberOrder(me, o));
-    else {
-      if (p.userId && p.userId !== 'all') list = list.filter((o) => o.userId === p.userId);
-      const sf = normalizeStore(p.storeFilter);
-      if (sf && sf !== 'all') list = list.filter((o) => normalizeStore(o.storeName) === sf);
-    }
-
-    const kw = String(p.keyword || '').trim().toLowerCase();
-    if (kw) {
-      list = list.filter((o) =>
-        [o.orderNo, o.barcode, o.customer, o.phone, o.status, ...(o.items || [])]
-          .some((v) => String(v || '').toLowerCase().includes(kw))
-      );
-    }
-
-    list.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
-    const total = list.length;
-    const page = Math.max(1, Number(p.page) || 1);
-    const pageSize = Math.min(100, Math.max(1, Number(p.pageSize) || 12));
-    const items = list.slice((page - 1) * pageSize, page * pageSize);
-
-    if (!p.silent) {
-      appendLog({
-        ...logBase(me),
-        module: isAdmin ? '数据查看' : '订单查询',
-        action: '查询记录',
-        detail: `查询会员订单：关键词「${kw || '无'}」，共 ${total} 条，第 ${page} 页`,
-        result: '成功'
-      });
-    }
-    return { items, total, page, pageSize };
-  }
-
-  /**
-   * 删除会员订单（按 id 批量）。仅限导入者本人或系统管理员，避免误删同事数据。
-   * 会员订单无照片文件，故无照片缓存需要清理。
-   */
-  function deleteMemberOrders(token, ids) {
-    const me = requireSession(token);
-    const list = loadMemberOrders();
-    const want = new Set((Array.isArray(ids) ? ids : [ids]).map((x) => String(x || '')).filter(Boolean));
-    if (!want.size) throw new Error('请选择要删除的会员订单');
-    const removed = list.filter((o) => want.has(String(o.id)));
-    if (!removed.length) throw new Error('会员订单不存在或已被删除');
-    for (const o of removed) {
-      if (!isSysAdmin(me) && o.userId !== me.id) throw new Error('无权限删除他人导入的会员订单');
-    }
-    saveMemberOrders(list.filter((o) => !want.has(String(o.id))));
-    appendLog({
-      ...logBase(me),
-      module: '会员订单',
-      action: '删除会员订单',
-      detail: `删除会员订单 ${removed.length} 条：${removed.map((o) => `「${o.orderNo}」`).join('、')}`,
-      result: '成功'
-    });
-    return { deleted: removed.length };
-  }
-
   // ---------- 衣物照片存档（条形码索引） ----------
   function addRecord(token, p = {}) {
     const me = requireSessionPermission(token, 'capture');
@@ -1479,7 +1230,6 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     '新增条码', '新增存档照片', '修改条码', '离线存档', '删除存档', '批量删除存档',
     '查询记录', '查看记录', '批量导出照片', '按日期导出照片',
     '导出本周订单表格', '导出本周订单明细',
-    '导入会员订单', '删除会员订单',
     '下载原片', '批量下载原片',
     '新增用户', '修改用户', '删除用户',
     '修改备注',
@@ -3072,11 +2822,6 @@ function createStore({ dataDir, defaultPhotoDir, updateDir, appVersion = '0.0.0'
     renameRecordBarcode,
     renameRecordsBarcode,
     listBarcodes,
-    // 会员导出软件订单：独立表，不与照片存档 records 混存
-    importMemberOrders,
-    previewMemberOrders,
-    listMemberOrders,
-    deleteMemberOrders,
     getRecord,
     deleteRecord,
     deleteRecords,

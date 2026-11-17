@@ -55,9 +55,6 @@ renderer/styles.*.bak.css
 # WorkBuddy 工作区数据（项目记忆与本地配置，非源码）
 .workbuddy/
 
-# 本机设计评审导出物（UI 稿截图与评审聚合页，临时产物，非源码）
-_review_export/
-
 # ---------- 仓库边界 ----------
 # 本仓库**只放桌面端**（Electron + Vue 3）。移动端已迁出到独立仓库
 # Jace-Hao/xingqiyi-laundry-photo-android，其源码、构建产物（APK）、
